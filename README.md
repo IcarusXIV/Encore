@@ -2,8 +2,6 @@
 
 **Your Dance Mods, One Command Away** — Create presets for your favorite dance and emote mods, then activate them instantly with custom chat commands. Automatically handles Penumbra mod priorities so your animations always show correctly.
 
-![Encore Banner](images/banner.png)
-
 ## Installation
 
 Add this repository to Dalamud:
@@ -18,13 +16,13 @@ https://raw.githubusercontent.com/IcarusXIV/Encore/master/repo.json
 - **Automatic Priority Management** — Boosts your target mod's priority so it always wins over conflicts
 - **Smart Emote Detection** — Automatically detects which emote a mod affects and executes it
 - **Icon Picker** — Choose from hundreds of game icons for your presets
-- **Pose Support** — Works with idle poses, sitting poses, and doze animations (triggers redraw automatically)
+- **Pose Support** — Works with idle poses, sitting poses (chair/groundsit), and doze animations (triggers redraw automatically)
 
 ## Features
 
 **Preset Management:**
 - Create unlimited presets for dance/emote mods
-- Favorite and organize your presets
+- Favourite and organize your presets
 - Duplicate presets for variations
 - Custom icons from FFXIV's icon library
 
