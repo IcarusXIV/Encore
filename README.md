@@ -1,67 +1,62 @@
 # Encore
 
-**Your Dance Mods, One Command Away** — Create presets for your favorite dance and emote mods, then activate them instantly with custom chat commands. Automatically handles Penumbra mod priorities so your animations always show correctly.
-
-![Encore Banner](images/banner.png)
+**Your dance mods, one command away.** Create presets for your favourite dance and emote mods, then activate them instantly with a single click or custom chat command. Encore handles all the Penumbra priority juggling behind the scenes so you can just dance.
 
 ## Installation
 
-Add this repository to Dalamud:
+Add this custom repo URL in Dalamud:
 ```
-https://raw.githubusercontent.com/IcarusXIV/Encore/master/repo.json
+https://raw.githubusercontent.com/IcarusXIV/Encore/master/Encore/repo.json
 ```
 
-## What It Does
+Requires [Penumbra](https://github.com/xivdev/Penumbra).
 
-- **One-Click Dance Switching** — Save dance/emote mods as presets and activate them instantly
-- **Custom Chat Commands** — Create your own commands like `/hips` or `/mydance` for each preset
-- **Automatic Priority Management** — Boosts your target mod's priority so it always wins over conflicts
-- **Smart Emote Detection** — Automatically detects which emote a mod affects and executes it
-- **Icon Picker** — Choose from hundreds of game icons for your presets
-- **Pose Support** — Works with idle poses, sitting poses, and doze animations (triggers redraw automatically)
+## What Does It Do?
 
-## Features
+**Switch dances instantly** -- Pick a preset, click play (or type your command), and you're dancing. No more digging through Penumbra to swap priorities every time you want a different dance.
 
-**Preset Management:**
-- Create unlimited presets for dance/emote mods
-- Favorite and organize your presets
-- Duplicate presets for variations
-- Custom icons from FFXIV's icon library
+**Custom chat commands** -- Give each preset its own command like `/hips` or `/mydance`. Type it in chat and go.
 
-**Smart Detection:**
-- Scans your Penumbra mods to find emote/dance mods
-- Identifies the correct emote command automatically
-- Distinguishes between emotes and pose replacements
-- Handles all emote variants (cheer, ranger poses, etc.)
+**Pose presets** -- Not just emotes. Encore supports idle poses, sitting poses, ground sitting, and doze animations. It writes the pose index, triggers a redraw, and cycles `/cpose` automatically so you don't have to.
 
-**Seamless Integration:**
-- Works with your existing Penumbra setup
-- Respects Dalamud's UI scaling
-- Validates commands to prevent conflicts with game/plugin commands
-- Remembers original mod priorities for clean deactivation
+**Sit & doze anywhere** -- Chair-sit and doze presets place your character into the sit or doze state without needing furniture. No chair required.
+
+**Conflict handling** -- When you activate a preset, Encore temporarily disables other mods that affect the same emote so yours always wins. Pin your important mods to protect them from being disabled.
+
+**Mod option switching** -- If your mod has option groups (music, ear wiggles, different animations, etc.), you can configure which options to apply per preset. They get restored when you switch away.
+
+**Vanilla presets** -- Want to go back to the original game animation? Create a vanilla preset that just disables conflicting mods without enabling anything.
+
+**Warp to target** -- For duo or group emotes, use `/warp` (or the button in the main window) to warp to your partner's exact position. Stand next to them first -- it only works within a short distance.
+
+## Organising Your Presets
+
+- **Folders** -- Group presets into collapsible, colour-coded folders
+- **Drag & drop** -- Reorder presets and move them between folders
+- **Sort modes** -- Custom, Name, Command, Favourites, Newest, Oldest
+- **Search** -- Filter presets by name
+- **Favourites** -- Star your go-to presets for quick access
+- **Icons** -- Pick from hundreds of game icons to make each preset recognizable at a glance
 
 ## Commands
 
-| Command | Description |
+| Command | What it does |
 |---------|-------------|
-| `/encore` | Open the main Encore window |
-| `/[yourpreset]` | Activate a preset (custom command you define) |
+| `/encore` | Open the main window |
+| `/encorereset` | Restore all mods to their original state |
+| `/warp` | Warp to your target's position (must be close) |
+| `/yourcommand` | Activate a preset (you define these) |
 
-## How It Works
+## Getting Started
 
-1. **Create a Preset** — Click the + button and select a dance/emote mod from your Penumbra library
-2. **Set a Command** — Give it a memorable chat command like `/hips`
-3. **Pick an Icon** — Choose an icon that represents your dance
-4. **Use It!** — Type your command in chat and watch the magic happen
+1. Open Encore with `/encore`
+2. Click **New Preset**
+3. Give it a name, a chat command, and an icon
+4. Pick a dance mod (populated from your Penumbra Library)
+5. Choose which base dance (if multiple options) & optionally set mod options
+6. Hit **Save** and you're done -- click play or type your command to activate it
 
-Encore automatically:
-- Boosts your mod's priority so it takes precedence
-- Executes the correct emote command
-- Triggers a redraw if needed (for pose mods)
-
-## Requirements
-
-- [Penumbra](https://github.com/xivdev/Penumbra) — Required for mod management
+Everything is restored when you switch to a different preset or use `/encorereset`.
 
 ## Support
 
@@ -72,5 +67,3 @@ Encore automatically:
 ## Credits
 
 Created by **Icarus**
-
-Inspired by the workflow needs of dancers, GPosers, and emote mod enthusiasts everywhere.
