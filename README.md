@@ -66,4 +66,6 @@ Everything is restored when you switch to a different preset or use `/encorerese
 
 ## Credits
 
+Ottermandias - AutoVisor: Pose index writing and /cpose cycling
+SoyaX - DozeAnywhere: Sit/doze anywhere hooks and function signatures
 Created by **Icarus**
