@@ -1,0 +1,77 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - '*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.x.x'
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Download Dalamud
+        run: |
+          Invoke-WebRequest -Uri https://goatcorp.github.io/dalamud-distrib/stg/latest.zip -OutFile latest.zip
+          Expand-Archive -Force latest.zip "$env:AppData\XIVLauncher\addon\Hooks\dev"
+
+      - name: Build
+        run: |
+          $ver = '${{ github.ref_name }}'
+          dotnet build --no-restore --configuration Release -p:Version=$ver -p:AssemblyVersion=$ver -p:FileVersion=$ver
+
+      - name: Update version in repo.json
+        run: |
+          $ver = '${{ github.ref_name }}'
+          $path = './Encore/repo.json'
+          $json = Get-Content -Raw $path | ConvertFrom-Json
+          $json[0].AssemblyVersion = $ver
+          $json[0].TestingAssemblyVersion = $ver
+          $json[0].DownloadLinkInstall = $json[0].DownloadLinkInstall -replace '[^/]+/Encore.zip',"$ver/Encore.zip"
+          $json[0].DownloadLinkTesting = $json[0].DownloadLinkTesting -replace '[^/]+/Encore.zip',"$ver/Encore.zip"
+          $json[0].DownloadLinkUpdate = $json[0].DownloadLinkUpdate -replace '[^/]+/Encore.zip',"$ver/Encore.zip"
+          $json | ConvertTo-Json -AsArray | Set-Content -Path $path
+
+      - name: Create Zip
+        run: |
+          $PluginPath = "Encore/bin/Release"
+          $OutputZip = "Encore.zip"
+          $Files = @(
+            "$PluginPath/Encore.dll",
+            "$PluginPath/Encore.json"
+          )
+          Compress-Archive -Path $Files -DestinationPath $OutputZip -Force
+          if (Test-Path "$PluginPath/Assets") {
+            Compress-Archive -Path "$PluginPath/Assets" -Update -DestinationPath $OutputZip
+          }
+
+      - name: Upload Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: Encore.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commit repo.json
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add Encore/repo.json
+          git commit -m "Update repo.json for ${{ github.ref_name }}" || echo "No changes to commit"
+          git push origin HEAD:master

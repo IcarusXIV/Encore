@@ -1,0 +1,1326 @@
+using Dalamud.Game.Command;
+using Dalamud.IoC;
+using Dalamud.Plugin;
+using Dalamud.Plugin.Ipc;
+using Dalamud.Interface.Windowing;
+using Dalamud.Plugin.Services;
+using Dalamud.Game.Text;
+using Dalamud.Game.Text.SeStringHandling;
+using FFXIVClientStructs.FFXIV.Client.Game.Character;
+using FFXIVClientStructs.FFXIV.Client.Game.Control;
+using FFXIVClientStructs.FFXIV.Client.System.String;
+using FFXIVClientStructs.FFXIV.Client.UI;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Encore.Services;
+using Encore.Windows;
+
+namespace Encore;
+
+public sealed class Plugin : IDalamudPlugin
+{
+    // Static instance for easy access from windows
+    public static Plugin? Instance { get; private set; }
+
+    // Dalamud services
+    [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
+    [PluginService] internal static ITextureProvider TextureProvider { get; private set; } = null!;
+    [PluginService] internal static ICommandManager CommandManager { get; private set; } = null!;
+    [PluginService] internal static IPluginLog Log { get; private set; } = null!;
+    [PluginService] internal static IChatGui ChatGui { get; private set; } = null!;
+    [PluginService] internal static IFramework Framework { get; private set; } = null!;
+    [PluginService] internal static IGameInteropProvider GameInteropProvider { get; private set; } = null!;
+    [PluginService] internal static IObjectTable ObjectTable { get; private set; } = null!;
+    [PluginService] internal static ITargetManager TargetManager { get; private set; } = null!;
+
+    // Main command
+    private const string MainCommand = "/encore";
+
+    // Configuration
+    public Configuration Configuration { get; init; }
+
+    // Services
+    public PenumbraService? PenumbraService { get; private set; }
+    public EmoteDetectionService? EmoteDetectionService { get; private set; }
+    public PoseService? PoseService { get; private set; }
+
+    // Windows
+    public readonly WindowSystem WindowSystem = new("Encore");
+    private MainWindow MainWindow { get; init; }
+    private PresetEditorWindow PresetEditorWindow { get; init; }
+    private IconPickerWindow IconPickerWindow { get; init; }
+    private HelpWindow HelpWindow { get; init; }
+
+    // Dynamic command tracking
+    private readonly HashSet<string> registeredPresetCommands = new();
+
+    // Prevent overlapping preset executions
+    private volatile bool isExecutingPreset = false;
+
+    public Plugin()
+    {
+        Instance = this;
+
+        // Load configuration
+        Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
+
+        // Backfill CreatedAt for existing presets that predate this field
+        bool needsCreatedAtBackfill = false;
+        for (int i = 0; i < Configuration.Presets.Count; i++)
+        {
+            if (Configuration.Presets[i].CreatedAt == default)
+            {
+                Configuration.Presets[i].CreatedAt = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddMinutes(i);
+                needsCreatedAtBackfill = true;
+            }
+        }
+        if (needsCreatedAtBackfill) Configuration.Save();
+
+        // Initialize services
+        try
+        {
+            PenumbraService = new PenumbraService(PluginInterface, Log);
+            EmoteDetectionService = new EmoteDetectionService(PenumbraService, PluginInterface, Log);
+            PoseService = new PoseService(GameInteropProvider, ObjectTable, Framework, Log);
+
+            // Initialize emote mod cache in background (like CS+)
+            if (PenumbraService.IsAvailable)
+            {
+                EmoteDetectionService.InitializeCacheAsync();
+
+                // Subscribe to Penumbra mod events for cache invalidation
+                SubscribeToPenumbraEvents();
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"Failed to initialize services: {ex.Message}");
+        }
+
+        // Create windows
+        MainWindow = new MainWindow();
+        PresetEditorWindow = new PresetEditorWindow();
+        IconPickerWindow = new IconPickerWindow();
+        HelpWindow = new HelpWindow();
+
+        // Wire up window dependencies
+        MainWindow.SetEditorWindow(PresetEditorWindow);
+        MainWindow.SetHelpWindow(HelpWindow);
+        PresetEditorWindow.SetIconPicker(IconPickerWindow);
+
+        // Add windows to system
+        WindowSystem.AddWindow(MainWindow);
+        WindowSystem.AddWindow(PresetEditorWindow);
+        WindowSystem.AddWindow(IconPickerWindow);
+        WindowSystem.AddWindow(HelpWindow);
+
+        // Register main command
+        CommandManager.AddHandler(MainCommand, new CommandInfo(OnMainCommand)
+        {
+            HelpMessage = "Open the Encore dance preset manager"
+        });
+
+        // Register reset command
+        CommandManager.AddHandler($"{MainCommand}reset", new CommandInfo(OnResetCommand)
+        {
+            HelpMessage = "Reset all mod priorities to their original values"
+        });
+
+        // Register warp command
+        CommandManager.AddHandler("/warp", new CommandInfo(OnWarpCommand)
+        {
+            HelpMessage = "Warp to your target's position"
+        });
+
+        // Register preset commands
+        UpdatePresetCommands();
+
+        // Show help on first launch
+        if (!Configuration.HasSeenHelp)
+        {
+            HelpWindow.IsOpen = true;
+            Configuration.HasSeenHelp = true;
+            Configuration.Save();
+        }
+
+        // Hook UI drawing
+        PluginInterface.UiBuilder.Draw += WindowSystem.Draw;
+        PluginInterface.UiBuilder.OpenConfigUi += ToggleMainUi;
+        PluginInterface.UiBuilder.OpenMainUi += ToggleMainUi;
+
+        Log.Information($"Encore loaded. Penumbra available: {PenumbraService?.IsAvailable ?? false}");
+    }
+
+    // Penumbra event subscriptions
+    private ICallGateSubscriber<string, object?>? modAddedSubscriber;
+    private ICallGateSubscriber<string, object?>? modDeletedSubscriber;
+    private ICallGateSubscriber<string, string, object?>? modMovedSubscriber;
+    private Action<string>? onModAddedAction;
+    private Action<string>? onModDeletedAction;
+    private Action<string, string>? onModMovedAction;
+
+    public void Dispose()
+    {
+        // Unhook UI
+        PluginInterface.UiBuilder.Draw -= WindowSystem.Draw;
+        PluginInterface.UiBuilder.OpenConfigUi -= ToggleMainUi;
+        PluginInterface.UiBuilder.OpenMainUi -= ToggleMainUi;
+
+        // Unsubscribe from Penumbra events
+        UnsubscribeFromPenumbraEvents();
+
+        // Remove windows
+        WindowSystem.RemoveAllWindows();
+        MainWindow.Dispose();
+
+        // Remove commands
+        CommandManager.RemoveHandler(MainCommand);
+        CommandManager.RemoveHandler($"{MainCommand}reset");
+        CommandManager.RemoveHandler("/warp");
+
+        foreach (var cmd in registeredPresetCommands)
+        {
+            CommandManager.RemoveHandler($"/{cmd}");
+        }
+        registeredPresetCommands.Clear();
+
+        // Dispose services
+        PoseService?.Dispose();
+        PenumbraService?.Dispose();
+
+        Instance = null;
+    }
+
+    private void SubscribeToPenumbraEvents()
+    {
+        try
+        {
+            // Create action handlers
+            onModAddedAction = OnPenumbraModAdded;
+            onModDeletedAction = OnPenumbraModDeleted;
+            onModMovedAction = OnPenumbraModMoved;
+
+            // Subscribe to mod added event
+            modAddedSubscriber = PluginInterface.GetIpcSubscriber<string, object?>("Penumbra.ModAdded");
+            modAddedSubscriber.Subscribe(onModAddedAction);
+
+            // Subscribe to mod deleted event
+            modDeletedSubscriber = PluginInterface.GetIpcSubscriber<string, object?>("Penumbra.ModDeleted");
+            modDeletedSubscriber.Subscribe(onModDeletedAction);
+
+            // Subscribe to mod moved event
+            modMovedSubscriber = PluginInterface.GetIpcSubscriber<string, string, object?>("Penumbra.ModMoved");
+            modMovedSubscriber.Subscribe(onModMovedAction);
+
+            Log.Information("Subscribed to Penumbra mod events");
+        }
+        catch (Exception ex)
+        {
+            Log.Warning($"Failed to subscribe to Penumbra events: {ex.Message}");
+        }
+    }
+
+    private void UnsubscribeFromPenumbraEvents()
+    {
+        try
+        {
+            if (modAddedSubscriber != null && onModAddedAction != null)
+                modAddedSubscriber.Unsubscribe(onModAddedAction);
+
+            if (modDeletedSubscriber != null && onModDeletedAction != null)
+                modDeletedSubscriber.Unsubscribe(onModDeletedAction);
+
+            if (modMovedSubscriber != null && onModMovedAction != null)
+                modMovedSubscriber.Unsubscribe(onModMovedAction);
+        }
+        catch (Exception ex)
+        {
+            Log.Debug($"Error unsubscribing from Penumbra events: {ex.Message}");
+        }
+    }
+
+    private void OnPenumbraModAdded(string modDirectory)
+    {
+        EmoteDetectionService?.OnModAdded(modDirectory);
+    }
+
+    private void OnPenumbraModDeleted(string modDirectory)
+    {
+        EmoteDetectionService?.OnModDeleted(modDirectory);
+    }
+
+    private void OnPenumbraModMoved(string oldDirectory, string newDirectory)
+    {
+        EmoteDetectionService?.OnModMoved(oldDirectory, newDirectory);
+    }
+
+    private void OnMainCommand(string command, string args)
+    {
+        // Handle subcommands
+        args = args.Trim().ToLower();
+
+        if (args == "reset")
+        {
+            ResetAllPriorities();
+            return;
+        }
+
+        // Default: toggle main window
+        MainWindow.Toggle();
+    }
+
+    private void OnResetCommand(string command, string args)
+    {
+        ResetAllPriorities();
+    }
+
+    private void OnWarpCommand(string command, string args)
+    {
+        Framework.RunOnFrameworkThread(() => WarpToTarget());
+    }
+
+    public void ToggleMainUi()
+    {
+        MainWindow.Toggle();
+    }
+
+    public void UpdatePresetCommands()
+    {
+        // Remove old commands
+        foreach (var cmd in registeredPresetCommands)
+        {
+            try
+            {
+                CommandManager.RemoveHandler($"/{cmd}");
+            }
+            catch (Exception ex)
+            {
+                Log.Debug($"Failed to remove command /{cmd}: {ex.Message}");
+            }
+        }
+        registeredPresetCommands.Clear();
+
+        // Register new commands
+        foreach (var preset in Configuration.Presets)
+        {
+            if (!preset.Enabled || string.IsNullOrWhiteSpace(preset.ChatCommand))
+                continue;
+
+            var cmd = preset.ChatCommand.TrimStart('/').ToLower();
+
+            // Skip if command would conflict with system commands
+            if (cmd == "encore" || cmd == "encorereset")
+                continue;
+
+            // Skip duplicates
+            if (registeredPresetCommands.Contains(cmd))
+            {
+                Log.Warning($"Duplicate command /{cmd} - skipping");
+                continue;
+            }
+
+            try
+            {
+                // Capture preset ID for the lambda
+                var presetId = preset.Id;
+
+                CommandManager.AddHandler($"/{cmd}", new CommandInfo((c, a) => OnPresetCommand(presetId))
+                {
+                    HelpMessage = $"Encore: {preset.Name}",
+                    ShowInHelp = false  // Hide from plugin installer command list
+                });
+
+                registeredPresetCommands.Add(cmd);
+                Log.Debug($"Registered command /{cmd} for preset '{preset.Name}'");
+            }
+            catch (Exception ex)
+            {
+                Log.Warning($"Failed to register command /{cmd}: {ex.Message}");
+            }
+        }
+    }
+
+    private void OnPresetCommand(string presetId)
+    {
+        var preset = Configuration.Presets.Find(p => p.Id == presetId);
+        if (preset != null)
+        {
+            ExecutePreset(preset);
+        }
+    }
+
+    /// <summary>
+    /// Execute a dance preset — adjust priorities, disable conflicts, and perform the emote/pose action.
+    /// </summary>
+    public void ExecutePreset(DancePreset preset)
+    {
+        if (PenumbraService == null || !PenumbraService.IsAvailable)
+        {
+            PrintChat("Penumbra is not available!", XivChatType.ErrorMessage);
+            return;
+        }
+
+        if (string.IsNullOrEmpty(preset.ModDirectory))
+        {
+            if (!preset.IsVanilla)
+            {
+                PrintChat($"Preset '{preset.Name}' has no target mod configured!", XivChatType.ErrorMessage);
+                return;
+            }
+            // Vanilla preset - continue to conflict disabling
+        }
+
+        // Prevent overlapping executions
+        if (isExecutingPreset)
+        {
+            PrintChat("Please wait - still applying previous preset.", XivChatType.Echo);
+            return;
+        }
+
+        // Get current collection
+        var (success, collectionId, collectionName) = PenumbraService.GetCurrentCollection();
+        if (!success)
+        {
+            PrintChat("Could not determine current Penumbra collection!", XivChatType.ErrorMessage);
+            return;
+        }
+
+        Log.Information($"Executing preset '{preset.Name}' in collection '{collectionName}'");
+
+        // Check if this preset is already active in THIS collection (avoid re-boosting priority)
+        var isAlreadyActive = Configuration.ActivePresetId == preset.Id &&
+                              Configuration.ActivePresetCollectionId == collectionId.ToString();
+
+        // Snapshot current state before applying new preset (these are previous preset's changes)
+        var previousPriorities = new Dictionary<string, int>(Configuration.OriginalPriorities);
+        var previousModsWeEnabled = new HashSet<string>(Configuration.ModsWeEnabled);
+        var previousModsWeDisabled = new HashSet<string>(Configuration.ModsWeDisabled);
+        var previousModOptions = new Dictionary<string, Dictionary<string, List<string>>>(Configuration.OriginalModOptions);
+
+        isExecutingPreset = true;
+
+        Task.Run(async () =>
+        {
+            try
+            {
+                // Track what the NEW preset adds (to distinguish from previous state)
+                HashSet<string> newPresetModsEnabled = new();
+                HashSet<string> newPresetModsDisabled = new();
+
+                if (isAlreadyActive)
+                {
+                    // Same preset - just execute emote, don't re-apply priorities
+                    Log.Debug($"Preset '{preset.Name}' already active, skipping priority changes");
+                }
+                else
+                {
+                    // Apply new preset first (fast path)
+                    (newPresetModsEnabled, newPresetModsDisabled) = await ApplyPresetPriorities(preset, collectionId);
+
+                    // Track this as the active preset in this collection
+                    Configuration.ActivePresetId = preset.Id;
+                    Configuration.ActivePresetCollectionId = collectionId.ToString();
+                }
+
+                // Execute emote/pose action (immediate - don't wait)
+                if (preset.ExecuteEmote)
+                {
+                    Framework.RunOnFrameworkThread(() =>
+                    {
+                        switch (preset.AnimationType)
+                        {
+                            case 2: // StandingIdle
+                                if (PoseService != null && preset.PoseIndex >= 0)
+                                {
+                                    PoseService.SetPoseIndex(EmoteController.PoseType.Idle, (byte)preset.PoseIndex);
+                                    ExecuteRedraw();
+                                    PoseService.CycleCPoseToIndex((byte)preset.PoseIndex);
+                                }
+                                else
+                                {
+                                    ExecuteRedraw();
+                                }
+                                break;
+
+                            case 3: // ChairSitting
+                                if (PoseService != null && preset.PoseIndex >= 0)
+                                    PoseService.SetPoseIndex(EmoteController.PoseType.Sit, (byte)preset.PoseIndex);
+                                if (PoseService != null)
+                                    PoseService.ExecuteSitAnywhere();
+                                else
+                                    ExecuteRedraw();
+                                break;
+
+                            case 4: // GroundSitting
+                                if (PoseService != null && preset.PoseIndex >= 0)
+                                    PoseService.SetPoseIndex(EmoteController.PoseType.GroundSit, (byte)preset.PoseIndex);
+                                ExecuteEmote("/groundsit");
+                                break;
+
+                            case 5: // LyingDozing
+                                if (PoseService != null && preset.PoseIndex >= 0)
+                                    PoseService.SetPoseIndex(EmoteController.PoseType.Doze, (byte)preset.PoseIndex);
+                                if (PoseService != null)
+                                    PoseService.ExecuteDozeAnywhere();
+                                else
+                                    ExecuteRedraw();
+                                break;
+
+                            default: // AnimationType 1 (Emote) or unknown
+                                if (!string.IsNullOrEmpty(preset.EmoteCommand))
+                                    ExecuteEmote(preset.EmoteCommand);
+                                break;
+                        }
+                    });
+                }
+
+                // Restore previous preset's changes in background (after emote starts)
+                if (!isAlreadyActive && (previousPriorities.Count > 0 || previousModsWeEnabled.Count > 0 || previousModsWeDisabled.Count > 0 || previousModOptions.Count > 0))
+                {
+                    Log.Debug("Restoring previous preset changes in background...");
+                    await RestorePreviousChanges(collectionId, previousPriorities, previousModsWeEnabled, previousModsWeDisabled, previousModOptions, preset.ModDirectory, newPresetModsEnabled, newPresetModsDisabled);
+                }
+
+                // Save config AFTER both apply and restore are complete
+                // This ensures the persisted state reflects the final result
+                Framework.RunOnFrameworkThread(() =>
+                {
+                    Configuration.Save();
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"Error executing preset: {ex.Message}");
+                Framework.RunOnFrameworkThread(() =>
+                {
+                    PrintChat($"Error executing preset: {ex.Message}", XivChatType.ErrorMessage);
+                });
+            }
+            finally
+            {
+                isExecutingPreset = false;
+            }
+        });
+    }
+
+    private async Task RestorePreviousChanges(Guid collectionId,
+        Dictionary<string, int> previousPriorities,
+        HashSet<string> previousModsWeEnabled,
+        HashSet<string> previousModsWeDisabled,
+        Dictionary<string, Dictionary<string, List<string>>> previousModOptions,
+        string currentPresetModDirectory,
+        HashSet<string> newPresetModsEnabled,
+        HashSet<string> newPresetModsDisabled)
+    {
+        var currentModKey = $"{collectionId}|{currentPresetModDirectory}";
+
+        // Restore priorities from previous preset
+        foreach (var (key, originalPriority) in previousPriorities)
+        {
+            var parts = key.Split('|');
+            if (parts.Length != 2) continue;
+            if (!Guid.TryParse(parts[0], out var storedCollectionId)) continue;
+            if (storedCollectionId != collectionId) continue;
+
+            var modDirectory = parts[1];
+
+            // Skip if this is the current preset's mod (unless it's a vanilla preset with no mod)
+            if (!string.IsNullOrEmpty(currentPresetModDirectory) &&
+                string.Equals(modDirectory, currentPresetModDirectory, StringComparison.OrdinalIgnoreCase))
+            {
+                Log.Debug($"Skipping restore for '{modDirectory}' - it's the current preset's mod");
+                continue;
+            }
+
+            // Skip if the NEW preset disabled this mod as a conflict (check against what was just added, not historical state)
+            if (newPresetModsDisabled.Contains(key))
+            {
+                Log.Debug($"Skipping priority restore for '{modDirectory}' - new preset disabled it as conflict");
+                continue;
+            }
+
+            PenumbraService!.TrySetModPriority(collectionId, modDirectory, originalPriority);
+            Configuration.OriginalPriorities.Remove(key);
+            Log.Debug($"Restored priority for '{modDirectory}' to {originalPriority}");
+            await Task.Delay(5);
+        }
+
+        // Disable mods that previous preset enabled
+        foreach (var key in previousModsWeEnabled)
+        {
+            var parts = key.Split('|');
+            if (parts.Length != 2) continue;
+            if (!Guid.TryParse(parts[0], out var storedCollectionId)) continue;
+            if (storedCollectionId != collectionId) continue;
+
+            var modDirectory = parts[1];
+
+            // Skip if this is the current preset's mod (unless it's a vanilla preset with no mod)
+            if (!string.IsNullOrEmpty(currentPresetModDirectory) &&
+                string.Equals(modDirectory, currentPresetModDirectory, StringComparison.OrdinalIgnoreCase))
+            {
+                Log.Debug($"Skipping disable for '{modDirectory}' - it's the current preset's mod");
+                continue;
+            }
+
+            // Skip if the NEW preset also enabled this mod (check against what was just added)
+            if (newPresetModsEnabled.Contains(key))
+            {
+                Log.Debug($"Skipping disable for '{modDirectory}' - new preset also enabled it");
+                continue;
+            }
+
+            PenumbraService!.TrySetModEnabled(collectionId, modDirectory, false);
+            Configuration.ModsWeEnabled.Remove(key);
+            Log.Debug($"Disabled mod '{modDirectory}' (previous preset had enabled it)");
+            await Task.Delay(5);
+        }
+
+        // Re-enable mods that previous preset disabled
+        foreach (var key in previousModsWeDisabled)
+        {
+            var parts = key.Split('|');
+            if (parts.Length != 2) continue;
+            if (!Guid.TryParse(parts[0], out var storedCollectionId)) continue;
+            if (storedCollectionId != collectionId) continue;
+
+            var modDirectory = parts[1];
+
+            // Skip if this is the current preset's mod (unless it's a vanilla preset with no mod)
+            if (!string.IsNullOrEmpty(currentPresetModDirectory) &&
+                string.Equals(modDirectory, currentPresetModDirectory, StringComparison.OrdinalIgnoreCase))
+            {
+                Log.Debug($"Skipping re-enable for '{modDirectory}' - it's the current preset's mod");
+                continue;
+            }
+
+            // Skip if the NEW preset also disabled this mod as a conflict (check against what was just added)
+            if (newPresetModsDisabled.Contains(key))
+            {
+                Log.Debug($"Skipping re-enable for '{modDirectory}' - new preset also disabled it as conflict");
+                continue;
+            }
+
+            PenumbraService!.TrySetModEnabled(collectionId, modDirectory, true);
+            Configuration.ModsWeDisabled.Remove(key);
+            Log.Debug($"Re-enabled mod '{modDirectory}' (previous preset had disabled it)");
+            await Task.Delay(5);
+        }
+
+        // Restore mod options from previous preset
+        foreach (var (key, originalOptions) in previousModOptions)
+        {
+            var parts = key.Split('|');
+            if (parts.Length != 2) continue;
+            if (!Guid.TryParse(parts[0], out var storedCollectionId)) continue;
+            if (storedCollectionId != collectionId) continue;
+
+            var modDirectory = parts[1];
+
+            // Skip if this is the current preset's mod
+            if (!string.IsNullOrEmpty(currentPresetModDirectory) &&
+                string.Equals(modDirectory, currentPresetModDirectory, StringComparison.OrdinalIgnoreCase))
+            {
+                Log.Debug($"Skipping mod options restore for '{modDirectory}' - it's the current preset's mod");
+                continue;
+            }
+
+            foreach (var (groupName, options) in originalOptions)
+            {
+                PenumbraService!.TrySetModSettings(collectionId, modDirectory, groupName, options);
+            }
+            Configuration.OriginalModOptions.Remove(key);
+            Log.Debug($"Restored mod options for '{modDirectory}'");
+            await Task.Delay(5);
+        }
+
+        Log.Debug("Previous preset changes restored");
+    }
+
+    private async Task RestorePresetPriorities(Guid collectionId)
+    {
+        if (Configuration.OriginalPriorities.Count == 0 && Configuration.ModsWeEnabled.Count == 0 && Configuration.ModsWeDisabled.Count == 0 && Configuration.OriginalModOptions.Count == 0)
+        {
+            Log.Debug("No state to restore (OriginalPriorities, ModsWeEnabled, ModsWeDisabled, and OriginalModOptions are empty)");
+            return;
+        }
+
+        Log.Information($"Restoring previous preset state: {Configuration.OriginalPriorities.Count} priorities, {Configuration.ModsWeEnabled.Count} mods we enabled, {Configuration.ModsWeDisabled.Count} mods we disabled, {Configuration.OriginalModOptions.Count} mod options");
+
+        int prioritiesRestored = 0;
+        int modsDisabled = 0;
+        int modsReEnabled = 0;
+
+        // Restore priorities
+        foreach (var (key, originalPriority) in Configuration.OriginalPriorities.ToList())
+        {
+            var parts = key.Split('|');
+            if (parts.Length != 2)
+                continue;
+
+            if (!Guid.TryParse(parts[0], out var storedCollectionId))
+                continue;
+
+            // Only restore for matching collection
+            if (storedCollectionId != collectionId)
+            {
+                Log.Debug($"Skipping restore for '{parts[1]}' - different collection");
+                continue;
+            }
+
+            var modDirectory = parts[1];
+
+            // Get current priority for logging
+            var (gotCurrent, _, currentPriority, _) = PenumbraService!.GetCurrentModSettings(collectionId, modDirectory, "");
+
+            var result = PenumbraService!.TrySetModPriority(collectionId, modDirectory, originalPriority);
+            if (result)
+            {
+                prioritiesRestored++;
+                Log.Information($"Restored priority for '{modDirectory}': {currentPriority} -> {originalPriority}");
+            }
+            else
+            {
+                Log.Warning($"Failed to restore priority for '{modDirectory}'");
+            }
+
+            await Task.Delay(10);
+        }
+
+        // Disable mods we enabled
+        foreach (var key in Configuration.ModsWeEnabled.ToList())
+        {
+            var parts = key.Split('|');
+            if (parts.Length != 2)
+                continue;
+
+            if (!Guid.TryParse(parts[0], out var storedCollectionId))
+                continue;
+
+            // Only restore for matching collection
+            if (storedCollectionId != collectionId)
+                continue;
+
+            var modDirectory = parts[1];
+
+            var result = PenumbraService!.TrySetModEnabled(collectionId, modDirectory, false);
+            if (result)
+            {
+                modsDisabled++;
+                Log.Information($"Disabled mod '{modDirectory}' (we had enabled it)");
+            }
+            else
+            {
+                Log.Warning($"Failed to disable mod '{modDirectory}'");
+            }
+
+            await Task.Delay(10);
+        }
+
+        // Re-enable mods we disabled (conflicting mods)
+        foreach (var key in Configuration.ModsWeDisabled.ToList())
+        {
+            var parts = key.Split('|');
+            if (parts.Length != 2)
+                continue;
+
+            if (!Guid.TryParse(parts[0], out var storedCollectionId))
+                continue;
+
+            // Only restore for matching collection
+            if (storedCollectionId != collectionId)
+                continue;
+
+            var modDirectory = parts[1];
+
+            var result = PenumbraService!.TrySetModEnabled(collectionId, modDirectory, true);
+            if (result)
+            {
+                modsReEnabled++;
+                Log.Information($"Re-enabled mod '{modDirectory}' (we had disabled it)");
+            }
+            else
+            {
+                Log.Warning($"Failed to re-enable mod '{modDirectory}'");
+            }
+
+            await Task.Delay(10);
+        }
+
+        // Restore mod options
+        int optionsRestored = 0;
+        foreach (var (key, originalOptions) in Configuration.OriginalModOptions.ToList())
+        {
+            var parts = key.Split('|');
+            if (parts.Length != 2)
+                continue;
+
+            if (!Guid.TryParse(parts[0], out var storedCollectionId))
+                continue;
+
+            if (storedCollectionId != collectionId)
+            {
+                Log.Debug($"Skipping mod options restore for '{parts[1]}' - different collection");
+                continue;
+            }
+
+            var modDirectory = parts[1];
+
+            foreach (var (groupName, options) in originalOptions)
+            {
+                var result = PenumbraService!.TrySetModSettings(collectionId, modDirectory, groupName, options);
+                if (result)
+                {
+                    Log.Information($"Restored mod options for '{modDirectory}'.{groupName}");
+                }
+                else
+                {
+                    Log.Warning($"Failed to restore mod options for '{modDirectory}'.{groupName}");
+                }
+            }
+            optionsRestored++;
+
+            await Task.Delay(10);
+        }
+
+        // Clear stored state after restoring
+        Configuration.OriginalPriorities.Clear();
+        Configuration.ModsWeEnabled.Clear();
+        Configuration.ModsWeDisabled.Clear();
+        Configuration.OriginalModOptions.Clear();
+
+        Log.Information($"Restore complete: {prioritiesRestored} priorities restored, {modsDisabled} mods disabled, {modsReEnabled} mods re-enabled, {optionsRestored} mod options restored");
+    }
+
+    private async Task<(HashSet<string> modsEnabled, HashSet<string> modsDisabled)> ApplyPresetPriorities(DancePreset preset, Guid collectionId)
+    {
+        Log.Information($"Applying preset '{preset.Name}' (mod: {preset.ModName}, vanilla: {preset.IsVanilla})");
+
+        // Track what THIS preset application adds (for restoration logic)
+        var newModsEnabled = new HashSet<string>();
+        var newModsDisabled = new HashSet<string>();
+
+        // Vanilla preset - skip mod enable/priority, just disable conflicts
+        if (preset.IsVanilla)
+        {
+            Log.Information($"Vanilla preset - skipping mod enable/priority, only disabling conflicts");
+            var vanillaConflictsDisabled = await DisableConflictingMods(preset, collectionId);
+            foreach (var key in vanillaConflictsDisabled)
+            {
+                newModsDisabled.Add(key);
+            }
+
+            return (newModsEnabled, newModsDisabled);
+        }
+
+        // Get current settings of target mod
+        var (gotSettings, isEnabled, currentPriority, currentOptions) = PenumbraService!.GetCurrentModSettings(collectionId, preset.ModDirectory, preset.ModName);
+        Log.Information($"Current state for '{preset.ModName}': gotSettings={gotSettings}, enabled={isEnabled}, priority={currentPriority}");
+
+        // Store original priority of target mod ONLY (before we change it)
+        var modKey = $"{collectionId}|{preset.ModDirectory}";
+        int originalPriority;
+        if (!Configuration.OriginalPriorities.ContainsKey(modKey))
+        {
+            if (gotSettings)
+            {
+                originalPriority = currentPriority;
+                Configuration.OriginalPriorities[modKey] = currentPriority;
+                Log.Information($"Stored original priority for '{preset.ModName}': {currentPriority}");
+            }
+            else
+            {
+                // Mod not in collection, store 0 as default
+                originalPriority = 0;
+                Configuration.OriginalPriorities[modKey] = 0;
+                Log.Information($"Stored default priority for '{preset.ModName}': 0 (mod not in collection)");
+            }
+        }
+        else
+        {
+            originalPriority = Configuration.OriginalPriorities[modKey];
+            Log.Debug($"Original priority for '{preset.ModName}' already stored: {originalPriority}");
+        }
+
+        // Store original mod options (before we change them)
+        if (!Configuration.OriginalModOptions.ContainsKey(modKey))
+        {
+            if (gotSettings && currentOptions.Count > 0)
+            {
+                // Deep copy the options to avoid reference issues
+                var optionsCopy = new Dictionary<string, List<string>>();
+                foreach (var (group, opts) in currentOptions)
+                {
+                    optionsCopy[group] = new List<string>(opts);
+                }
+                Configuration.OriginalModOptions[modKey] = optionsCopy;
+                Log.Information($"Stored original mod options for '{preset.ModName}': {currentOptions.Count} groups");
+            }
+        }
+        else
+        {
+            Log.Debug($"Original mod options for '{preset.ModName}' already stored");
+        }
+
+        // Always try to enable the mod (it might be disabled or not in collection)
+        // Track that we enabled it if it was disabled OR not in the collection at all
+        var wasDisabled = !gotSettings || !isEnabled;
+        var enableResult = PenumbraService.TrySetModEnabled(collectionId, preset.ModDirectory, true, preset.ModName);
+        if (enableResult)
+        {
+            if (wasDisabled)
+            {
+                // Track that we enabled this mod so we can disable it on restore
+                Configuration.ModsWeEnabled.Add(modKey);
+                newModsEnabled.Add(modKey);
+                Log.Information($"Enabled mod '{preset.ModName}' (was disabled)");
+            }
+            else
+            {
+                Log.Debug($"Ensured mod '{preset.ModName}' is enabled");
+            }
+        }
+        else
+        {
+            Log.Warning($"Failed to enable mod '{preset.ModName}'");
+        }
+
+        // Calculate target priority (boost from ORIGINAL priority, not current)
+        // This prevents priority escalation when switching between presets
+        int boostAmount = preset.PriorityBoost != 0 ? preset.PriorityBoost : Configuration.DefaultPriorityBoost;
+        int basePriority = originalPriority;  // Always use original, not current
+        int targetPriority = basePriority + boostAmount;
+
+        // Set target mod priority (boosted)
+        var targetResult = PenumbraService.TrySetModPriority(collectionId, preset.ModDirectory, targetPriority, preset.ModName);
+        if (targetResult)
+        {
+            Log.Information($"Boosted '{preset.ModName}' priority: {originalPriority} -> {targetPriority} (+{boostAmount})");
+        }
+        else
+        {
+            Log.Warning($"Failed to set priority for '{preset.ModName}'");
+        }
+
+        // Disable conflicting mods (other enabled mods that affect the same emotes)
+        var conflictsDisabled = await DisableConflictingMods(preset, collectionId);
+        foreach (var key in conflictsDisabled)
+        {
+            newModsDisabled.Add(key);
+        }
+
+        // Apply mod options if configured
+        if (preset.ModOptions.Count > 0)
+        {
+            foreach (var (groupName, options) in preset.ModOptions)
+            {
+                PenumbraService.TrySetModSettings(collectionId, preset.ModDirectory, groupName, options, preset.ModName);
+            }
+        }
+
+        return (newModsEnabled, newModsDisabled);
+    }
+
+    // Returns set of mod keys that were disabled by this call
+    private async Task<HashSet<string>> DisableConflictingMods(DancePreset preset, Guid collectionId)
+    {
+        var disabledMods = new HashSet<string>();
+
+        if (EmoteDetectionService == null)
+            return disabledMods;
+
+        // Get the emotes affected by the preset's mod
+        var presetModInfo = EmoteDetectionService.AnalyzeMod(preset.ModDirectory, preset.ModName);
+
+        // Build the set of emotes to check for conflicts
+        var presetEmotes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var presetEmoteCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Add emotes from mod analysis if available
+        if (presetModInfo != null && presetModInfo.AffectedEmotes.Count > 0)
+        {
+            foreach (var emote in presetModInfo.AffectedEmotes)
+                presetEmotes.Add(emote);
+            foreach (var cmd in presetModInfo.EmoteCommands)
+                presetEmoteCommands.Add(cmd.TrimStart('/').ToLowerInvariant());
+        }
+
+        // Fallback: use the preset's configured emote command if we don't have emotes from analysis
+        if (presetEmotes.Count == 0 && !string.IsNullOrEmpty(preset.EmoteCommand))
+        {
+            var emoteCmd = preset.EmoteCommand.TrimStart('/').ToLowerInvariant();
+            presetEmoteCommands.Add(emoteCmd);
+            // Also add as an emote name (many emotes have matching names/commands)
+            presetEmotes.Add(emoteCmd);
+            Log.Debug($"Using preset's configured emote command as fallback: {emoteCmd}");
+        }
+
+        if (presetEmotes.Count == 0 && presetEmoteCommands.Count == 0)
+        {
+            Log.Debug($"No affected emotes found for preset '{preset.Name}', skipping conflict check");
+            return disabledMods;
+        }
+
+        Log.Debug($"Preset '{preset.Name}' affects emotes: [{string.Join(", ", presetEmotes)}], commands: [{string.Join(", ", presetEmoteCommands)}]");
+
+        // Get all emote mods from cache
+        var allEmoteMods = EmoteDetectionService.GetEmoteMods();
+        int conflictsDisabled = 0;
+
+        foreach (var mod in allEmoteMods)
+        {
+            // Skip the preset's own mod (unless vanilla preset which has no mod)
+            if (!preset.IsVanilla && string.Equals(mod.ModDirectory, preset.ModDirectory, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            // Check if this mod affects any of the same emotes (by name or command)
+            var sharedEmotes = mod.AffectedEmotes.Where(e => presetEmotes.Contains(e)).ToList();
+            var sharedCommands = mod.EmoteCommands
+                .Select(c => c.TrimStart('/').ToLowerInvariant())
+                .Where(c => presetEmoteCommands.Contains(c))
+                .ToList();
+
+            if (sharedEmotes.Count == 0 && sharedCommands.Count == 0)
+                continue;
+
+            // For pose presets, only conflict with mods targeting the same pose number
+            if (preset.AnimationType >= 2 && preset.AnimationType <= 5 && preset.PoseIndex >= 0)
+            {
+                if (mod.AnimationType == (EmoteDetectionService.AnimationType)preset.AnimationType)
+                {
+                    // Check if the conflicting mod affects the preset's target pose
+                    bool modAffectsTargetPose;
+                    if (mod.AffectedPoseIndices != null && mod.AffectedPoseIndices.Count > 0)
+                        modAffectsTargetPose = mod.AffectedPoseIndices.Contains(preset.PoseIndex);
+                    else
+                        modAffectsTargetPose = mod.PoseIndex < 0 || mod.PoseIndex == preset.PoseIndex;
+
+                    if (!modAffectsTargetPose)
+                    {
+                        Log.Debug($"Mod '{mod.ModName}' targets pose(s) [{string.Join(",", mod.AffectedPoseIndices ?? new List<int>())}] (PoseIndex={mod.PoseIndex}), preset targets {preset.PoseIndex} - not a conflict");
+                        continue;
+                    }
+                }
+            }
+
+            var sharedDescription = string.Join(", ",
+                sharedEmotes.Concat(sharedCommands.Select(c => $"/{c}")).Distinct());
+
+            // Check if this mod is enabled in the collection
+            var (gotSettings, isEnabled, _, _) = PenumbraService!.GetCurrentModSettings(collectionId, mod.ModDirectory, mod.ModName);
+            if (!gotSettings)
+                continue;
+
+            var modKey = $"{collectionId}|{mod.ModDirectory}";
+
+            // Don't disable pinned mods
+            if (Configuration.PinnedModDirectories.Contains(mod.ModDirectory))
+            {
+                Log.Debug($"Mod '{mod.ModName}' is pinned, not disabling");
+                continue;
+            }
+
+            // If mod is already disabled but conflicts, claim it so restore doesn't re-enable
+            if (!isEnabled)
+            {
+                disabledMods.Add(modKey);
+                Log.Debug($"Mod '{mod.ModName}' already disabled, claiming as conflict to prevent re-enable");
+                continue;
+            }
+
+            // This mod is enabled and conflicts - disable it
+
+            // If tracking says we disabled this mod but Penumbra says it's enabled,
+            // the tracking is stale - we need to actually disable it
+            if (Configuration.ModsWeDisabled.Contains(modKey))
+            {
+                // Tracking is stale (mod is enabled but we thought we disabled it)
+                // Remove stale entry and fall through to actually disable it
+                Log.Debug($"Mod '{mod.ModName}' was tracked as disabled but is actually enabled - stale tracking, will disable");
+                Configuration.ModsWeDisabled.Remove(modKey);
+            }
+
+            var result = PenumbraService.TrySetModEnabled(collectionId, mod.ModDirectory, false, mod.ModName);
+            if (result)
+            {
+                Configuration.ModsWeDisabled.Add(modKey);
+                disabledMods.Add(modKey);
+                conflictsDisabled++;
+                Log.Information($"Disabled conflicting mod '{mod.ModName}' (shares: {sharedDescription})");
+            }
+            else
+            {
+                Log.Warning($"Failed to disable conflicting mod '{mod.ModName}'");
+            }
+
+            await Task.Delay(10);
+        }
+
+        if (conflictsDisabled > 0)
+        {
+            Log.Information($"Disabled {conflictsDisabled} conflicting mod(s)");
+        }
+
+        return disabledMods;
+    }
+
+    public void ResetAllPriorities()
+    {
+        if (PenumbraService == null || !PenumbraService.IsAvailable)
+        {
+            PrintChat("Penumbra is not available!", XivChatType.ErrorMessage);
+            return;
+        }
+
+        if (Configuration.OriginalPriorities.Count == 0 && Configuration.ModsWeEnabled.Count == 0 && Configuration.ModsWeDisabled.Count == 0 && Configuration.OriginalModOptions.Count == 0)
+        {
+            PrintChat("No changes to restore.", XivChatType.Echo);
+            return;
+        }
+
+        Task.Run(async () =>
+        {
+            try
+            {
+                int restored = 0;
+
+                // Restore priorities
+                foreach (var (key, originalPriority) in Configuration.OriginalPriorities.ToList())
+                {
+                    var parts = key.Split('|');
+                    if (parts.Length != 2)
+                        continue;
+
+                    if (!Guid.TryParse(parts[0], out var collectionId))
+                        continue;
+
+                    var modDirectory = parts[1];
+
+                    var result = PenumbraService.TrySetModPriority(collectionId, modDirectory, originalPriority);
+                    if (result)
+                    {
+                        restored++;
+                        Log.Debug($"Restored priority for '{modDirectory}' to {originalPriority}");
+                    }
+
+                    await Task.Delay(5);
+                }
+
+                // Disable mods we enabled
+                foreach (var key in Configuration.ModsWeEnabled.ToList())
+                {
+                    var parts = key.Split('|');
+                    if (parts.Length != 2)
+                        continue;
+
+                    if (!Guid.TryParse(parts[0], out var collectionId))
+                        continue;
+
+                    var modDirectory = parts[1];
+
+                    var result = PenumbraService.TrySetModEnabled(collectionId, modDirectory, false);
+                    if (result)
+                    {
+                        restored++;
+                        Log.Debug($"Disabled mod '{modDirectory}' (we had enabled it)");
+                    }
+
+                    await Task.Delay(5);
+                }
+
+                // Re-enable mods we disabled (conflicting mods)
+                foreach (var key in Configuration.ModsWeDisabled.ToList())
+                {
+                    var parts = key.Split('|');
+                    if (parts.Length != 2)
+                        continue;
+
+                    if (!Guid.TryParse(parts[0], out var collectionId))
+                        continue;
+
+                    var modDirectory = parts[1];
+
+                    var result = PenumbraService.TrySetModEnabled(collectionId, modDirectory, true);
+                    if (result)
+                    {
+                        restored++;
+                        Log.Debug($"Re-enabled mod '{modDirectory}' (we had disabled it)");
+                    }
+
+                    await Task.Delay(5);
+                }
+
+                // Restore mod options
+                foreach (var (key, originalOptions) in Configuration.OriginalModOptions.ToList())
+                {
+                    var parts = key.Split('|');
+                    if (parts.Length != 2)
+                        continue;
+
+                    if (!Guid.TryParse(parts[0], out var collectionId))
+                        continue;
+
+                    var modDirectory = parts[1];
+
+                    foreach (var (groupName, options) in originalOptions)
+                    {
+                        PenumbraService.TrySetModSettings(collectionId, modDirectory, groupName, options);
+                    }
+                    restored++;
+                    Log.Debug($"Restored mod options for '{modDirectory}'");
+
+                    await Task.Delay(5);
+                }
+
+                // Clear stored state and active preset
+                Configuration.OriginalPriorities.Clear();
+                Configuration.ModsWeEnabled.Clear();
+                Configuration.ModsWeDisabled.Clear();
+                Configuration.OriginalModOptions.Clear();
+                Configuration.ActivePresetId = null;
+                Configuration.ActivePresetCollectionId = null;
+
+                Framework.RunOnFrameworkThread(() =>
+                {
+                    Configuration.Save();
+                    PrintChat($"Restored state for {restored} mod(s).", XivChatType.Echo);
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"Error resetting priorities: {ex.Message}");
+                Framework.RunOnFrameworkThread(() =>
+                {
+                    PrintChat($"Error resetting priorities: {ex.Message}", XivChatType.ErrorMessage);
+                });
+            }
+        });
+    }
+
+    public const float MaxWarpDistance = 2f;
+
+    public unsafe (bool hasTarget, string targetName, float distance, bool inRange) GetWarpState()
+    {
+        var target = TargetManager.Target ?? TargetManager.SoftTarget;
+        if (target == null)
+            return (false, "", 0f, false);
+
+        var player = (Character*)(ObjectTable.LocalPlayer?.Address ?? nint.Zero);
+        if (player == null)
+            return (false, "", 0f, false);
+
+        var playerPos = new System.Numerics.Vector3(
+            player->GameObject.Position.X,
+            player->GameObject.Position.Y,
+            player->GameObject.Position.Z);
+        var distance = System.Numerics.Vector3.Distance(playerPos, target.Position);
+
+        return (true, target.Name.TextValue, distance, distance <= MaxWarpDistance);
+    }
+
+    public unsafe void WarpToTarget()
+    {
+        var target = TargetManager.Target ?? TargetManager.SoftTarget;
+        if (target == null)
+        {
+            PrintChat("Select a target first.", XivChatType.ErrorMessage);
+            return;
+        }
+
+        var player = (Character*)(ObjectTable.LocalPlayer?.Address ?? nint.Zero);
+        if (player == null) return;
+
+        var playerPos = new System.Numerics.Vector3(
+            player->GameObject.Position.X,
+            player->GameObject.Position.Y,
+            player->GameObject.Position.Z);
+        var targetPos = target.Position;
+        var distance = System.Numerics.Vector3.Distance(playerPos, targetPos);
+
+        if (distance > MaxWarpDistance)
+        {
+            PrintChat($"Move closer to {target.Name.TextValue} and try again.", XivChatType.ErrorMessage);
+            return;
+        }
+
+        // Fine-tune position to match target exactly
+        player->GameObject.SetPosition(targetPos.X, targetPos.Y, targetPos.Z);
+
+        // Match target's rotation (if enabled in config)
+        if (Configuration.WarpMatchRotation)
+        {
+            player->GameObject.SetRotation(target.Rotation);
+        }
+
+        Log.Debug($"Warped to target '{target.Name}' ({distance:F2} units away)");
+    }
+
+    private unsafe void ExecuteEmote(string command)
+    {
+        if (string.IsNullOrWhiteSpace(command))
+            return;
+
+        // Ensure command starts with /
+        if (!command.StartsWith("/"))
+            command = "/" + command;
+
+        try
+        {
+            // Execute via game's chat system (not CommandManager - that's for plugin commands only)
+            var uiModule = UIModule.Instance();
+            if (uiModule != null)
+            {
+                using var str = new Utf8String(command);
+                uiModule->ProcessChatBoxEntry(&str);
+                Log.Debug($"Executed emote: {command}");
+            }
+            else
+            {
+                Log.Warning("UIModule not available, cannot execute emote");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"Failed to execute emote '{command}': {ex.Message}");
+        }
+    }
+
+    private unsafe void ExecuteRedraw()
+    {
+        try
+        {
+            // Execute via game's chat system (same as emotes)
+            var uiModule = UIModule.Instance();
+            if (uiModule != null)
+            {
+                using var str = new Utf8String("/penumbra redraw self");
+                uiModule->ProcessChatBoxEntry(&str);
+                Log.Debug("Executed Penumbra redraw for pose mod");
+            }
+            else
+            {
+                Log.Warning("UIModule not available, cannot execute redraw");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"Failed to execute redraw: {ex.Message}");
+        }
+    }
+
+    private void PrintChat(string message, XivChatType type = XivChatType.Echo)
+    {
+        var seString = new SeStringBuilder()
+            .AddUiForeground("[Encore] ", 35)
+            .AddText(message)
+            .Build();
+
+        ChatGui.Print(new XivChatEntry
+        {
+            Message = seString,
+            Type = type
+        });
+    }
+}
