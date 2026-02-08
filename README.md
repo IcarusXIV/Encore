@@ -1,6 +1,6 @@
 # Encore
 
-**Your Dance Mods, One Command Away** — Create presets for your favorite dance and emote mods, then activate them instantly with custom chat commands. Automatically handles Penumbra mod priorities so your animations always show correctly.
+**Your Dance Mods, One Command Away** -- Create presets for your favorite dance and emote mods, then activate them instantly with custom chat commands. Automatically handles Penumbra mod priorities so your animations always show correctly.
 
 ## Installation
 
@@ -11,12 +11,12 @@ https://raw.githubusercontent.com/IcarusXIV/Encore/master/repo.json
 
 ## What It Does
 
-- **One-Click Dance Switching** — Save dance/emote mods as presets and activate them instantly
-- **Custom Chat Commands** — Create your own commands like `/hips` or `/mydance` for each preset
-- **Automatic Priority Management** — Boosts your target mod's priority so it always wins over conflicts
-- **Smart Emote Detection** — Automatically detects which emote a mod affects and executes it
-- **Icon Picker** — Choose from hundreds of game icons for your presets
-- **Pose Support** — Works with idle poses, sitting poses (chair/groundsit), and doze animations (triggers redraw automatically)
+- **One-Click Dance Switching** -- Save dance/emote mods as presets and activate them instantly
+- **Custom Chat Commands** -- Create your own commands like `/hips` or `/mydance` for each preset
+- **Automatic Priority Management** -- Boosts your target mod's priority so it always wins over conflicts
+- **Smart Emote Detection** -- Automatically detects which emote a mod affects and executes it
+- **Icon Picker** -- Choose from hundreds of game icons for your presets
+- **Pose Support** -- Works with idle poses, sitting poses (chair/groundsit), and doze animations (triggers redraw automatically)
 
 ## Features
 
