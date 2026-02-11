@@ -1695,6 +1695,24 @@ public class EmoteDetectionService
             }
         }
 
+        // Mixed-type mod detection: if we classified as a pose mod but also found
+        // real emote commands (dances, cheers, etc.), this is a mega mod that covers
+        // multiple animation types. Classify as Emote so the preset editor shows the
+        // full emote dropdown, but preserve the original pose type so users can still
+        // create pose presets from it.
+        AnimationType originalPoseType = AnimationType.None;
+        if (isPoseMod && emoteCommands.Count > 0)
+        {
+            var poseOnlyCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                { "/cpose", "/sit", "/groundsit", "/doze" };
+            if (emoteCommands.Any(cmd => !poseOnlyCommands.Contains(cmd)))
+            {
+                originalPoseType = detectedAnimationType;
+                detectedAnimationType = AnimationType.Emote;
+                log.Debug($"Mod '{modName}' has both emotes and poses — classifying as Emote (mixed-type mod, pose type: {originalPoseType})");
+            }
+        }
+
         // If we found nothing, return null
         if (affectedEmotes.Count == 0 && emoteCommands.Count == 0)
         {
@@ -1737,6 +1755,7 @@ public class EmoteDetectionService
             PrimaryEmote = primaryEmote,
             EmoteCommand = primaryCommand,
             AnimationType = detectedAnimationType,
+            PoseAnimationType = originalPoseType,
             PoseIndex = detectedPoseIndex,
             AffectedPoseIndices = sortedPoseIndices
         };
@@ -2392,6 +2411,12 @@ public class EmoteModInfo
     public string EmoteCommand { get; set; } = "";
 
     public EmoteDetectionService.AnimationType AnimationType { get; set; } = EmoteDetectionService.AnimationType.Emote;
+
+    /// <summary>
+    /// For mixed-type mods (e.g., mega mods with dances + poses): the original pose type
+    /// before reclassification to Emote. None if not a mixed mod.
+    /// </summary>
+    public EmoteDetectionService.AnimationType PoseAnimationType { get; set; } = EmoteDetectionService.AnimationType.None;
 
     /// <summary>
     /// The pose index (0-6) for pose mods, or -1 if not applicable/unknown.

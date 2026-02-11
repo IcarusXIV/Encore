@@ -31,6 +31,7 @@ public class PresetEditorWindow : Window
     private int selectedEmoteIndex = 0;  // Which emote to use when there are multiple
     private bool useCustomEmoteCommand = false;  // User wants to override detected emote
     private EmoteDetectionService.AnimationType detectedAnimationType = EmoteDetectionService.AnimationType.Emote;
+    private EmoteDetectionService.AnimationType detectedPoseAnimationType = EmoteDetectionService.AnimationType.None;  // For mixed mods
     private List<int> detectedPoseIndices = new();  // All pose indices detected for this mod
     private int selectedPoseIndex = -1;  // The pose index the user selected
 
@@ -292,6 +293,7 @@ public class PresetEditorWindow : Window
         detectedConflicts = new List<string>();
         selectedEmoteIndex = 0;  // Reset selection
         detectedAnimationType = EmoteDetectionService.AnimationType.Emote;  // Reset to default
+        detectedPoseAnimationType = EmoteDetectionService.AnimationType.None;  // Reset mixed-mod pose type
         detectedPoseIndices = new List<int>();  // Reset pose indices
         selectedPoseIndex = -1;  // Reset selected pose
 
@@ -309,6 +311,7 @@ public class PresetEditorWindow : Window
             detectedEmotes = modInfo.AffectedEmotes;
             detectedEmoteCommands = modInfo.EmoteCommands;
             detectedAnimationType = modInfo.AnimationType;
+            detectedPoseAnimationType = modInfo.PoseAnimationType;
             // Populate pose indices from the mod's detected list (fallback to single PoseIndex)
             if (modInfo.AffectedPoseIndices.Count > 0)
                 detectedPoseIndices = new List<int>(modInfo.AffectedPoseIndices);
@@ -689,7 +692,7 @@ public class PresetEditorWindow : Window
 
             if (isPoseMod)
             {
-                // Pose mod — show type, pose index, and explain redraw behaviour
+                // Pure pose mod — show type, pose index, and explain redraw behaviour
                 var poseTypeName = detectedAnimationType switch
                 {
                     EmoteDetectionService.AnimationType.StandingIdle => "Idle",
@@ -699,10 +702,8 @@ public class PresetEditorWindow : Window
                     _ => "Pose"
                 };
 
-                // Show pose picker
                 if (detectedPoseIndices.Count > 1)
                 {
-                    // Multi-pose mod - show dropdown for user to pick
                     ImGui.TextColored(new Vector4(0.6f, 0.8f, 1f, 1f), $"Type: {poseTypeName} (will redraw)");
                     ImGui.Text("Pose to use:");
                     ImGui.SetNextItemWidth(200);
@@ -717,8 +718,7 @@ public class PresetEditorWindow : Window
                 }
                 else if (detectedPoseIndices.Count == 1)
                 {
-                    var poseInfo = $"Type: {poseTypeName} #{detectedPoseIndices[0]} (will redraw)";
-                    ImGui.TextColored(new Vector4(0.6f, 0.8f, 1f, 1f), poseInfo);
+                    ImGui.TextColored(new Vector4(0.6f, 0.8f, 1f, 1f), $"Type: {poseTypeName} #{detectedPoseIndices[0]} (will redraw)");
                 }
                 else
                 {
@@ -732,12 +732,11 @@ public class PresetEditorWindow : Window
             }
             else
             {
-                // Emote mod - show emote selection
+                // Emote mod (or mixed mod) - show emote selection
                 ImGui.Text("Emote to execute:");
 
                 if (detectedEmoteCommands.Count > 0 && !useCustomEmoteCommand)
                 {
-                    // Show combo with detected emotes
                     ImGui.SetNextItemWidth(200);
                     var emoteOptions = detectedEmoteCommands.ToArray();
                     if (selectedEmoteIndex >= emoteOptions.Length)
@@ -748,7 +747,6 @@ public class PresetEditorWindow : Window
                         editEmoteCommand = detectedEmoteCommands[selectedEmoteIndex];
                     }
 
-                    // Button to switch to custom input
                     ImGui.SameLine();
                     if (ImGui.Button("Custom"))
                     {
@@ -765,18 +763,15 @@ public class PresetEditorWindow : Window
                 }
                 else
                 {
-                    // Custom emote input
                     ImGui.SetNextItemWidth(200);
                     ImGui.Text("/");
                     ImGui.SameLine(0, 0);
                     ImGui.SetNextItemWidth(180);
                     if (ImGui.InputText("##customEmote", ref editEmoteCommand, 50))
                     {
-                        // Clean up: ensure it starts with /
                         editEmoteCommand = "/" + editEmoteCommand.TrimStart('/').ToLowerInvariant();
                     }
 
-                    // Button to switch back to detected emotes (if any)
                     if (detectedEmoteCommands.Count > 0)
                     {
                         ImGui.SameLine();
@@ -793,6 +788,41 @@ public class PresetEditorWindow : Window
                     {
                         ImGui.SameLine();
                         ImGui.TextColored(new Vector4(1f, 0.8f, 0.4f, 1f), "(auto-detect failed)");
+                    }
+                }
+
+                // Auto-detect pose commands: if user selected /sit, /groundsit, or /doze,
+                // show the pose picker so they can choose which pose number
+                var selectedCommandAnimType = GetAnimationTypeForCommand(editEmoteCommand);
+                if (selectedCommandAnimType != EmoteDetectionService.AnimationType.Emote &&
+                    detectedPoseIndices.Count > 0)
+                {
+                    ImGui.Spacing();
+                    var poseTypeName = selectedCommandAnimType switch
+                    {
+                        EmoteDetectionService.AnimationType.StandingIdle => "Idle",
+                        EmoteDetectionService.AnimationType.ChairSitting => "Sit",
+                        EmoteDetectionService.AnimationType.GroundSitting => "Ground Sit",
+                        EmoteDetectionService.AnimationType.LyingDozing => "Doze",
+                        _ => "Pose"
+                    };
+
+                    if (detectedPoseIndices.Count > 1)
+                    {
+                        ImGui.Text($"{poseTypeName} pose to use:");
+                        ImGui.SetNextItemWidth(200);
+                        var poseOptions = detectedPoseIndices.Select(i => $"Pose #{i}").ToArray();
+                        var currentIdx = detectedPoseIndices.IndexOf(selectedPoseIndex);
+                        if (currentIdx < 0) currentIdx = 0;
+                        if (ImGui.Combo("##poseSelect", ref currentIdx, poseOptions, poseOptions.Length))
+                        {
+                            selectedPoseIndex = detectedPoseIndices[currentIdx];
+                        }
+                    }
+                    else if (detectedPoseIndices.Count == 1)
+                    {
+                        ImGui.TextColored(new Vector4(0.6f, 0.8f, 1f, 1f), $"{poseTypeName} pose #{detectedPoseIndices[0]}");
+                        selectedPoseIndex = detectedPoseIndices[0];
                     }
                 }
             }
@@ -957,8 +987,22 @@ public class PresetEditorWindow : Window
         }
 
         CurrentPreset.ExecuteEmote = true;
-        CurrentPreset.AnimationType = (int)detectedAnimationType;
-        CurrentPreset.PoseIndex = selectedPoseIndex;
+
+        // Determine animation type: if the selected emote is a pose command (/sit, /groundsit, /doze),
+        // use the corresponding pose animation type so the preset executes as a pose preset
+        var commandAnimType = GetAnimationTypeForCommand(CurrentPreset.EmoteCommand);
+        if (commandAnimType != EmoteDetectionService.AnimationType.Emote &&
+            detectedPoseIndices.Count > 0)
+        {
+            CurrentPreset.AnimationType = (int)commandAnimType;
+            CurrentPreset.PoseIndex = selectedPoseIndex;
+        }
+        else
+        {
+            CurrentPreset.AnimationType = (int)detectedAnimationType;
+            CurrentPreset.PoseIndex = selectedPoseIndex;
+        }
+
         CurrentPreset.IsVanilla = isVanillaPreset;
 
         // Save mod options (deep copy)
@@ -967,6 +1011,17 @@ public class PresetEditorWindow : Window
         {
             CurrentPreset.ModOptions[group] = new List<string>(opts);
         }
+    }
+
+    private static EmoteDetectionService.AnimationType GetAnimationTypeForCommand(string? command)
+    {
+        return command?.ToLowerInvariant() switch
+        {
+            "/sit" => EmoteDetectionService.AnimationType.ChairSitting,
+            "/groundsit" => EmoteDetectionService.AnimationType.GroundSitting,
+            "/doze" => EmoteDetectionService.AnimationType.LyingDozing,
+            _ => EmoteDetectionService.AnimationType.Emote
+        };
     }
 
     private string SanitizeCommand(string input)

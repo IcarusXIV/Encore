@@ -11,7 +11,7 @@ namespace Encore.Services;
 // Cache data structure for emote mods - persisted to disk
 public class EmoteModCacheData
 {
-    public const int CurrentVersion = 4;
+    public const int CurrentVersion = 5;
 
     [JsonPropertyName("version")]
     public int Version { get; set; } = CurrentVersion;
@@ -46,6 +46,9 @@ public class EmoteModCacheEntry
 
     [JsonPropertyName("animationType")]
     public int AnimationType { get; set; } = 1; // Default to Emote (1)
+
+    [JsonPropertyName("poseAnimationType")]
+    public int PoseAnimationType { get; set; } = 0; // For mixed mods: original pose type before reclassification
 
     [JsonPropertyName("poseIndex")]
     public int PoseIndex { get; set; } = -1; // -1 = not applicable/unknown
@@ -118,6 +121,7 @@ public class EmoteModCache
                     PrimaryEmote = entry.PrimaryEmote,
                     EmoteCommand = entry.PrimaryCommand,
                     AnimationType = (EmoteDetectionService.AnimationType)entry.AnimationType,
+                    PoseAnimationType = (EmoteDetectionService.AnimationType)entry.PoseAnimationType,
                     PoseIndex = entry.PoseIndex,
                     AffectedPoseIndices = new List<int>(entry.AffectedPoseIndices ?? new List<int>())
                 });
@@ -143,6 +147,7 @@ public class EmoteModCache
                 PrimaryEmote = emoteInfo?.PrimaryEmote ?? "",
                 PrimaryCommand = emoteInfo?.EmoteCommand ?? "",
                 AnimationType = (int)(emoteInfo?.AnimationType ?? EmoteDetectionService.AnimationType.Emote),
+                PoseAnimationType = (int)(emoteInfo?.PoseAnimationType ?? EmoteDetectionService.AnimationType.None),
                 PoseIndex = emoteInfo?.PoseIndex ?? -1,
                 AffectedPoseIndices = emoteInfo?.AffectedPoseIndices != null ? new List<int>(emoteInfo.AffectedPoseIndices) : new List<int>(),
                 LastSeen = DateTime.UtcNow

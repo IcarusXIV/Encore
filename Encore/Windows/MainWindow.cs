@@ -1074,17 +1074,34 @@ public class MainWindow : Window, IDisposable
 
         ImGui.SameLine();
 
-        // Warp to target button (dynamic colour based on range)
-        var warpState = Plugin.Instance?.GetWarpState() ?? (false, "", 0f, false);
+        // Align to target button (dynamic colour based on state)
+        var alignState = Plugin.Instance?.GetAlignState() ?? (false, "", 0f, false, true, false);
+        var isWalking = alignState.isWalking;
+        var alignBlocked = alignState.hasTarget && !alignState.isStanding && !isWalking;
 
-        if (warpState.inRange)
+        if (isWalking)
+        {
+            // Cyan pulse - actively walking to target
+            var pulse = (float)(Math.Sin(ImGui.GetTime() * 4.0) * 0.15 + 0.85);
+            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.1f * pulse, 0.5f * pulse, 0.6f * pulse, 1f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.15f * pulse, 0.6f * pulse, 0.7f * pulse, 1f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.08f * pulse, 0.4f * pulse, 0.5f * pulse, 1f));
+        }
+        else if (alignBlocked)
+        {
+            // Orange - sitting/dozing, blocked
+            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.6f, 0.4f, 0.1f, 1f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.7f, 0.5f, 0.15f, 1f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.5f, 0.35f, 0.05f, 1f));
+        }
+        else if (alignState.inRange)
         {
             // Green - in range
             ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.15f, 0.55f, 0.15f, 1f));
             ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.2f, 0.65f, 0.2f, 1f));
             ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.1f, 0.45f, 0.1f, 1f));
         }
-        else if (warpState.hasTarget)
+        else if (alignState.hasTarget)
         {
             // Dim red - has target but too far
             ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.55f, 0.15f, 0.15f, 1f));
@@ -1093,36 +1110,49 @@ public class MainWindow : Window, IDisposable
         }
 
         ImGui.PushFont(UiBuilder.IconFont);
-        var warpClicked = ImGui.Button(FontAwesomeIcon.LocationCrosshairs.ToIconString(), new Vector2(35 * scale, 30 * scale));
+        var alignClicked = ImGui.Button(FontAwesomeIcon.LocationCrosshairs.ToIconString(), new Vector2(35 * scale, 30 * scale));
         ImGui.PopFont();
 
-        if (warpState.inRange || warpState.hasTarget)
+        if (isWalking || alignBlocked || alignState.inRange || alignState.hasTarget)
         {
             ImGui.PopStyleColor(3);
         }
 
-        if (warpClicked)
+        if (alignClicked)
         {
-            Plugin.Framework.RunOnFrameworkThread(() => Plugin.Instance?.WarpToTarget());
+            if (isWalking)
+                Plugin.Instance?.MovementService?.Cancel();
+            else
+                Plugin.Framework.RunOnFrameworkThread(() => Plugin.Instance?.AlignToTarget());
         }
 
         if (ImGui.IsItemHovered())
         {
             ImGui.BeginTooltip();
-            if (!warpState.hasTarget)
+            if (isWalking)
             {
-                ImGui.Text("Warp to Target");
+                ImGui.TextColored(new Vector4(0.3f, 0.9f, 0.9f, 1f), "Walking to target...");
+                ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "Click to cancel.");
+            }
+            else if (!alignState.hasTarget)
+            {
+                ImGui.Text("Align to Target");
                 ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "Select a target first.");
             }
-            else if (warpState.inRange)
+            else if (alignBlocked)
             {
-                ImGui.TextColored(new Vector4(0.4f, 1f, 0.4f, 1f), "Ready to warp!");
-                ImGui.Text($"Target: {warpState.targetName}");
+                ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f), "Stand up first.");
+                ImGui.Text($"Target: {alignState.targetName}");
+            }
+            else if (alignState.inRange)
+            {
+                ImGui.TextColored(new Vector4(0.4f, 1f, 0.4f, 1f), "Ready to align!");
+                ImGui.Text($"Target: {alignState.targetName}");
             }
             else
             {
                 ImGui.TextColored(new Vector4(1f, 0.5f, 0.5f, 1f), "Move closer to your target.");
-                ImGui.Text($"Target: {warpState.targetName}");
+                ImGui.Text($"Target: {alignState.targetName}");
             }
             ImGui.EndTooltip();
         }
@@ -1162,8 +1192,8 @@ public class MainWindow : Window, IDisposable
             ImGui.EndTooltip();
         }
 
-        // Help button (right edge)
-        ImGui.SameLine(ImGui.GetWindowWidth() - 40 * scale);
+        // Help button (right edge, with room for gear button)
+        ImGui.SameLine(ImGui.GetWindowWidth() - 75 * scale);
         if (ImGui.Button("?", new Vector2(30 * scale, 30 * scale)))
         {
             helpWindow?.Toggle();
@@ -1173,7 +1203,24 @@ public class MainWindow : Window, IDisposable
             ImGui.SetTooltip("Help & Guide");
         }
 
-        // Draw pinned mods popup
+        ImGui.SameLine();
+
+        // Settings gear button (far right)
+        ImGui.PushFont(UiBuilder.IconFont);
+        var gearClicked = ImGui.Button(FontAwesomeIcon.Cog.ToIconString(), new Vector2(30 * scale, 30 * scale));
+        ImGui.PopFont();
+
+        if (gearClicked)
+        {
+            ImGui.OpenPopup("###settingsPopup");
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Settings");
+        }
+
+        // Draw popups
+        DrawSettingsPopup();
         DrawPinnedModsPopup();
     }
 
@@ -1257,6 +1304,51 @@ public class MainWindow : Window, IDisposable
                 // Show total count
                 ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f),
                     $"{emoteMods.Count} mods available");
+            }
+
+            ImGui.EndPopup();
+        }
+    }
+
+    private void DrawSettingsPopup()
+    {
+        var scale = UIStyles.Scale;
+        ImGui.SetNextWindowSize(new Vector2(300 * scale, 0));
+
+        if (ImGui.BeginPopup("###settingsPopup"))
+        {
+            var config = Plugin.Instance?.Configuration;
+            if (config != null)
+            {
+                ImGui.Text("Settings");
+                ImGui.Separator();
+                ImGui.Spacing();
+
+                // Sit/Doze Anywhere toggle
+                var allowAnywhere = config.AllowSitDozeAnywhere;
+                if (ImGui.Checkbox("Allow Sit/Doze Anywhere", ref allowAnywhere))
+                {
+                    config.AllowSitDozeAnywhere = allowAnywhere;
+                    config.Save();
+                }
+                ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f),
+                    "Sit/doze without nearby furniture.");
+                if (allowAnywhere)
+                {
+                    ImGui.Spacing();
+                    ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f),
+                        "This uses the same technique as DozeAnywhere.");
+                    ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f),
+                        "It sends position data to SE's servers and");
+                    ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f),
+                        "may be detectable. Use at your own risk.");
+                }
+                else
+                {
+                    ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f),
+                        "When off, /sit and /doze require furniture.");
+                }
+
             }
 
             ImGui.EndPopup();

@@ -19,7 +19,7 @@ Requires [Penumbra](https://github.com/xivdev/Penumbra).
 
 **Pose presets** -- Not just emotes. Encore supports idle poses, sitting poses, ground sitting, and doze animations. It writes the pose index, triggers a redraw, and cycles `/cpose` automatically so you don't have to.
 
-**Sit & doze anywhere** -- Chair-sit and doze presets place your character into the sit or doze state without needing furniture. No chair required.
+**Sit & doze anywhere** -- Chair-sit and doze presets place your character into the sit or doze state without needing furniture. No chair required. (Opt-in via settings button)
 
 **Conflict handling** -- When you activate a preset, Encore temporarily disables other mods that affect the same emote so yours always wins. Pin your important mods to protect them from being disabled.
 
@@ -27,7 +27,7 @@ Requires [Penumbra](https://github.com/xivdev/Penumbra).
 
 **Vanilla presets** -- Want to go back to the original game animation? Create a vanilla preset that just disables conflicting mods without enabling anything.
 
-**Warp to target** -- For duo or group emotes, use `/warp` (or the button in the main window) to warp to your partner's exact position. Stand next to them first -- it only works within a short distance.
+**Align to target** -- For duo or group emotes, use `/align` (or the button in the main window) to move to your partner's exact position. Stand next to them first -- it only works within a short distance.
 
 ## Organising Your Presets
 
@@ -44,7 +44,7 @@ Requires [Penumbra](https://github.com/xivdev/Penumbra).
 |---------|-------------|
 | `/encore` | Open the main window |
 | `/encorereset` | Restore all mods to their original state |
-| `/warp` | Warp to your target's position (must be close) |
+| `/align` | Warp to your target's position (must be close) |
 | `/yourcommand` | Activate a preset (you define these) |
 
 ## Getting Started

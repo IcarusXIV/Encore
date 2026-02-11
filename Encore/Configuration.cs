@@ -40,7 +40,8 @@ public class Configuration : IPluginConfiguration
     public bool HasSeenHelp { get; set; } = false;
     public List<PresetFolder> Folders { get; set; } = new();
     public List<string> FolderOrder { get; set; } = new();
-    public bool WarpMatchRotation { get; set; } = true;
+    // Opt-in: use game functions for sit/doze anywhere (sends position data to server)
+    public bool AllowSitDozeAnywhere { get; set; } = false;
 
     public void Save()
     {

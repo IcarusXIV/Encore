@@ -34,6 +34,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IGameInteropProvider GameInteropProvider { get; private set; } = null!;
     [PluginService] internal static IObjectTable ObjectTable { get; private set; } = null!;
     [PluginService] internal static ITargetManager TargetManager { get; private set; } = null!;
+    [PluginService] internal static IGameConfig GameConfig { get; private set; } = null!;
 
     // Main command
     private const string MainCommand = "/encore";
@@ -44,6 +45,7 @@ public sealed class Plugin : IDalamudPlugin
     // Services
     public PenumbraService? PenumbraService { get; private set; }
     public EmoteDetectionService? EmoteDetectionService { get; private set; }
+    public MovementService? MovementService { get; private set; }
     public PoseService? PoseService { get; private set; }
 
     // Windows
@@ -58,6 +60,15 @@ public sealed class Plugin : IDalamudPlugin
 
     // Prevent overlapping preset executions
     private volatile bool isExecutingPreset = false;
+
+    // Emote loop tracking (/loop command)
+    private string? loopingEmoteCommand = null;
+    private ushort previousEmoteId = 0;
+    private ushort previousTimeline = 0;
+    private ushort loopingEmoteId = 0;
+    private ushort emoteTimeline = 0;
+    private bool loopWaitingForStart = false;
+    private System.Numerics.Vector3 previousPosition;
 
     public Plugin()
     {
@@ -84,6 +95,7 @@ public sealed class Plugin : IDalamudPlugin
             PenumbraService = new PenumbraService(PluginInterface, Log);
             EmoteDetectionService = new EmoteDetectionService(PenumbraService, PluginInterface, Log);
             PoseService = new PoseService(GameInteropProvider, ObjectTable, Framework, Log);
+            MovementService = new MovementService(GameInteropProvider, ObjectTable, GameConfig, Log);
 
             // Initialize emote mod cache in background (like CS+)
             if (PenumbraService.IsAvailable)
@@ -128,10 +140,16 @@ public sealed class Plugin : IDalamudPlugin
             HelpMessage = "Reset all mod priorities to their original values"
         });
 
-        // Register warp command
-        CommandManager.AddHandler("/warp", new CommandInfo(OnWarpCommand)
+        // Register align command
+        CommandManager.AddHandler("/align", new CommandInfo(OnAlignCommand)
         {
-            HelpMessage = "Warp to your target's position"
+            HelpMessage = "Walk to your target's position for alignment"
+        });
+
+        // Register loop command
+        CommandManager.AddHandler("/loop", new CommandInfo(OnLoopCommand)
+        {
+            HelpMessage = "Loop an emote (e.g., /loop stomp). Use /loop to stop."
         });
 
         // Register preset commands
@@ -149,6 +167,7 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.Draw += WindowSystem.Draw;
         PluginInterface.UiBuilder.OpenConfigUi += ToggleMainUi;
         PluginInterface.UiBuilder.OpenMainUi += ToggleMainUi;
+        Framework.Update += OnFrameworkUpdate;
 
         Log.Information($"Encore loaded. Penumbra available: {PenumbraService?.IsAvailable ?? false}");
     }
@@ -163,7 +182,8 @@ public sealed class Plugin : IDalamudPlugin
 
     public void Dispose()
     {
-        // Unhook UI
+        // Unhook UI and framework
+        Framework.Update -= OnFrameworkUpdate;
         PluginInterface.UiBuilder.Draw -= WindowSystem.Draw;
         PluginInterface.UiBuilder.OpenConfigUi -= ToggleMainUi;
         PluginInterface.UiBuilder.OpenMainUi -= ToggleMainUi;
@@ -178,7 +198,8 @@ public sealed class Plugin : IDalamudPlugin
         // Remove commands
         CommandManager.RemoveHandler(MainCommand);
         CommandManager.RemoveHandler($"{MainCommand}reset");
-        CommandManager.RemoveHandler("/warp");
+        CommandManager.RemoveHandler("/align");
+        CommandManager.RemoveHandler("/loop");
 
         foreach (var cmd in registeredPresetCommands)
         {
@@ -187,6 +208,7 @@ public sealed class Plugin : IDalamudPlugin
         registeredPresetCommands.Clear();
 
         // Dispose services
+        MovementService?.Dispose();
         PoseService?.Dispose();
         PenumbraService?.Dispose();
 
@@ -276,9 +298,41 @@ public sealed class Plugin : IDalamudPlugin
         ResetAllPriorities();
     }
 
-    private void OnWarpCommand(string command, string args)
+    private static readonly HashSet<string> NoLoopCommands = new(StringComparer.OrdinalIgnoreCase)
     {
-        Framework.RunOnFrameworkThread(() => WarpToTarget());
+        "/sit", "/groundsit", "/doze", "/cpose", "/changepose",
+    };
+
+    private void OnLoopCommand(string command, string args)
+    {
+        var emote = args.Trim();
+
+        // /loop with no args = stop looping
+        if (string.IsNullOrEmpty(emote))
+        {
+            ClearEmoteLoop();
+            return;
+        }
+
+        // Normalize: add leading slash if missing
+        if (!emote.StartsWith("/"))
+            emote = "/" + emote;
+
+        // Block state-changing emotes
+        if (NoLoopCommands.Contains(emote))
+            return;
+
+        // Start looping
+        loopingEmoteCommand = emote;
+        loopingEmoteId = 0;
+        emoteTimeline = 0;
+        loopWaitingForStart = true;
+        ExecuteEmote(emote);
+    }
+
+    private void OnAlignCommand(string command, string args)
+    {
+        Framework.RunOnFrameworkThread(() => AlignToTarget());
     }
 
     public void ToggleMainUi()
@@ -429,6 +483,8 @@ public sealed class Plugin : IDalamudPlugin
                 {
                     Framework.RunOnFrameworkThread(() =>
                     {
+                        loopingEmoteCommand = null; // Clear any active loop
+
                         switch (preset.AnimationType)
                         {
                             case 2: // StandingIdle
@@ -447,10 +503,10 @@ public sealed class Plugin : IDalamudPlugin
                             case 3: // ChairSitting
                                 if (PoseService != null && preset.PoseIndex >= 0)
                                     PoseService.SetPoseIndex(EmoteController.PoseType.Sit, (byte)preset.PoseIndex);
-                                if (PoseService != null)
+                                if (Configuration.AllowSitDozeAnywhere && PoseService != null)
                                     PoseService.ExecuteSitAnywhere();
                                 else
-                                    ExecuteRedraw();
+                                    ExecuteEmote("/sit");
                                 break;
 
                             case 4: // GroundSitting
@@ -462,10 +518,10 @@ public sealed class Plugin : IDalamudPlugin
                             case 5: // LyingDozing
                                 if (PoseService != null && preset.PoseIndex >= 0)
                                     PoseService.SetPoseIndex(EmoteController.PoseType.Doze, (byte)preset.PoseIndex);
-                                if (PoseService != null)
+                                if (Configuration.AllowSitDozeAnywhere && PoseService != null)
                                     PoseService.ExecuteDozeAnywhere();
                                 else
-                                    ExecuteRedraw();
+                                    ExecuteEmote("/doze");
                                 break;
 
                             default: // AnimationType 1 (Emote) or unknown
@@ -1068,6 +1124,8 @@ public sealed class Plugin : IDalamudPlugin
 
     public void ResetAllPriorities()
     {
+        loopingEmoteCommand = null;
+
         if (PenumbraService == null || !PenumbraService.IsAvailable)
         {
             PrintChat("Penumbra is not available!", XivChatType.ErrorMessage);
@@ -1199,17 +1257,21 @@ public sealed class Plugin : IDalamudPlugin
         });
     }
 
-    public const float MaxWarpDistance = 2f;
+    public const float MaxAlignDistance = 2f;
 
-    public unsafe (bool hasTarget, string targetName, float distance, bool inRange) GetWarpState()
+    public unsafe (bool hasTarget, string targetName, float distance, bool inRange, bool isStanding, bool isWalking) GetAlignState()
     {
+        var isWalking = MovementService?.IsMovingToDestination ?? false;
+
         var target = TargetManager.Target ?? TargetManager.SoftTarget;
         if (target == null)
-            return (false, "", 0f, false);
+            return (false, "", 0f, false, true, isWalking);
 
         var player = (Character*)(ObjectTable.LocalPlayer?.Address ?? nint.Zero);
         if (player == null)
-            return (false, "", 0f, false);
+            return (false, "", 0f, false, true, isWalking);
+
+        var isStanding = player->Mode == CharacterModes.Normal;
 
         var playerPos = new System.Numerics.Vector3(
             player->GameObject.Position.X,
@@ -1217,11 +1279,18 @@ public sealed class Plugin : IDalamudPlugin
             player->GameObject.Position.Z);
         var distance = System.Numerics.Vector3.Distance(playerPos, target.Position);
 
-        return (true, target.Name.TextValue, distance, distance <= MaxWarpDistance);
+        return (true, target.Name.TextValue, distance, distance <= MaxAlignDistance, isStanding, isWalking);
     }
 
-    public unsafe void WarpToTarget()
+    public unsafe void AlignToTarget()
     {
+        // Block if already walking
+        if (MovementService?.IsMovingToDestination == true)
+        {
+            PrintChat("Already walking to target.", XivChatType.Echo);
+            return;
+        }
+
         var target = TargetManager.Target ?? TargetManager.SoftTarget;
         if (target == null)
         {
@@ -1232,6 +1301,13 @@ public sealed class Plugin : IDalamudPlugin
         var player = (Character*)(ObjectTable.LocalPlayer?.Address ?? nint.Zero);
         if (player == null) return;
 
+        // Block align while sitting, dozing, mounted, or in any non-standing state
+        if (player->Mode != CharacterModes.Normal)
+        {
+            PrintChat("Stand up first.", XivChatType.ErrorMessage);
+            return;
+        }
+
         var playerPos = new System.Numerics.Vector3(
             player->GameObject.Position.X,
             player->GameObject.Position.Y,
@@ -1239,22 +1315,36 @@ public sealed class Plugin : IDalamudPlugin
         var targetPos = target.Position;
         var distance = System.Numerics.Vector3.Distance(playerPos, targetPos);
 
-        if (distance > MaxWarpDistance)
+        if (distance > MaxAlignDistance)
         {
             PrintChat($"Move closer to {target.Name.TextValue} and try again.", XivChatType.ErrorMessage);
             return;
         }
 
-        // Fine-tune position to match target exactly
-        player->GameObject.SetPosition(targetPos.X, targetPos.Y, targetPos.Z);
+        var targetRotation = target.Rotation;
 
-        // Match target's rotation (if enabled in config)
-        if (Configuration.WarpMatchRotation)
+        // Use RMIWalk movement override if hook is active, otherwise fall back to SetPosition
+        if (MovementService != null && MovementService.IsHookActive)
         {
-            player->GameObject.SetRotation(target.Rotation);
+            MovementService.WalkTo(targetPos,
+                arrived: () => ApplyTargetRotation(targetRotation),
+                cancelled: null);
+            Log.Debug($"Walking to target '{target.Name}' ({distance:F2} units away)");
         }
+        else
+        {
+            // Fallback: direct position set (if signature broke)
+            player->GameObject.SetPosition(targetPos.X, targetPos.Y, targetPos.Z);
+            player->GameObject.SetRotation(targetRotation);
+            Log.Debug($"Aligned to target '{target.Name}' ({distance:F2} units away) [fallback]");
+        }
+    }
 
-        Log.Debug($"Warped to target '{target.Name}' ({distance:F2} units away)");
+    private unsafe void ApplyTargetRotation(float rotation)
+    {
+        var player = (Character*)(ObjectTable.LocalPlayer?.Address ?? nint.Zero);
+        if (player != null)
+            player->GameObject.SetRotation(rotation);
     }
 
     private unsafe void ExecuteEmote(string command)
@@ -1309,6 +1399,114 @@ public sealed class Plugin : IDalamudPlugin
             Log.Error($"Failed to execute redraw: {ex.Message}");
         }
     }
+
+    private void OnFrameworkUpdate(IFramework fw)
+    {
+        if (loopingEmoteCommand == null) return;
+
+        try
+        {
+            var localPlayer = ObjectTable.LocalPlayer;
+            if (localPlayer == null) return;
+
+            var currentEmoteId = ReadCurrentEmoteId();
+            var currentTimeline = ReadBaseTimeline();
+
+            // Capture the emote's ID and timeline when it first starts playing
+            if (loopWaitingForStart && currentEmoteId != previousEmoteId && currentEmoteId != 0)
+            {
+                if (loopingEmoteId == 0)
+                {
+                    // First execution — learn the emote's ID and timeline
+                    loopingEmoteId = currentEmoteId;
+                    emoteTimeline = currentTimeline;
+                    loopWaitingForStart = false;
+                    previousPosition = localPlayer.Position;
+                }
+                else if (currentEmoteId == loopingEmoteId)
+                {
+                    // Re-execution — same emote started again
+                    emoteTimeline = currentTimeline;
+                    loopWaitingForStart = false;
+                    previousPosition = localPlayer.Position;
+                }
+                else
+                {
+                    // A different emote started — user did something else, cancel loop
+                    ClearEmoteLoop();
+                    previousEmoteId = currentEmoteId;
+                    previousTimeline = currentTimeline;
+                    return;
+                }
+            }
+
+            // Detect emote end via EmoteId reverting
+            if (loopingEmoteId != 0 && currentEmoteId != previousEmoteId && previousEmoteId == loopingEmoteId)
+            {
+                ExecuteEmote(loopingEmoteCommand);
+                loopWaitingForStart = true;
+            }
+
+            // Detect emote end via timeline change (backup)
+            if (loopingEmoteId != 0 && currentTimeline != previousTimeline &&
+                previousTimeline == emoteTimeline && currentTimeline != emoteTimeline)
+            {
+                ExecuteEmote(loopingEmoteCommand);
+                loopWaitingForStart = true;
+            }
+
+            previousEmoteId = currentEmoteId;
+            previousTimeline = currentTimeline;
+
+            // Cancel if player moves (skip while emote animation is active)
+            if (currentEmoteId != loopingEmoteId)
+            {
+                var currentPos = localPlayer.Position;
+                var dx = currentPos.X - previousPosition.X;
+                var dz = currentPos.Z - previousPosition.Z;
+
+                if (dx * dx + dz * dz > 0.001f)
+                    ClearEmoteLoop();
+
+                previousPosition = currentPos;
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"[EmoteLoop] Error: {ex.Message}");
+        }
+    }
+
+    private unsafe ushort ReadCurrentEmoteId()
+    {
+        var localPlayer = ObjectTable.LocalPlayer;
+        if (localPlayer == null || localPlayer.Address == nint.Zero) return 0;
+
+        var player = (Character*)localPlayer.Address;
+        if (player == null) return 0;
+
+        return player->EmoteController.EmoteId;
+    }
+
+    private unsafe ushort ReadBaseTimeline()
+    {
+        var localPlayer = ObjectTable.LocalPlayer;
+        if (localPlayer == null || localPlayer.Address == nint.Zero) return 0;
+
+        var player = (Character*)localPlayer.Address;
+        if (player == null) return 0;
+
+        return player->Timeline.TimelineSequencer.GetSlotTimeline(0);
+    }
+
+    public void ClearEmoteLoop()
+    {
+        loopingEmoteCommand = null;
+        loopingEmoteId = 0;
+        emoteTimeline = 0;
+        loopWaitingForStart = false;
+    }
+
 
     private void PrintChat(string message, XivChatType type = XivChatType.Echo)
     {

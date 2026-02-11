@@ -168,7 +168,7 @@ public class HelpWindow : Window
         ImGui.PushStyleColor(ImGuiCol.Text, warningColor);
         DrawIconBullet(FontAwesomeIcon.ExclamationTriangle, "Sit & Doze Presets", warningColor);
         ImGui.PopStyleColor();
-        ImGui.TextWrapped("Chair-sit and doze presets will place your character into the sit/doze state without needing furniture. Other players will see this, and it is not standard game behaviour.");
+        ImGui.TextWrapped("By default, chair-sit and doze presets require nearby furniture. To sit/doze anywhere, enable 'Allow Sit/Doze Anywhere' in the settings (gear icon). This sends position data to the server and is not standard game behaviour.");
 
         ImGui.Spacing();
         ImGui.Spacing();
@@ -214,9 +214,9 @@ public class HelpWindow : Window
         ImGui.Spacing();
 
         ImGui.PushStyleColor(ImGuiCol.Text, warningColor);
-        DrawIconBullet(FontAwesomeIcon.LocationCrosshairs, "Warp to Target - duo emote alignment", warningColor);
+        DrawIconBullet(FontAwesomeIcon.LocationCrosshairs, "Align to Target - duo emote alignment", warningColor);
         ImGui.PopStyleColor();
-        ImGui.TextWrapped("For duo/group emotes, use the warp button or /warp to align with your target. Stand right next to them first -- the button turns green when you're close enough. This physically moves your character to your target's exact position.");
+        ImGui.TextWrapped("For duo/group emotes, use the align button or /align to walk to your target's position. Stand right next to them first -- the button turns green when you're close enough. Your character will physically walk to them and match their rotation. Avoid clicking your mouse during the walk for best results.");
 
         ImGui.Spacing();
         ImGui.Separator();
@@ -230,9 +230,12 @@ public class HelpWindow : Window
         ImGui.Text("/encorereset");
         ImGui.SameLine(140 * UIStyles.Scale);
         ImGui.Text("Reset all mods");
-        ImGui.Text("/warp");
+        ImGui.Text("/align");
         ImGui.SameLine(140 * UIStyles.Scale);
-        ImGui.Text("Warp to target's position");
+        ImGui.Text("Walk to target for alignment");
+        ImGui.Text("/loop <emote>");
+        ImGui.SameLine(140 * UIStyles.Scale);
+        ImGui.Text("Loop an emote (move to stop)");
     }
 
     private void DrawNavigation()
