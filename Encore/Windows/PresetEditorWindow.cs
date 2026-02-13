@@ -1,10 +1,13 @@
 using System;
+using System.IO;
 using System.Linq;
 using System.Numerics;
 using System.Collections.Generic;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Windowing;
 using Dalamud.Interface.Textures.TextureWraps;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.Processing;
 using Encore.Styles;
 using Encore.Services;
 
@@ -33,6 +36,7 @@ public class PresetEditorWindow : Window
     private EmoteDetectionService.AnimationType detectedAnimationType = EmoteDetectionService.AnimationType.Emote;
     private EmoteDetectionService.AnimationType detectedPoseAnimationType = EmoteDetectionService.AnimationType.None;  // For mixed mods
     private List<int> detectedPoseIndices = new();  // All pose indices detected for this mod
+    private Dictionary<int, List<int>> detectedPoseTypeIndices = new();  // Per-type pose indices (AnimationType -> indices)
     private int selectedPoseIndex = -1;  // The pose index the user selected
 
     // Vanilla preset mode
@@ -50,6 +54,9 @@ public class PresetEditorWindow : Window
     private bool needsRefresh = true;
     private bool isLoading = false;
     private string loadingStatus = "";
+
+    // Custom icon path (uploaded image)
+    private string? editCustomIconPath;
 
     // Icon picker reference
     private IconPickerWindow? iconPickerWindow;
@@ -218,6 +225,7 @@ public class PresetEditorWindow : Window
         editName = "";
         editCommand = "";
         editIconId = null;
+        editCustomIconPath = null;
         editModDirectory = "";
         editModName = "";
         editEmoteCommand = "";
@@ -249,6 +257,7 @@ public class PresetEditorWindow : Window
         editName = preset.Name;
         editCommand = preset.ChatCommand;
         editIconId = preset.IconId;
+        editCustomIconPath = preset.CustomIconPath;
         editModDirectory = preset.ModDirectory;
         editModName = preset.ModName;
         editEmoteCommand = preset.EmoteCommand ?? "";  // Load the preset's emote command
@@ -295,6 +304,7 @@ public class PresetEditorWindow : Window
         detectedAnimationType = EmoteDetectionService.AnimationType.Emote;  // Reset to default
         detectedPoseAnimationType = EmoteDetectionService.AnimationType.None;  // Reset mixed-mod pose type
         detectedPoseIndices = new List<int>();  // Reset pose indices
+        detectedPoseTypeIndices = new Dictionary<int, List<int>>();  // Reset per-type indices
         selectedPoseIndex = -1;  // Reset selected pose
 
         if (string.IsNullOrEmpty(editModDirectory))
@@ -319,6 +329,12 @@ public class PresetEditorWindow : Window
                 detectedPoseIndices = new List<int> { modInfo.PoseIndex };
             else
                 detectedPoseIndices = new List<int>();
+
+            // Populate per-type pose indices
+            if (modInfo.PoseTypeIndices.Count > 0)
+                detectedPoseTypeIndices = modInfo.PoseTypeIndices.ToDictionary(kv => kv.Key, kv => new List<int>(kv.Value));
+            else
+                detectedPoseTypeIndices = new Dictionary<int, List<int>>();
 
             // Auto-select pose: if editing existing preset, re-select its PoseIndex;
             // if single pose, auto-select; if multiple, default to first
@@ -431,18 +447,40 @@ public class PresetEditorWindow : Window
         ImGui.Spacing();
 
         // Icon (optional)
+        ImGui.AlignTextToFramePadding();
         ImGui.Text("Icon (optional):");
         ImGui.SameLine();
-        if (editIconId.HasValue)
+        bool hasIcon = false;
+        if (!string.IsNullOrEmpty(editCustomIconPath) && File.Exists(editCustomIconPath))
+        {
+            var tex = GetCustomIcon(editCustomIconPath);
+            if (tex != null)
+            {
+                var iconDisplaySize = new Vector2(24 * UIStyles.Scale, 24 * UIStyles.Scale);
+                Vector2 uv0 = Vector2.Zero, uv1 = Vector2.One;
+                if (tex.Width > tex.Height) {
+                    float excess = (tex.Width - tex.Height) / (2f * tex.Width);
+                    uv0.X = excess; uv1.X = 1f - excess;
+                } else if (tex.Height > tex.Width) {
+                    float excess = (tex.Height - tex.Width) / (2f * tex.Height);
+                    uv0.Y = excess; uv1.Y = 1f - excess;
+                }
+                ImGui.Image(tex.Handle, iconDisplaySize, uv0, uv1);
+                ImGui.SameLine();
+                hasIcon = true;
+            }
+        }
+        else if (editIconId.HasValue)
         {
             var iconTexture = GetGameIcon(editIconId.Value);
             if (iconTexture != null)
             {
                 ImGui.Image(iconTexture.Handle, new Vector2(24 * UIStyles.Scale, 24 * UIStyles.Scale));
                 ImGui.SameLine();
+                hasIcon = true;
             }
         }
-        if (ImGui.Button(editIconId.HasValue ? "Change" : "Choose"))
+        if (ImGui.Button("Choose"))
         {
             if (iconPickerWindow != null)
             {
@@ -450,11 +488,25 @@ public class PresetEditorWindow : Window
                 iconPickerWindow.IsOpen = true;
             }
         }
-        if (editIconId.HasValue)
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Pick a game icon");
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("Upload"))
+        {
+            OpenCustomIconDialog();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Upload a custom image (PNG, JPG, GIF, WebP)");
+        }
+        if (hasIcon)
         {
             ImGui.SameLine();
             if (ImGui.Button("Clear"))
             {
+                editCustomIconPath = null;
                 editIconId = null;
             }
         }
@@ -569,8 +621,13 @@ public class PresetEditorWindow : Window
                     var label = isUsed ? "\u2713 " : "";  // Checkmark prefix if used
                     label += mod.ModName;
 
+                    // Check if it's a movement mod
+                    if (mod.AnimationType == EmoteDetectionService.AnimationType.Movement)
+                    {
+                        label += " [Walk / Run]";
+                    }
                     // Check if it's a pose mod
-                    if (mod.RequiresRedraw)
+                    else if (mod.RequiresRedraw)
                     {
                         // Pose mod - show type and index
                         var poseTypeName = mod.AnimationType switch
@@ -687,10 +744,19 @@ public class PresetEditorWindow : Window
             ImGui.Spacing();
 
             // Show different info based on animation type
-            var isPoseMod = detectedAnimationType != EmoteDetectionService.AnimationType.Emote &&
+            var isMovementMod = detectedAnimationType == EmoteDetectionService.AnimationType.Movement;
+            var isPoseMod = !isMovementMod &&
+                           detectedAnimationType != EmoteDetectionService.AnimationType.Emote &&
                            detectedAnimationType != EmoteDetectionService.AnimationType.None;
 
-            if (isPoseMod)
+            if (isMovementMod)
+            {
+                // Movement mod — no emote/pose selection needed
+                ImGui.TextColored(new Vector4(0.6f, 0.9f, 0.6f, 1f), "Type: Movement (Walk / Sprint / Jog)");
+                ImGui.TextDisabled("This mod changes your walking and movement animations.");
+                ImGui.TextDisabled("No emote or pose selection needed — just enable and go.");
+            }
+            else if (isPoseMod)
             {
                 // Pure pose mod — show type, pose index, and explain redraw behaviour
                 var poseTypeName = detectedAnimationType switch
@@ -725,10 +791,6 @@ public class PresetEditorWindow : Window
                     ImGui.TextColored(new Vector4(0.6f, 0.8f, 1f, 1f), $"Type: {poseTypeName} (will redraw)");
                 }
                 ImGui.TextDisabled("Pose mods require a Penumbra redraw to take effect");
-                if (selectedPoseIndex >= 0)
-                {
-                    ImGui.TextDisabled($"Use /cpose to cycle to pose #{selectedPoseIndex}");
-                }
             }
             else
             {
@@ -791,38 +853,47 @@ public class PresetEditorWindow : Window
                     }
                 }
 
-                // Auto-detect pose commands: if user selected /sit, /groundsit, or /doze,
-                // show the pose picker so they can choose which pose number
+                // Auto-detect pose commands: if user selected /sit, /groundsit, /doze, or /cpose,
+                // show the pose picker so they can choose which pose number.
+                // Use per-type indices when available to filter to only relevant poses.
                 var selectedCommandAnimType = GetAnimationTypeForCommand(editEmoteCommand);
-                if (selectedCommandAnimType != EmoteDetectionService.AnimationType.Emote &&
-                    detectedPoseIndices.Count > 0)
+                if (selectedCommandAnimType != EmoteDetectionService.AnimationType.Emote)
                 {
-                    ImGui.Spacing();
-                    var poseTypeName = selectedCommandAnimType switch
-                    {
-                        EmoteDetectionService.AnimationType.StandingIdle => "Idle",
-                        EmoteDetectionService.AnimationType.ChairSitting => "Sit",
-                        EmoteDetectionService.AnimationType.GroundSitting => "Ground Sit",
-                        EmoteDetectionService.AnimationType.LyingDozing => "Doze",
-                        _ => "Pose"
-                    };
+                    // Get pose indices for this specific type, falling back to all indices
+                    var typeKey = (int)selectedCommandAnimType;
+                    var relevantIndices = (detectedPoseTypeIndices.Count > 0 && detectedPoseTypeIndices.TryGetValue(typeKey, out var typeIndices))
+                        ? typeIndices
+                        : detectedPoseIndices;
 
-                    if (detectedPoseIndices.Count > 1)
+                    if (relevantIndices.Count > 0)
                     {
-                        ImGui.Text($"{poseTypeName} pose to use:");
-                        ImGui.SetNextItemWidth(200);
-                        var poseOptions = detectedPoseIndices.Select(i => $"Pose #{i}").ToArray();
-                        var currentIdx = detectedPoseIndices.IndexOf(selectedPoseIndex);
-                        if (currentIdx < 0) currentIdx = 0;
-                        if (ImGui.Combo("##poseSelect", ref currentIdx, poseOptions, poseOptions.Length))
+                        ImGui.Spacing();
+                        var poseTypeName = selectedCommandAnimType switch
                         {
-                            selectedPoseIndex = detectedPoseIndices[currentIdx];
+                            EmoteDetectionService.AnimationType.StandingIdle => "Idle",
+                            EmoteDetectionService.AnimationType.ChairSitting => "Sit",
+                            EmoteDetectionService.AnimationType.GroundSitting => "Ground Sit",
+                            EmoteDetectionService.AnimationType.LyingDozing => "Doze",
+                            _ => "Pose"
+                        };
+
+                        if (relevantIndices.Count > 1)
+                        {
+                            ImGui.Text($"{poseTypeName} pose to use:");
+                            ImGui.SetNextItemWidth(200);
+                            var poseOptions = relevantIndices.Select(i => $"Pose #{i}").ToArray();
+                            var currentIdx = relevantIndices.IndexOf(selectedPoseIndex);
+                            if (currentIdx < 0) { currentIdx = 0; selectedPoseIndex = relevantIndices[0]; }
+                            if (ImGui.Combo("##poseSelect", ref currentIdx, poseOptions, poseOptions.Length))
+                            {
+                                selectedPoseIndex = relevantIndices[currentIdx];
+                            }
                         }
-                    }
-                    else if (detectedPoseIndices.Count == 1)
-                    {
-                        ImGui.TextColored(new Vector4(0.6f, 0.8f, 1f, 1f), $"{poseTypeName} pose #{detectedPoseIndices[0]}");
-                        selectedPoseIndex = detectedPoseIndices[0];
+                        else if (relevantIndices.Count == 1)
+                        {
+                            ImGui.TextColored(new Vector4(0.6f, 0.8f, 1f, 1f), $"{poseTypeName} pose #{relevantIndices[0]}");
+                            selectedPoseIndex = relevantIndices[0];
+                        }
                     }
                 }
             }
@@ -957,6 +1028,7 @@ public class PresetEditorWindow : Window
             return;
 
         editIconId = iconPickerWindow.SelectedIconId;
+        editCustomIconPath = null;  // Game icon replaces custom icon
         iconPickerWindow.Confirmed = false;
     }
 
@@ -970,6 +1042,7 @@ public class PresetEditorWindow : Window
         CurrentPreset.Name = editName;
         CurrentPreset.ChatCommand = editCommand.TrimStart('/');
         CurrentPreset.IconId = editIconId;
+        CurrentPreset.CustomIconPath = editCustomIconPath;
         CurrentPreset.ModDirectory = editModDirectory;
         CurrentPreset.ModName = editModName;
 
@@ -986,21 +1059,32 @@ public class PresetEditorWindow : Window
             CurrentPreset.EmoteCommand = "/dance";
         }
 
-        CurrentPreset.ExecuteEmote = true;
-
-        // Determine animation type: if the selected emote is a pose command (/sit, /groundsit, /doze),
-        // use the corresponding pose animation type so the preset executes as a pose preset
-        var commandAnimType = GetAnimationTypeForCommand(CurrentPreset.EmoteCommand);
-        if (commandAnimType != EmoteDetectionService.AnimationType.Emote &&
-            detectedPoseIndices.Count > 0)
+        // Movement mods need ExecuteEmote=true so the redraw runs on activation
+        if (detectedAnimationType == EmoteDetectionService.AnimationType.Movement)
         {
-            CurrentPreset.AnimationType = (int)commandAnimType;
-            CurrentPreset.PoseIndex = selectedPoseIndex;
+            CurrentPreset.ExecuteEmote = true;
+            CurrentPreset.EmoteCommand = "";
+            CurrentPreset.AnimationType = (int)EmoteDetectionService.AnimationType.Movement;
+            CurrentPreset.PoseIndex = -1;
         }
         else
         {
-            CurrentPreset.AnimationType = (int)detectedAnimationType;
-            CurrentPreset.PoseIndex = selectedPoseIndex;
+            CurrentPreset.ExecuteEmote = true;
+
+            // Determine animation type: if the selected emote is a pose command (/sit, /groundsit, /doze),
+            // use the corresponding pose animation type so the preset executes as a pose preset
+            var commandAnimType = GetAnimationTypeForCommand(CurrentPreset.EmoteCommand);
+            if (commandAnimType != EmoteDetectionService.AnimationType.Emote &&
+                detectedPoseIndices.Count > 0)
+            {
+                CurrentPreset.AnimationType = (int)commandAnimType;
+                CurrentPreset.PoseIndex = selectedPoseIndex;
+            }
+            else
+            {
+                CurrentPreset.AnimationType = (int)detectedAnimationType;
+                CurrentPreset.PoseIndex = selectedPoseIndex;
+            }
         }
 
         CurrentPreset.IsVanilla = isVanillaPreset;
@@ -1017,6 +1101,7 @@ public class PresetEditorWindow : Window
     {
         return command?.ToLowerInvariant() switch
         {
+            "/cpose" => EmoteDetectionService.AnimationType.StandingIdle,
             "/sit" => EmoteDetectionService.AnimationType.ChairSitting,
             "/groundsit" => EmoteDetectionService.AnimationType.GroundSitting,
             "/doze" => EmoteDetectionService.AnimationType.LyingDozing,
@@ -1057,6 +1142,55 @@ public class PresetEditorWindow : Window
         {
             return null;
         }
+    }
+
+    private IDalamudTextureWrap? GetCustomIcon(string path)
+    {
+        try
+        {
+            var texture = Plugin.TextureProvider.GetFromFile(path);
+            return texture?.GetWrapOrEmpty();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private void OpenCustomIconDialog()
+    {
+        var browser = Plugin.Instance?.FileBrowserWindow;
+        if (browser == null) return;
+
+        browser.OnFileSelected = (sourcePath) =>
+        {
+            try
+            {
+                var destName = $"{Guid.NewGuid()}.png";
+                var destPath = Path.Combine(Plugin.IconsDirectory, destName);
+
+                // Resize to max 128x128 for crisp icon display (avoids crunchy downscaling)
+                using var image = Image.Load(sourcePath);
+                const int maxSize = 128;
+                if (image.Width > maxSize || image.Height > maxSize)
+                {
+                    image.Mutate(x => x.Resize(new ResizeOptions
+                    {
+                        Size = new SixLabors.ImageSharp.Size(maxSize, maxSize),
+                        Mode = ResizeMode.Max
+                    }));
+                }
+                image.SaveAsPng(destPath);
+
+                editCustomIconPath = destPath;
+                editIconId = null;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.Error($"Failed to copy icon: {ex.Message}");
+            }
+        };
+        browser.Open();
     }
 
     private void ValidateUniqueness()

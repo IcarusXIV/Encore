@@ -2,12 +2,16 @@
 <Project Sdk="Dalamud.NET.Sdk/14.0.1">
     <PropertyGroup>
         <TargetFramework>net10.0-windows</TargetFramework>
-        <Version>1.0.0.1</Version>
+        <Version>1.0.0.2</Version>
         <Description>Dance mod preset manager. Create presets for dance mods with custom chat commands. Automatically adjusts mod priorities and executes emotes.</Description>
         <PackageLicenseExpression>AGPL-3.0-or-later</PackageLicenseExpression>
         <IsPackable>false</IsPackable>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="SixLabors.ImageSharp" Version="3.1.12" />
+    </ItemGroup>
 
     <ItemGroup>
         <Content Include="Encore.json">

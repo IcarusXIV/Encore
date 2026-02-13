@@ -273,9 +273,10 @@ public class EmoteDetectionService
         { "battle stance", "/battlestance" },
         { "battle01", "/battlestance" },
 
-        // Change Pose - /cpose
+        // Change Pose - /cpose (FFXIV display name: "Change Pose")
         { "cpose", "/cpose" },
         { "changepose", "/cpose" },
+        { "change pose", "/cpose" },
 
         // Hildy - /hildy (Hildibrand pose)
         { "hildy", "/hildy" },
@@ -567,12 +568,17 @@ public class EmoteDetectionService
 
         // Limber Up - /limberup
         { "limberup", "/limberup" },
+        { "limber up", "/limberup" },
 
-        // Push Ups - /pushups
+        // Push Ups - /pushups (FFXIV display name: "Push-ups")
         { "pushups", "/pushups" },
+        { "push ups", "/pushups" },
+        { "push-ups", "/pushups" },
 
-        // Sit Ups - /situps
+        // Sit Ups - /situps (FFXIV display name: "Sit-ups")
         { "situps", "/situps" },
+        { "sit ups", "/situps" },
+        { "sit-ups", "/situps" },
 
         // Squats - /squats
         { "squats", "/squats" },
@@ -1033,30 +1039,44 @@ public class EmoteDetectionService
         // Victory Reveal - /vreveal
         { "vreveal", "/vreveal" },
         { "victoryreveal", "/vreveal" },
+        { "victory reveal", "/vreveal" },
 
-        // Paint emotes
+        // Paint emotes (FFXIV display name: "Paint It Black/Blue/Red/Yellow")
         { "paintblack", "/paintblack" },
+        { "paint black", "/paintblack" },
+        { "paint it black", "/paintblack" },
         { "paintblue", "/paintblue" },
+        { "paint blue", "/paintblue" },
+        { "paint it blue", "/paintblue" },
         { "paintred", "/paintred" },
+        { "paint red", "/paintred" },
+        { "paint it red", "/paintred" },
         { "paintyellow", "/paintyellow" },
+        { "paint yellow", "/paintyellow" },
+        { "paint it yellow", "/paintyellow" },
 
         // Imperial Salute - /imperialsalute
         { "imperialsalute", "/imperialsalute" },
+        { "imperial salute", "/imperialsalute" },
 
         // Pagaga / Oho Kaliy - special emotes
         { "pagaga", "/pagaga" },
         { "ohokaliy", "/ohokaliy" },
+        { "oho kaliy", "/ohokaliy" },
 
         // Make It Hail - /makeithail
         { "makeithail", "/makeithail" },
+        { "make it hail", "/makeithail" },
 
         // Lounge - /lounge (alias for sit)
         { "lounge", "/lounge" },
 
         // Additional emotes
         { "ritualprayer", "/ritualprayer" },
+        { "ritual prayer", "/ritualprayer" },
         { "ritual", "/ritualprayer" },
         { "victorypose", "/victorypose" },
+        { "victory pose", "/victorypose" },
         { "hildibrand", "/hildibrand" },
 
         // ============================================
@@ -1526,8 +1546,12 @@ public class EmoteDetectionService
                 PrimaryEmote = cached.PrimaryEmote ?? "",
                 EmoteCommand = cached.PrimaryCommand ?? "",
                 AnimationType = (AnimationType)cached.AnimationType,
+                PoseAnimationType = (AnimationType)cached.PoseAnimationType,
                 PoseIndex = cached.PoseIndex,
-                AffectedPoseIndices = new List<int>(cached.AffectedPoseIndices ?? new List<int>())
+                AffectedPoseIndices = new List<int>(cached.AffectedPoseIndices ?? new List<int>()),
+                PoseTypeIndices = cached.PoseTypeIndices != null
+                    ? cached.PoseTypeIndices.ToDictionary(kv => kv.Key, kv => new List<int>(kv.Value))
+                    : new Dictionary<int, List<int>>()
             };
         }
 
@@ -1552,6 +1576,7 @@ public class EmoteDetectionService
         // Track animation type and pose indices from file path analysis
         AnimationType detectedAnimationType = AnimationType.None;
         var detectedPoseIndices = new HashSet<int>();
+        var poseTypeIndices = new Dictionary<AnimationType, HashSet<int>>();
 
         // 1. Get emotes from file path analysis (good for specific IDs like loop_emot19)
         var filePathResult = AnalyzeModByFilePaths(modDirectory, modName);
@@ -1576,6 +1601,22 @@ public class EmoteDetectionService
                     detectedPoseIndices.Add(idx);
             else if (filePathResult.PoseIndex >= 0)
                 detectedPoseIndices.Add(filePathResult.PoseIndex);
+
+            // Collect per-type pose indices from file path analysis
+            if (filePathResult.PoseTypeIndices.Count > 0)
+            {
+                foreach (var (typeKey, indices) in filePathResult.PoseTypeIndices)
+                {
+                    var animType = (AnimationType)typeKey;
+                    if (!poseTypeIndices.TryGetValue(animType, out var set))
+                    {
+                        set = new HashSet<int>();
+                        poseTypeIndices[animType] = set;
+                    }
+                    foreach (var idx in indices)
+                        set.Add(idx);
+                }
+            }
         }
 
         // 2. ALSO get emotes from Penumbra's GetChangedItems
@@ -1596,29 +1637,35 @@ public class EmoteDetectionService
                 {
                     detectedAnimationType = AnimationType.StandingIdle;
                     var poseIdx = ExtractPoseIndexFromPath(itemLower, "pose");
-                    if (poseIdx >= 0) detectedPoseIndices.Add(poseIdx);
-                    else if (itemLower.Contains("idle.pap")) detectedPoseIndices.Add(0);
+                    if (poseIdx >= 0) { detectedPoseIndices.Add(poseIdx); AddPoseTypeIndex(poseTypeIndices, AnimationType.StandingIdle, poseIdx); }
+                    else if (itemLower.Contains("idle.pap")) { detectedPoseIndices.Add(0); AddPoseTypeIndex(poseTypeIndices, AnimationType.StandingIdle, 0); }
                 }
                 // Chair sitting
                 else if (itemLower.Contains("/sit/") || itemLower.Contains("s_pose"))
                 {
                     detectedAnimationType = AnimationType.ChairSitting;
                     var poseIdx = ExtractPoseIndexFromPath(itemLower, "s_pose");
-                    if (poseIdx >= 0) detectedPoseIndices.Add(poseIdx);
+                    if (poseIdx >= 0) { detectedPoseIndices.Add(poseIdx); AddPoseTypeIndex(poseTypeIndices, AnimationType.ChairSitting, poseIdx); }
                 }
                 // Ground sitting
                 else if (itemLower.Contains("/jmn/") || itemLower.Contains("j_pose"))
                 {
                     detectedAnimationType = AnimationType.GroundSitting;
                     var poseIdx = ExtractPoseIndexFromPath(itemLower, "j_pose");
-                    if (poseIdx >= 0) detectedPoseIndices.Add(poseIdx);
+                    if (poseIdx >= 0) { detectedPoseIndices.Add(poseIdx); AddPoseTypeIndex(poseTypeIndices, AnimationType.GroundSitting, poseIdx); }
                 }
                 // Doze
                 else if (itemLower.Contains("/doze/") || itemLower.Contains("l_pose"))
                 {
                     detectedAnimationType = AnimationType.LyingDozing;
                     var poseIdx = ExtractPoseIndexFromPath(itemLower, "l_pose");
-                    if (poseIdx >= 0) detectedPoseIndices.Add(poseIdx);
+                    if (poseIdx >= 0) { detectedPoseIndices.Add(poseIdx); AddPoseTypeIndex(poseTypeIndices, AnimationType.LyingDozing, poseIdx); }
+                }
+                // Movement (walk/sprint/jog)
+                else if (itemLower.Contains("resident/") &&
+                         (itemLower.Contains("move_a") || itemLower.Contains("move_b")))
+                {
+                    detectedAnimationType = AnimationType.Movement;
                 }
             }
         }
@@ -1670,17 +1717,49 @@ public class EmoteDetectionService
                     affectedEmotes.Add(cleanName);
                 if (!emoteCommands.Contains(command))
                     emoteCommands.Add(command);
+                continue;
             }
+
+            // Normalize: remove hyphens (e.g., "push-ups" → "pushups")
+            var normalized = cleanName.Replace("-", "");
+            if (normalized != cleanName && EmoteToCommand.TryGetValue(normalized, out command))
+            {
+                if (!affectedEmotes.Contains(normalized))
+                    affectedEmotes.Add(normalized);
+                if (!emoteCommands.Contains(command))
+                    emoteCommands.Add(command);
+                continue;
+            }
+
+            // Normalize: remove filler words "it"/"a"/"the" and collapse spaces
+            // Handles "Paint It Black" → "paint black", etc.
+            var withoutFillers = System.Text.RegularExpressions.Regex.Replace(cleanName, @"\b(it|a|the)\b", "").Trim();
+            withoutFillers = System.Text.RegularExpressions.Regex.Replace(withoutFillers, @"\s+", " ");
+            if (withoutFillers != cleanName && EmoteToCommand.TryGetValue(withoutFillers, out command))
+            {
+                if (!affectedEmotes.Contains(withoutFillers))
+                    affectedEmotes.Add(withoutFillers);
+                if (!emoteCommands.Contains(command))
+                    emoteCommands.Add(command);
+                continue;
+            }
+
             // Try partial match for emote-related items
-            else if (itemLower.Contains("dance") ||
-                     itemLower.Contains("emote") ||
-                     itemLower.Contains("gesture") ||
-                     itemLower.Contains("expression") ||
-                     itemLower.Contains("hum"))
+            if (itemLower.Contains("dance") ||
+                itemLower.Contains("emote") ||
+                itemLower.Contains("gesture") ||
+                itemLower.Contains("expression") ||
+                itemLower.Contains("hum"))
             {
                 // Try to match against known emotes (longest first)
                 foreach (var (emoteName, emoteCmd) in EmoteToCommand.OrderByDescending(e => e.Key.Length))
                 {
+                    // Skip "pose" in partial matching — too short, matches many unrelated items
+                    // ("Change Pose" → "pose", "Pose of the Unbound" → "pose", etc.)
+                    // Direct match handles the actual /pose emote; this prevents false positives.
+                    if (emoteName == "pose")
+                        continue;
+
                     // Check if the clean name contains or matches this emote
                     if (cleanName.Contains(emoteName.ToLowerInvariant()) ||
                         emoteName.ToLowerInvariant().Contains(cleanName))
@@ -1711,6 +1790,28 @@ public class EmoteDetectionService
                 detectedAnimationType = AnimationType.Emote;
                 log.Debug($"Mod '{modName}' has both emotes and poses — classifying as Emote (mixed-type mod, pose type: {originalPoseType})");
             }
+        }
+
+        // Multi-pose-type reclassification: if the mod has multiple pose types
+        // (e.g., idle+sit+groundsit+doze) but no real emote animations, reclassify
+        // as Emote so the preset editor shows the command dropdown for all types.
+        // Also add commands for all detected pose types.
+        if (isPoseMod && poseTypeIndices.Count > 1 && originalPoseType == AnimationType.None)
+        {
+            // Add commands for all detected pose types
+            foreach (var type in poseTypeIndices.Keys)
+                AddPoseCommandsForType(type, affectedEmotes, emoteCommands);
+
+            originalPoseType = detectedAnimationType;
+            detectedAnimationType = AnimationType.Emote;
+            log.Debug($"Mod '{modName}' has {poseTypeIndices.Count} pose types — classifying as Emote (multi-pose-type mod, original: {originalPoseType})");
+        }
+
+        // Movement mods: tag with "walk" identifier (no emote command needed)
+        if (detectedAnimationType == AnimationType.Movement)
+        {
+            if (!affectedEmotes.Contains("walk"))
+                affectedEmotes.Add("walk");
         }
 
         // If we found nothing, return null
@@ -1745,6 +1846,11 @@ public class EmoteDetectionService
         var sortedPoseIndices = detectedPoseIndices.OrderBy(i => i).ToList();
         int detectedPoseIndex = sortedPoseIndices.Count > 0 ? sortedPoseIndices[0] : -1;
 
+        // Convert poseTypeIndices to serializable form
+        var poseTypeIndicesResult = poseTypeIndices.ToDictionary(
+            kv => (int)kv.Key,
+            kv => kv.Value.OrderBy(i => i).ToList());
+
         return new EmoteModInfo
         {
             ModDirectory = modDirectory,
@@ -1757,7 +1863,8 @@ public class EmoteDetectionService
             AnimationType = detectedAnimationType,
             PoseAnimationType = originalPoseType,
             PoseIndex = detectedPoseIndex,
-            AffectedPoseIndices = sortedPoseIndices
+            AffectedPoseIndices = sortedPoseIndices,
+            PoseTypeIndices = poseTypeIndicesResult
         };
     }
 
@@ -1774,12 +1881,14 @@ public class EmoteDetectionService
         var posePaths = new List<string>();
         int emoteCount = 0;
         int poseCount = 0;
+        int movementCount = 0;
         int otherCount = 0;
         int weaponCount = 0;
 
         // Track detected animation type and pose indices from paths
         AnimationType detectedType = AnimationType.None;
         var detectedPoseIndices = new HashSet<int>();
+        var poseTypeIndices = new Dictionary<AnimationType, HashSet<int>>();
 
         foreach (var path in modFiles)
         {
@@ -1802,6 +1911,16 @@ public class EmoteDetectionService
                 continue;
             }
 
+            // Movement animation files: move_a.pap, move_b.pap in bt_common/resident/
+            if (pathLower.EndsWith(".pap") && pathLower.Contains("resident/") &&
+                (pathLower.Contains("move_a") || pathLower.Contains("move_b")))
+            {
+                movementCount++;
+                emotePaths.Add(path);
+                detectedType = AnimationType.Movement;
+                continue;
+            }
+
             // Check for pose files FIRST (they're in specific locations)
             // Standing idle patterns:
             //   /resident/idle.pap, /resident/pose##.pap (standard)
@@ -1820,8 +1939,8 @@ public class EmoteDetectionService
                         detectedType = AnimationType.StandingIdle;
                         // Extract pose index from filename (pose01.pap -> 1, idle.pap -> 0)
                         var poseIdx = ExtractPoseIndexFromPath(pathLower, "pose");
-                        if (poseIdx >= 0) detectedPoseIndices.Add(poseIdx);
-                        else if (pathLower.Contains("idle.pap")) detectedPoseIndices.Add(0);
+                        if (poseIdx >= 0) { detectedPoseIndices.Add(poseIdx); AddPoseTypeIndex(poseTypeIndices, AnimationType.StandingIdle, poseIdx); }
+                        else if (pathLower.Contains("idle.pap")) { detectedPoseIndices.Add(0); AddPoseTypeIndex(poseTypeIndices, AnimationType.StandingIdle, 0); }
                         continue;
                     }
                 }
@@ -1838,7 +1957,7 @@ public class EmoteDetectionService
                         if (detectedType == AnimationType.None)
                             detectedType = AnimationType.StandingIdle;
                         var poseIdx = ExtractPoseIndexFromPath(pathLower, "pose");
-                        if (poseIdx >= 0) detectedPoseIndices.Add(poseIdx);
+                        if (poseIdx >= 0) { detectedPoseIndices.Add(poseIdx); AddPoseTypeIndex(poseTypeIndices, AnimationType.StandingIdle, poseIdx); }
                         continue;
                     }
                 }
@@ -1851,7 +1970,7 @@ public class EmoteDetectionService
                 posePaths.Add(path);
                 detectedType = AnimationType.ChairSitting;
                 var poseIdx = ExtractPoseIndexFromPath(pathLower, "s_pose");
-                if (poseIdx >= 0) detectedPoseIndices.Add(poseIdx);
+                if (poseIdx >= 0) { detectedPoseIndices.Add(poseIdx); AddPoseTypeIndex(poseTypeIndices, AnimationType.ChairSitting, poseIdx); }
                 continue;
             }
 
@@ -1862,7 +1981,7 @@ public class EmoteDetectionService
                 posePaths.Add(path);
                 detectedType = AnimationType.GroundSitting;
                 var poseIdx = ExtractPoseIndexFromPath(pathLower, "j_pose");
-                if (poseIdx >= 0) detectedPoseIndices.Add(poseIdx);
+                if (poseIdx >= 0) { detectedPoseIndices.Add(poseIdx); AddPoseTypeIndex(poseTypeIndices, AnimationType.GroundSitting, poseIdx); }
                 continue;
             }
 
@@ -1873,24 +1992,27 @@ public class EmoteDetectionService
                 posePaths.Add(path);
                 detectedType = AnimationType.LyingDozing;
                 var poseIdx = ExtractPoseIndexFromPath(pathLower, "l_pose");
-                if (poseIdx >= 0) detectedPoseIndices.Add(poseIdx);
+                if (poseIdx >= 0) { detectedPoseIndices.Add(poseIdx); AddPoseTypeIndex(poseTypeIndices, AnimationType.LyingDozing, poseIdx); }
                 continue;
             }
 
-            // Standing idle poses in /emote/ folder: pose##_loop.pap pattern
+            // Standing idle poses in /emote/ folder: pose## files (loop, start, end, bare)
             // These are the idle poses you cycle through with /cpose, NOT the /pose emote
             if (pathLower.Contains("/emote/") && pathLower.EndsWith(".pap"))
             {
                 var filename = Path.GetFileName(pathLower);
-                // Match pose##_loop.pap pattern (pose01_loop.pap, pose02_loop.pap, etc.)
-                var idlePoseMatch = System.Text.RegularExpressions.Regex.Match(filename, @"^pose(\d+)_loop\.pap$");
+                // Match pose##*.pap pattern (pose01_loop.pap, pose01_start.pap, pose01.pap, etc.)
+                var idlePoseMatch = System.Text.RegularExpressions.Regex.Match(filename, @"^pose(\d+)");
                 if (idlePoseMatch.Success)
                 {
                     poseCount++;
                     posePaths.Add(path);
                     detectedType = AnimationType.StandingIdle;
                     if (int.TryParse(idlePoseMatch.Groups[1].Value, out var poseIdx))
+                    {
                         detectedPoseIndices.Add(poseIdx);
+                        AddPoseTypeIndex(poseTypeIndices, AnimationType.StandingIdle, poseIdx);
+                    }
                     continue;
                 }
             }
@@ -1923,16 +2045,16 @@ public class EmoteDetectionService
                 otherCount++;
         }
 
-        // Must have emote or pose files
-        if (emoteCount == 0 && poseCount == 0)
+        // Must have emote, pose, or movement files
+        if (emoteCount == 0 && poseCount == 0 && movementCount == 0)
             return null;
 
         // If mostly weapon files, skip (weapon stance mod, not emote)
-        var relevantCount = emoteCount + poseCount;
+        var relevantCount = emoteCount + poseCount + movementCount;
         if (weaponCount > relevantCount)
             return null;
 
-        // If more non-emote than emote/pose files, skip (likely not an emote/pose mod)
+        // If more non-emote than emote/pose/movement files, skip
         if (otherCount > relevantCount * 2)
             return null;
 
@@ -1953,36 +2075,27 @@ public class EmoteDetectionService
             }
         }
 
-        // For pose mods, add appropriate commands based on type
+        // For pose mods, add appropriate commands for ALL detected pose types
         if (poseCount > 0)
         {
-            switch (detectedType)
+            // If we tracked per-type indices, add commands for each type
+            if (poseTypeIndices.Count > 0)
             {
-                case AnimationType.StandingIdle:
-                    if (!affectedEmotes.Contains("idle"))
-                        affectedEmotes.Add("idle");
-                    if (!emoteCommands.Contains("/cpose"))
-                        emoteCommands.Add("/cpose");
-                    break;
-                case AnimationType.ChairSitting:
-                    if (!affectedEmotes.Contains("sit"))
-                        affectedEmotes.Add("sit");
-                    if (!emoteCommands.Contains("/sit"))
-                        emoteCommands.Add("/sit");
-                    break;
-                case AnimationType.GroundSitting:
-                    if (!affectedEmotes.Contains("groundsit"))
-                        affectedEmotes.Add("groundsit");
-                    if (!emoteCommands.Contains("/groundsit"))
-                        emoteCommands.Add("/groundsit");
-                    break;
-                case AnimationType.LyingDozing:
-                    if (!affectedEmotes.Contains("doze"))
-                        affectedEmotes.Add("doze");
-                    if (!emoteCommands.Contains("/doze"))
-                        emoteCommands.Add("/doze");
-                    break;
+                foreach (var type in poseTypeIndices.Keys)
+                    AddPoseCommandsForType(type, affectedEmotes, emoteCommands);
             }
+            else
+            {
+                // Fallback: single type (backward compat)
+                AddPoseCommandsForType(detectedType, affectedEmotes, emoteCommands);
+            }
+        }
+
+        // For movement mods, add a "walk" identifier
+        if (movementCount > 0 && detectedType == AnimationType.Movement)
+        {
+            if (!affectedEmotes.Contains("walk"))
+                affectedEmotes.Add("walk");
         }
 
         // Prioritize specific emotes over generic ones
@@ -2020,6 +2133,27 @@ public class EmoteDetectionService
         var sortedPoseIndices = detectedPoseIndices.OrderBy(i => i).ToList();
         int poseIndex = sortedPoseIndices.Count > 0 ? sortedPoseIndices[0] : -1;
 
+        // Convert poseTypeIndices to serializable form
+        var poseTypeIndicesResult = poseTypeIndices.ToDictionary(
+            kv => (int)kv.Key,
+            kv => kv.Value.OrderBy(i => i).ToList());
+
+        // Multi-pose-type reclassification: if the mod has multiple pose types
+        // (e.g., idle+sit+groundsit+doze) but no real emote animations, reclassify
+        // as Emote so the preset editor shows the command dropdown for all types.
+        // The existing "auto-detect pose commands" logic handles the rest.
+        AnimationType originalPoseType = AnimationType.None;
+        bool isPoseMod = detectedType == AnimationType.StandingIdle ||
+                         detectedType == AnimationType.ChairSitting ||
+                         detectedType == AnimationType.GroundSitting ||
+                         detectedType == AnimationType.LyingDozing;
+        if (isPoseMod && poseTypeIndices.Count > 1)
+        {
+            originalPoseType = detectedType;
+            detectedType = AnimationType.Emote;
+            log.Debug($"Mod '{modName}' has {poseTypeIndices.Count} pose types — classifying as Emote (multi-pose-type mod, original: {originalPoseType})");
+        }
+
         // Return mod info
         return new EmoteModInfo
         {
@@ -2031,8 +2165,10 @@ public class EmoteDetectionService
             PrimaryEmote = primaryEmote,
             EmoteCommand = primaryCommand,
             AnimationType = detectedType,
+            PoseAnimationType = originalPoseType,
             PoseIndex = poseIndex,
-            AffectedPoseIndices = sortedPoseIndices
+            AffectedPoseIndices = sortedPoseIndices,
+            PoseTypeIndices = poseTypeIndicesResult
         };
     }
 
@@ -2066,6 +2202,39 @@ public class EmoteDetectionService
         catch
         {
             return -1;
+        }
+    }
+
+    private static void AddPoseTypeIndex(Dictionary<AnimationType, HashSet<int>> poseTypeIndices, AnimationType type, int index)
+    {
+        if (!poseTypeIndices.TryGetValue(type, out var indices))
+        {
+            indices = new HashSet<int>();
+            poseTypeIndices[type] = indices;
+        }
+        indices.Add(index);
+    }
+
+    private static void AddPoseCommandsForType(AnimationType type, List<string> affectedEmotes, List<string> emoteCommands)
+    {
+        switch (type)
+        {
+            case AnimationType.StandingIdle:
+                if (!affectedEmotes.Contains("idle")) affectedEmotes.Add("idle");
+                if (!emoteCommands.Contains("/cpose")) emoteCommands.Add("/cpose");
+                break;
+            case AnimationType.ChairSitting:
+                if (!affectedEmotes.Contains("sit")) affectedEmotes.Add("sit");
+                if (!emoteCommands.Contains("/sit")) emoteCommands.Add("/sit");
+                break;
+            case AnimationType.GroundSitting:
+                if (!affectedEmotes.Contains("groundsit")) affectedEmotes.Add("groundsit");
+                if (!emoteCommands.Contains("/groundsit")) emoteCommands.Add("/groundsit");
+                break;
+            case AnimationType.LyingDozing:
+                if (!affectedEmotes.Contains("doze")) affectedEmotes.Add("doze");
+                if (!emoteCommands.Contains("/doze")) emoteCommands.Add("/doze");
+                break;
         }
     }
 
@@ -2258,6 +2427,11 @@ public class EmoteDetectionService
             if (emoteName == "dance" && text.Contains("dance_"))
                 continue;
 
+            // Skip matching "pose" when text is a numbered pose file (pose01, pose02, etc.)
+            // These are idle pose animation files, not the /pose emote
+            if (emoteName == "pose" && System.Text.RegularExpressions.Regex.IsMatch(text, @"pose\d"))
+                continue;
+
             if (text.Contains(emoteName.ToLowerInvariant()))
                 return emoteName;
         }
@@ -2430,12 +2604,19 @@ public class EmoteModInfo
     /// </summary>
     public List<int> AffectedPoseIndices { get; set; } = new();
 
+    /// <summary>
+    /// Maps each AnimationType (as int) to its list of pose indices.
+    /// For mods with multiple pose types (e.g., idle+sit+groundsit+doze).
+    /// </summary>
+    public Dictionary<int, List<int>> PoseTypeIndices { get; set; } = new();
+
     public bool RequiresRedraw => AnimationType switch
     {
         EmoteDetectionService.AnimationType.StandingIdle => true,
         EmoteDetectionService.AnimationType.ChairSitting => true,
         EmoteDetectionService.AnimationType.GroundSitting => true,
         EmoteDetectionService.AnimationType.LyingDozing => true,
+        EmoteDetectionService.AnimationType.Movement => true,
         _ => false
     };
 }

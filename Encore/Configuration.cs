@@ -42,6 +42,8 @@ public class Configuration : IPluginConfiguration
     public List<string> FolderOrder { get; set; } = new();
     // Opt-in: use game functions for sit/doze anywhere (sends position data to server)
     public bool AllowSitDozeAnywhere { get; set; } = false;
+    public List<string> PinnedFileBrowserPaths { get; set; } = new();
+    public string? LastBrowserDirectory { get; set; }
 
     public void Save()
     {
@@ -68,6 +70,7 @@ public class DancePreset
     public string ChatCommand { get; set; } = "";
 
     public uint? IconId { get; set; }
+    public string? CustomIconPath { get; set; }
 
     // Whether commands are registered for this preset
     public bool Enabled { get; set; } = true;
@@ -87,19 +90,20 @@ public class DancePreset
     public string EmoteCommand { get; set; } = "/dance";
     public bool ExecuteEmote { get; set; } = true;
 
-    // 1=Emote, 2=StandingIdle, 3=ChairSitting, 4=GroundSitting, 5=LyingDozing
+    // 1=Emote, 2=StandingIdle, 3=ChairSitting, 4=GroundSitting, 5=LyingDozing, 6=Movement
     public int AnimationType { get; set; } = 1;
 
     // Pose index (0-6) for pose mods, or -1 if not applicable
     public int PoseIndex { get; set; } = -1;
 
-    // Poses require a Penumbra redraw to take effect
+    // Poses and movement mods require a Penumbra redraw to take effect
     public bool RequiresRedraw => AnimationType switch
     {
         2 => true, // StandingIdle
         3 => true, // ChairSitting
         4 => true, // GroundSitting
         5 => true, // LyingDozing
+        6 => true, // Movement
         _ => false
     };
 
@@ -117,6 +121,7 @@ public class DancePreset
             Name = Name + " (Copy)",
             ChatCommand = "",
             IconId = IconId,
+            CustomIconPath = CustomIconPath,
             Enabled = false,
             ModDirectory = ModDirectory,
             ModName = ModName,

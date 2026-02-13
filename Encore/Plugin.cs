@@ -12,6 +12,7 @@ using FFXIVClientStructs.FFXIV.Client.System.String;
 using FFXIVClientStructs.FFXIV.Client.UI;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using Encore.Services;
@@ -36,6 +37,9 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static ITargetManager TargetManager { get; private set; } = null!;
     [PluginService] internal static IGameConfig GameConfig { get; private set; } = null!;
 
+    // Icons directory for custom preset images
+    internal static string IconsDirectory => Path.Combine(PluginInterface.GetPluginConfigDirectory(), "icons");
+
     // Main command
     private const string MainCommand = "/encore";
 
@@ -54,6 +58,7 @@ public sealed class Plugin : IDalamudPlugin
     private PresetEditorWindow PresetEditorWindow { get; init; }
     private IconPickerWindow IconPickerWindow { get; init; }
     private HelpWindow HelpWindow { get; init; }
+    internal ImGuiFileBrowserWindow FileBrowserWindow { get; init; }
 
     // Dynamic command tracking
     private readonly HashSet<string> registeredPresetCommands = new();
@@ -89,6 +94,9 @@ public sealed class Plugin : IDalamudPlugin
         }
         if (needsCreatedAtBackfill) Configuration.Save();
 
+        // Ensure icons directory exists for custom preset images
+        Directory.CreateDirectory(IconsDirectory);
+
         // Initialize services
         try
         {
@@ -116,6 +124,8 @@ public sealed class Plugin : IDalamudPlugin
         PresetEditorWindow = new PresetEditorWindow();
         IconPickerWindow = new IconPickerWindow();
         HelpWindow = new HelpWindow();
+        FileBrowserWindow = new ImGuiFileBrowserWindow("Select Icon Image");
+        FileBrowserWindow.SetConfiguration(Configuration);
 
         // Wire up window dependencies
         MainWindow.SetEditorWindow(PresetEditorWindow);
@@ -127,6 +137,7 @@ public sealed class Plugin : IDalamudPlugin
         WindowSystem.AddWindow(PresetEditorWindow);
         WindowSystem.AddWindow(IconPickerWindow);
         WindowSystem.AddWindow(HelpWindow);
+        WindowSystem.AddWindow(FileBrowserWindow);
 
         // Register main command
         CommandManager.AddHandler(MainCommand, new CommandInfo(OnMainCommand)
@@ -447,6 +458,12 @@ public sealed class Plugin : IDalamudPlugin
         var isAlreadyActive = Configuration.ActivePresetId == preset.Id &&
                               Configuration.ActivePresetCollectionId == collectionId.ToString();
 
+        // Check if previous preset was a movement mod (need redraw to reload original walk/run animations)
+        var previousPreset = Configuration.ActivePresetId != null
+            ? Configuration.Presets.Find(p => p.Id == Configuration.ActivePresetId)
+            : null;
+        var wasMovementPreset = previousPreset?.AnimationType == 6;
+
         // Snapshot current state before applying new preset (these are previous preset's changes)
         var previousPriorities = new Dictionary<string, int>(Configuration.OriginalPriorities);
         var previousModsWeEnabled = new HashSet<string>(Configuration.ModsWeEnabled);
@@ -479,11 +496,19 @@ public sealed class Plugin : IDalamudPlugin
                 }
 
                 // Execute emote/pose action (immediate - don't wait)
-                if (preset.ExecuteEmote)
+                // Movement presets always need redraw even if ExecuteEmote is false (legacy presets)
+                if (preset.ExecuteEmote || preset.AnimationType == 6)
                 {
                     Framework.RunOnFrameworkThread(() =>
                     {
                         loopingEmoteCommand = null; // Clear any active loop
+
+                        // Switching away from a movement preset — redraw to reload original walk/run animations
+                        // (skip for types that already redraw: StandingIdle=2 and Movement=6)
+                        if (wasMovementPreset && !isAlreadyActive && preset.AnimationType != 2 && preset.AnimationType != 6)
+                        {
+                            ExecuteRedraw();
+                        }
 
                         switch (preset.AnimationType)
                         {
@@ -522,6 +547,10 @@ public sealed class Plugin : IDalamudPlugin
                                     PoseService.ExecuteDozeAnywhere();
                                 else
                                     ExecuteEmote("/doze");
+                                break;
+
+                            case 6: // Movement — just redraw to apply new walk/run animations
+                                ExecuteRedraw();
                                 break;
 
                             default: // AnimationType 1 (Emote) or unknown
@@ -1232,6 +1261,12 @@ public sealed class Plugin : IDalamudPlugin
                     await Task.Delay(5);
                 }
 
+                // If active preset was a movement mod, redraw to reload original walk/run animations
+                var activePreset = Configuration.ActivePresetId != null
+                    ? Configuration.Presets.Find(p => p.Id == Configuration.ActivePresetId)
+                    : null;
+                var needsRedraw = activePreset?.AnimationType == 6;
+
                 // Clear stored state and active preset
                 Configuration.OriginalPriorities.Clear();
                 Configuration.ModsWeEnabled.Clear();
@@ -1242,6 +1277,8 @@ public sealed class Plugin : IDalamudPlugin
 
                 Framework.RunOnFrameworkThread(() =>
                 {
+                    if (needsRedraw)
+                        ExecuteRedraw();
                     Configuration.Save();
                     PrintChat($"Restored state for {restored} mod(s).", XivChatType.Echo);
                 });

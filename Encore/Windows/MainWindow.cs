@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
@@ -14,7 +15,6 @@ public class MainWindow : Window, IDisposable
 {
     private PresetEditorWindow? editorWindow;
     private HelpWindow? helpWindow;
-    private int? presetToDelete = null;
     private int selectedPresetIndex = -1;
 
     // Sorting options
@@ -55,9 +55,6 @@ public class MainWindow : Window, IDisposable
         ("Pink", new Vector3(0.9f, 0.4f, 0.7f)),
         ("Cyan", new Vector3(0.3f, 0.8f, 0.8f)),
     };
-
-    // Folder delete confirmation
-    private string? folderToDelete = null;
 
     // Base sizes (before scaling)
     private const float BaseWidth = 500f;
@@ -130,10 +127,6 @@ public class MainWindow : Window, IDisposable
             DrawPresetList();
             ImGui.Spacing();
             DrawBottomBar();
-
-            // Delete confirmation popups
-            DrawDeleteConfirmation();
-            DrawFolderDeleteConfirmation();
         }
         finally
         {
@@ -154,7 +147,8 @@ public class MainWindow : Window, IDisposable
             : new Vector4(1f, 0.4f, 0.4f, 1f);
 
         var statusWidth = ImGui.CalcTextSize(statusText).X;
-        ImGui.SameLine(ImGui.GetWindowWidth() - statusWidth - 15);
+        ImGui.SameLine();
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - statusWidth);
         ImGui.TextColored(statusColor, statusText);
 
         ImGui.Separator();
@@ -170,8 +164,11 @@ public class MainWindow : Window, IDisposable
         // Sort controls
         DrawSortControls();
 
-        // Calculate list height
-        var listHeight = ImGui.GetContentRegionAvail().Y - 80;
+        // Current pose indices indicator
+        DrawPoseIndicator();
+
+        // Calculate list height (reserve space for bottom bar)
+        var listHeight = ImGui.GetContentRegionAvail().Y - 80 * UIStyles.Scale;
 
         if (ImGui.BeginChild("PresetList", new Vector2(-1, listHeight), true))
         {
@@ -193,7 +190,7 @@ public class MainWindow : Window, IDisposable
                 var sortedIndices = GetSortedPresetIndices(presets);
                 foreach (var i in sortedIndices)
                 {
-                    DrawPresetCard(presets[i], i);
+                    if (DrawPresetCard(presets[i], i)) break;
                 }
             }
 
@@ -239,17 +236,20 @@ public class MainWindow : Window, IDisposable
 
         // 1. Draw unfiled presets first (FolderId == null)
         var unfiledIndices = sortedIndices.Where(i => presets[i].FolderId == null).ToList();
+        var deletedThisFrame = false;
         foreach (var i in unfiledIndices)
         {
-            DrawPresetCard(presets[i], i);
+            if (DrawPresetCard(presets[i], i)) { deletedThisFrame = true; break; }
         }
 
-        // 2. Draw each folder and its presets
-        var folderOrder = config.FolderOrder ?? new List<string>();
+        // 2. Draw each folder and its presets (snapshot to avoid collection-modified if folder is reordered via context menu)
+        var folderOrder = (config.FolderOrder ?? new List<string>()).ToList();
         var folders = config.Folders ?? new List<PresetFolder>();
 
         foreach (var folderId in folderOrder)
         {
+            if (deletedThisFrame) break;
+
             var folder = folders.FirstOrDefault(f => f.Id == folderId);
             if (folder == null) continue;
 
@@ -266,15 +266,34 @@ public class MainWindow : Window, IDisposable
                 var indent = accentWidth + 2f * scale;
                 var paddingTop = 6f * scale;
                 var paddingBottom = 22f * scale;
-
-                // Estimate content area height
                 var itemSpacing = ImGui.GetStyle().ItemSpacing.Y;
-                var borderSize = ImGui.GetStyle().ChildBorderSize;
-                var cardTotalHeight = 80f * scale + borderSize * 2 + itemSpacing; // card + border + spacing between
-                var totalHeight = folderIndices.Count * cardTotalHeight + paddingTop + paddingBottom - itemSpacing; // padding top/bottom, remove trailing spacing
 
                 var startPos = ImGui.GetCursorScreenPos();
                 var contentWidth = ImGui.GetContentRegionAvail().X;
+
+                // Use channel splitting so we can render cards first (to measure height),
+                // then draw the background behind them on a lower channel.
+                drawList.ChannelsSplit(2);
+
+                // Channel 1: render preset cards (foreground)
+                drawList.ChannelsSetCurrent(1);
+
+                // Top padding
+                ImGui.SetCursorScreenPos(new Vector2(startPos.X, startPos.Y + paddingTop));
+
+                // Draw presets indented past the accent bar
+                ImGui.Indent(indent);
+                foreach (var i in folderIndices)
+                {
+                    if (DrawPresetCard(presets[i], i, folderColor)) { deletedThisFrame = true; break; }
+                }
+                ImGui.Unindent(indent);
+
+                // Measure actual content height from rendered cards
+                var totalHeight = ImGui.GetCursorScreenPos().Y - startPos.Y + paddingBottom;
+
+                // Channel 0: draw background elements (rendered behind cards)
+                drawList.ChannelsSetCurrent(0);
 
                 // Content area background (connects to header above — flat top corners)
                 var contentBg = new Vector4(
@@ -302,16 +321,8 @@ public class MainWindow : Window, IDisposable
                     ImGui.ColorConvertFloat4ToU32(new Vector4(folderColor.X, folderColor.Y, folderColor.Z, 0.3f)),
                     1f * scale);
 
-                // Top padding
-                ImGui.SetCursorScreenPos(new Vector2(startPos.X, startPos.Y + paddingTop));
-
-                // Draw presets indented past the accent bar
-                ImGui.Indent(indent);
-                foreach (var i in folderIndices)
-                {
-                    DrawPresetCard(presets[i], i, folderColor);
-                }
-                ImGui.Unindent(indent);
+                // Merge channels: background (0) drawn first, then cards (1)
+                drawList.ChannelsMerge();
 
                 // Ensure cursor is past the content area
                 var endY = startPos.Y + totalHeight + itemSpacing;
@@ -323,21 +334,25 @@ public class MainWindow : Window, IDisposable
         }
 
         // Also draw presets in folders that aren't in FolderOrder (orphaned folder refs)
-        var knownFolderIds = new HashSet<string>(folderOrder);
-        var orphanFolderIds = sortedIndices
-            .Where(i => presets[i].FolderId != null && !knownFolderIds.Contains(presets[i].FolderId!))
-            .Select(i => presets[i].FolderId!)
-            .Distinct()
-            .ToList();
-        foreach (var orphanId in orphanFolderIds)
+        if (!deletedThisFrame)
         {
-            // Preset references a deleted folder — unfile it
-            foreach (var i in sortedIndices.Where(i => presets[i].FolderId == orphanId))
+            var knownFolderIds = new HashSet<string>(folderOrder);
+            var orphanFolderIds = sortedIndices
+                .Where(i => presets[i].FolderId != null && !knownFolderIds.Contains(presets[i].FolderId!))
+                .Select(i => presets[i].FolderId!)
+                .Distinct()
+                .ToList();
+            foreach (var orphanId in orphanFolderIds)
             {
-                presets[i].FolderId = null;
-                DrawPresetCard(presets[i], i);
+                // Preset references a deleted folder — unfile it
+                foreach (var i in sortedIndices.Where(i => presets[i].FolderId == orphanId))
+                {
+                    presets[i].FolderId = null;
+                    if (DrawPresetCard(presets[i], i)) { deletedThisFrame = true; break; }
+                }
+                if (deletedThisFrame) break;
+                config.Save();
             }
-            config.Save();
         }
     }
 
@@ -504,8 +519,20 @@ public class MainWindow : Window, IDisposable
                 UIStyles.PushDangerButtonStyle();
                 if (ImGui.MenuItem("Delete Folder"))
                 {
-                    folderToDelete = folder.Id;
+                    var io = ImGui.GetIO();
+                    if (io.KeyCtrl && io.KeyShift)
+                    {
+                        // Unfile all presets in this folder
+                        foreach (var p in config.Presets.Where(p => p.FolderId == folder.Id))
+                            p.FolderId = null;
+
+                        config.Folders.Remove(folder);
+                        config.FolderOrder.Remove(folder.Id);
+                        config.Save();
+                    }
                 }
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip("Hold Ctrl+Shift and click to delete");
                 UIStyles.PopDangerButtonStyle();
 
                 ImGui.EndPopup();
@@ -551,8 +578,10 @@ public class MainWindow : Window, IDisposable
 
     private void DrawSortControls()
     {
+        var scale = UIStyles.Scale;
+
         // Search bar
-        ImGui.SetNextItemWidth(200);
+        ImGui.SetNextItemWidth(200 * scale);
         ImGui.InputTextWithHint("##presetSearch", "Search...", ref presetSearchFilter, 100);
 
         ImGui.SameLine();
@@ -562,7 +591,7 @@ public class MainWindow : Window, IDisposable
         ImGui.Text("Sort:");
         ImGui.SameLine();
 
-        ImGui.SetNextItemWidth(100);
+        ImGui.SetNextItemWidth(100 * scale);
         var sortOptions = new[] { "Custom", "Name", "Command", "Favorites", "Newest", "Oldest" };
         var currentSortIndex = (int)currentSort;
         if (ImGui.Combo("##sort", ref currentSortIndex, sortOptions, sortOptions.Length))
@@ -571,10 +600,14 @@ public class MainWindow : Window, IDisposable
         }
 
         // Priority boost on the right
-        ImGui.SameLine(ImGui.GetWindowWidth() - 125);
+        var priorityInputWidth = 50f * scale;
+        var priorityLabelWidth = ImGui.CalcTextSize("Priority +").X;
+        var prioritySectionWidth = priorityLabelWidth + 4 * scale + priorityInputWidth;
+        ImGui.SameLine();
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - prioritySectionWidth);
         ImGui.Text("Priority +");
-        ImGui.SameLine(0, 4);
-        ImGui.SetNextItemWidth(50);
+        ImGui.SameLine(0, 4 * scale);
+        ImGui.SetNextItemWidth(priorityInputWidth);
 
         // Load current value if not yet loaded
         if (editPriorityBoost == -1)
@@ -596,6 +629,41 @@ public class MainWindow : Window, IDisposable
         }
 
         ImGui.Spacing();
+    }
+
+    private void DrawPoseIndicator()
+    {
+        var poses = Plugin.Instance?.PoseService?.GetCurrentPoseIndices();
+        if (poses == null) return;
+
+        var (idle, sit, groundSit, doze) = poses.Value;
+        var dimColor = new Vector4(0.5f, 0.5f, 0.5f, 1f);
+        var valueColor = new Vector4(0.7f, 0.85f, 1f, 1f);
+
+        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new Vector2(0, ImGui.GetStyle().ItemSpacing.Y));
+
+        ImGui.TextColored(dimColor, "Current Pose:");
+        ImGui.SameLine(0, 4);
+        ImGui.TextColored(dimColor, "Idle");
+        ImGui.SameLine(0, 2);
+        ImGui.TextColored(valueColor, $"#{idle}");
+
+        ImGui.SameLine(0, 10);
+        ImGui.TextColored(dimColor, "Sit");
+        ImGui.SameLine(0, 2);
+        ImGui.TextColored(valueColor, $"#{sit}");
+
+        ImGui.SameLine(0, 10);
+        ImGui.TextColored(dimColor, "GSit");
+        ImGui.SameLine(0, 2);
+        ImGui.TextColored(valueColor, $"#{groundSit}");
+
+        ImGui.SameLine(0, 10);
+        ImGui.TextColored(dimColor, "Doze");
+        ImGui.SameLine(0, 2);
+        ImGui.TextColored(valueColor, $"#{doze}");
+
+        ImGui.PopStyleVar();
     }
 
     private List<int> GetSortedPresetIndices(List<DancePreset> presets)
@@ -648,7 +716,7 @@ public class MainWindow : Window, IDisposable
         return indices;
     }
 
-    private void DrawPresetCard(DancePreset preset, int index, Vector3? folderColor = null)
+    private bool DrawPresetCard(DancePreset preset, int index, Vector3? folderColor = null)
     {
         ImGui.PushID($"preset_{preset.Id}");
 
@@ -667,11 +735,14 @@ public class MainWindow : Window, IDisposable
         // Track card position for drag & drop
         var cardScreenPos = ImGui.GetCursorScreenPos();
 
-        if (ImGui.BeginChild($"card_{index}", new Vector2(-1, cardHeight), true))
+        if (ImGui.BeginChild($"card_{index}", new Vector2(-1, cardHeight), true, ImGuiWindowFlags.NoScrollbar))
         {
             // Track hover for NoMove on next frame
             if (ImGui.IsWindowHovered())
                 anyCardHovered = true;
+
+            // Content width for right-aligning buttons (must capture before drawing changes cursor)
+            var cardContentWidth = ImGui.GetContentRegionAvail().X;
 
             // Accent bars on left edge when inside a folder
             if (folderColor.HasValue)
@@ -704,7 +775,27 @@ public class MainWindow : Window, IDisposable
 
             // Icon
             var iconSize = 48f * scale;
-            if (preset.IconId.HasValue)
+            if (!string.IsNullOrEmpty(preset.CustomIconPath) && File.Exists(preset.CustomIconPath))
+            {
+                var tex = GetCustomIcon(preset.CustomIconPath);
+                if (tex != null)
+                {
+                    Vector2 uv0 = Vector2.Zero, uv1 = Vector2.One;
+                    if (tex.Width > tex.Height) {
+                        float excess = (tex.Width - tex.Height) / (2f * tex.Width);
+                        uv0.X = excess; uv1.X = 1f - excess;
+                    } else if (tex.Height > tex.Width) {
+                        float excess = (tex.Height - tex.Width) / (2f * tex.Height);
+                        uv0.Y = excess; uv1.Y = 1f - excess;
+                    }
+                    ImGui.Image(tex.Handle, new Vector2(iconSize, iconSize), uv0, uv1);
+                }
+                else
+                {
+                    DrawPlaceholderIcon(iconSize, scale);
+                }
+            }
+            else if (preset.IconId.HasValue)
             {
                 var iconTexture = GetGameIcon(preset.IconId.Value);
                 if (iconTexture != null)
@@ -723,6 +814,14 @@ public class MainWindow : Window, IDisposable
 
             ImGui.SameLine();
 
+            // Calculate max text width (from current cursor to where buttons start, with padding)
+            var textStartX = ImGui.GetCursorPosX();
+            var buttonWidth = 50f * scale;
+            var menuWidth = 28f * scale;
+            var btnSpacing = ImGui.GetStyle().ItemSpacing.X;
+            var buttonsStartX = cardContentWidth - buttonWidth - btnSpacing - menuWidth + 8 * scale;
+            var maxTextWidth = buttonsStartX - textStartX - 8 * scale;
+
             // Info section
             ImGui.BeginGroup();
 
@@ -732,12 +831,16 @@ public class MainWindow : Window, IDisposable
                 ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.5f, 0.5f, 0.5f, 1f));
             }
 
+            var nameMaxWidth = maxTextWidth;
             if (isFavorite)
             {
                 ImGui.TextColored(new Vector4(1f, 0.85f, 0.2f, 1f), "*");
                 ImGui.SameLine(0, 2);
+                nameMaxWidth -= ImGui.CalcTextSize("*").X + 2;
             }
-            ImGui.Text(preset.Name);
+            if (!preset.Enabled)
+                nameMaxWidth -= ImGui.CalcTextSize(" (Disabled)").X + ImGui.GetStyle().ItemSpacing.X;
+            DrawTruncatedText(preset.Name, nameMaxWidth);
 
             if (!preset.Enabled)
             {
@@ -757,14 +860,13 @@ public class MainWindow : Window, IDisposable
             }
 
             // Mod name
-            ImGui.TextDisabled(string.IsNullOrEmpty(preset.ModName) ? "No mod selected" : preset.ModName);
+            var modText = string.IsNullOrEmpty(preset.ModName) ? "No mod selected" : preset.ModName;
+            DrawTruncatedText(modText, maxTextWidth, disabled: true);
 
             ImGui.EndGroup();
 
-            // Action buttons (right side - closer to edge)
-            var buttonWidth = 50f * scale;
-            var menuWidth = 28f * scale;
-            var buttonsX = ImGui.GetWindowWidth() - buttonWidth - menuWidth - 12 * scale;
+            // Action buttons (right-aligned within content region)
+            var buttonsX = buttonsStartX;
 
             ImGui.SameLine(buttonsX);
             ImGui.BeginGroup();
@@ -843,13 +945,33 @@ public class MainWindow : Window, IDisposable
                 ImGui.Separator();
 
                 UIStyles.PushDangerButtonStyle();
+                var deleted = false;
                 if (ImGui.MenuItem("Delete"))
                 {
-                    presetToDelete = index;
+                    var io = ImGui.GetIO();
+                    if (io.KeyCtrl && io.KeyShift)
+                    {
+                        Plugin.Instance!.Configuration.Presets.RemoveAt(index);
+                        Plugin.Instance.UpdatePresetCommands();
+                        Plugin.Instance.Configuration.Save();
+                        selectedPresetIndex = -1;
+                        deleted = true;
+                    }
                 }
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip("Hold Ctrl+Shift and click to delete");
                 UIStyles.PopDangerButtonStyle();
 
                 ImGui.EndPopup();
+
+                if (deleted)
+                {
+                    ImGui.EndGroup();
+                    ImGui.EndChild();
+                    ImGui.PopStyleColor();
+                    ImGui.PopID();
+                    return true;
+                }
             }
 
             ImGui.EndGroup();
@@ -867,13 +989,17 @@ public class MainWindow : Window, IDisposable
             }
 
             // Base emote (bottom right corner) - drawn via DrawList to not affect layout
-            if (!string.IsNullOrEmpty(preset.EmoteCommand))
             {
                 var drawList = ImGui.GetWindowDrawList();
                 var emoteText = preset.EmoteCommand;
 
+                // For movement mods, show "Walk / Run"
+                if (preset.AnimationType == 6)
+                {
+                    emoteText = "Walk / Run";
+                }
                 // For pose mods, show the pose type and index (e.g., "cpose 1", "/groundsit 2")
-                if (preset.AnimationType >= 2 && preset.AnimationType <= 5)
+                else if (preset.AnimationType >= 2 && preset.AnimationType <= 5)
                 {
                     var poseStr = preset.PoseIndex >= 0 ? $" {preset.PoseIndex}" : "";
                     emoteText = preset.AnimationType switch
@@ -885,13 +1011,17 @@ public class MainWindow : Window, IDisposable
                         _ => emoteText
                     };
                 }
-                var emoteSize = ImGui.CalcTextSize(emoteText);
-                var windowPos = ImGui.GetWindowPos();
-                var windowSize = ImGui.GetWindowSize();
-                var textPos = new Vector2(
-                    windowPos.X + windowSize.X - emoteSize.X - 10 * scale,
-                    windowPos.Y + windowSize.Y - emoteSize.Y - 8 * scale);
-                drawList.AddText(textPos, ImGui.ColorConvertFloat4ToU32(new Vector4(0.45f, 0.45f, 0.45f, 1f)), emoteText);
+
+                if (!string.IsNullOrEmpty(emoteText))
+                {
+                    var emoteSize = ImGui.CalcTextSize(emoteText);
+                    var windowPos = ImGui.GetWindowPos();
+                    var windowSize = ImGui.GetWindowSize();
+                    var textPos = new Vector2(
+                        windowPos.X + windowSize.X - emoteSize.X - 10 * scale,
+                        windowPos.Y + windowSize.Y - emoteSize.Y - 8 * scale);
+                    drawList.AddText(textPos, ImGui.ColorConvertFloat4ToU32(new Vector4(0.45f, 0.45f, 0.45f, 1f)), emoteText);
+                }
             }
         }
         ImGui.EndChild();
@@ -945,6 +1075,7 @@ public class MainWindow : Window, IDisposable
         ImGui.PopID();
 
         ImGui.Spacing();
+        return false;
     }
 
     private void ToggleFavorite(string presetId)
@@ -975,6 +1106,40 @@ public class MainWindow : Window, IDisposable
 
         selectedPresetIndex = toIndex;
         Plugin.Instance?.Configuration.Save();
+    }
+
+    private static void DrawTruncatedText(string text, float maxWidth, bool disabled = false)
+    {
+        var fullSize = ImGui.CalcTextSize(text);
+        if (fullSize.X <= maxWidth || maxWidth <= 0)
+        {
+            if (disabled)
+                ImGui.TextDisabled(text);
+            else
+                ImGui.Text(text);
+            return;
+        }
+
+        var ellipsis = "...";
+        var ellipsisWidth = ImGui.CalcTextSize(ellipsis).X;
+        var truncated = text;
+        for (var i = text.Length - 1; i > 0; i--)
+        {
+            truncated = text[..i];
+            if (ImGui.CalcTextSize(truncated).X + ellipsisWidth <= maxWidth)
+            {
+                truncated += ellipsis;
+                break;
+            }
+        }
+
+        if (disabled)
+            ImGui.TextDisabled(truncated);
+        else
+            ImGui.Text(truncated);
+
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(text);
     }
 
     private void DrawPlaceholderIcon(float size, float scale)
@@ -1193,7 +1358,9 @@ public class MainWindow : Window, IDisposable
         }
 
         // Help button (right edge, with room for gear button)
-        ImGui.SameLine(ImGui.GetWindowWidth() - 75 * scale);
+        var rightButtonsWidth = 30 * scale + ImGui.GetStyle().ItemSpacing.X + 30 * scale;
+        ImGui.SameLine();
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - rightButtonsWidth);
         if (ImGui.Button("?", new Vector2(30 * scale, 30 * scale)))
         {
             helpWindow?.Toggle();
@@ -1465,114 +1632,6 @@ public class MainWindow : Window, IDisposable
         }
     }
 
-    private void DrawDeleteConfirmation()
-    {
-        // Open the popup at window level when presetToDelete is set
-        if (presetToDelete.HasValue)
-        {
-            ImGui.OpenPopup("Delete Preset?###deleteConfirm");
-        }
-
-        var center = ImGui.GetMainViewport().GetCenter();
-        ImGui.SetNextWindowPos(center, ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
-
-        if (ImGui.BeginPopupModal("Delete Preset?###deleteConfirm", ImGuiWindowFlags.AlwaysAutoResize))
-        {
-            if (presetToDelete.HasValue && presetToDelete.Value < Plugin.Instance?.Configuration.Presets.Count)
-            {
-                var preset = Plugin.Instance!.Configuration.Presets[presetToDelete.Value];
-                ImGui.Text($"Are you sure you want to delete '{preset.Name}'?");
-                ImGui.TextDisabled("This action cannot be undone.");
-                ImGui.Spacing();
-
-                var scale = UIStyles.Scale;
-                UIStyles.PushDangerButtonStyle();
-                if (ImGui.Button("Delete", new Vector2(100 * scale, 0)))
-                {
-                    Plugin.Instance.Configuration.Presets.RemoveAt(presetToDelete.Value);
-                    Plugin.Instance.UpdatePresetCommands();
-                    Plugin.Instance.Configuration.Save();
-                    presetToDelete = null;
-                    selectedPresetIndex = -1;
-                    ImGui.CloseCurrentPopup();
-                }
-                UIStyles.PopDangerButtonStyle();
-
-                ImGui.SameLine();
-
-                if (ImGui.Button("Cancel", new Vector2(100 * scale, 0)))
-                {
-                    presetToDelete = null;
-                    ImGui.CloseCurrentPopup();
-                }
-            }
-            else
-            {
-                ImGui.CloseCurrentPopup();
-            }
-
-            ImGui.EndPopup();
-        }
-    }
-
-    private void DrawFolderDeleteConfirmation()
-    {
-        if (folderToDelete != null)
-        {
-            ImGui.OpenPopup("Delete Folder?###deleteFolderConfirm");
-        }
-
-        var center = ImGui.GetMainViewport().GetCenter();
-        ImGui.SetNextWindowPos(center, ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
-
-        if (ImGui.BeginPopupModal("Delete Folder?###deleteFolderConfirm", ImGuiWindowFlags.AlwaysAutoResize))
-        {
-            var config = Plugin.Instance?.Configuration;
-            var folder = config?.Folders.FirstOrDefault(f => f.Id == folderToDelete);
-
-            if (folder != null && config != null)
-            {
-                var presetsInFolder = config.Presets.Count(p => p.FolderId == folder.Id);
-                ImGui.Text($"Delete folder '{folder.Name}'?");
-                if (presetsInFolder > 0)
-                    ImGui.TextDisabled($"{presetsInFolder} preset(s) will be moved out of this folder.");
-                else
-                    ImGui.TextDisabled("This folder is empty.");
-                ImGui.Spacing();
-
-                var scale = UIStyles.Scale;
-                UIStyles.PushDangerButtonStyle();
-                if (ImGui.Button("Delete", new Vector2(100 * scale, 0)))
-                {
-                    // Unfile all presets in this folder
-                    foreach (var p in config.Presets.Where(p => p.FolderId == folder.Id))
-                        p.FolderId = null;
-
-                    config.Folders.Remove(folder);
-                    config.FolderOrder.Remove(folder.Id);
-                    config.Save();
-                    folderToDelete = null;
-                    ImGui.CloseCurrentPopup();
-                }
-                UIStyles.PopDangerButtonStyle();
-
-                ImGui.SameLine();
-
-                if (ImGui.Button("Cancel", new Vector2(100 * scale, 0)))
-                {
-                    folderToDelete = null;
-                    ImGui.CloseCurrentPopup();
-                }
-            }
-            else
-            {
-                folderToDelete = null;
-                ImGui.CloseCurrentPopup();
-            }
-
-            ImGui.EndPopup();
-        }
-    }
 
     private void HandleEditorCompletion()
     {
@@ -1608,6 +1667,19 @@ public class MainWindow : Window, IDisposable
         try
         {
             var texture = Plugin.TextureProvider.GetFromGameIcon(iconId);
+            return texture?.GetWrapOrEmpty();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private IDalamudTextureWrap? GetCustomIcon(string path)
+    {
+        try
+        {
+            var texture = Plugin.TextureProvider.GetFromFile(path);
             return texture?.GetWrapOrEmpty();
         }
         catch

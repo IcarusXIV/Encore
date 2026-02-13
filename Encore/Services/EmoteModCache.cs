@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Dalamud.Plugin;
@@ -11,7 +12,7 @@ namespace Encore.Services;
 // Cache data structure for emote mods - persisted to disk
 public class EmoteModCacheData
 {
-    public const int CurrentVersion = 5;
+    public const int CurrentVersion = 9;
 
     [JsonPropertyName("version")]
     public int Version { get; set; } = CurrentVersion;
@@ -55,6 +56,9 @@ public class EmoteModCacheEntry
 
     [JsonPropertyName("affectedPoseIndices")]
     public List<int> AffectedPoseIndices { get; set; } = new();
+
+    [JsonPropertyName("poseTypeIndices")]
+    public Dictionary<int, List<int>> PoseTypeIndices { get; set; } = new();
 
     [JsonPropertyName("lastSeen")]
     public DateTime LastSeen { get; set; }
@@ -123,7 +127,10 @@ public class EmoteModCache
                     AnimationType = (EmoteDetectionService.AnimationType)entry.AnimationType,
                     PoseAnimationType = (EmoteDetectionService.AnimationType)entry.PoseAnimationType,
                     PoseIndex = entry.PoseIndex,
-                    AffectedPoseIndices = new List<int>(entry.AffectedPoseIndices ?? new List<int>())
+                    AffectedPoseIndices = new List<int>(entry.AffectedPoseIndices ?? new List<int>()),
+                    PoseTypeIndices = entry.PoseTypeIndices != null
+                        ? entry.PoseTypeIndices.ToDictionary(kv => kv.Key, kv => new List<int>(kv.Value))
+                        : new Dictionary<int, List<int>>()
                 });
             }
         }
@@ -150,6 +157,9 @@ public class EmoteModCache
                 PoseAnimationType = (int)(emoteInfo?.PoseAnimationType ?? EmoteDetectionService.AnimationType.None),
                 PoseIndex = emoteInfo?.PoseIndex ?? -1,
                 AffectedPoseIndices = emoteInfo?.AffectedPoseIndices != null ? new List<int>(emoteInfo.AffectedPoseIndices) : new List<int>(),
+                PoseTypeIndices = emoteInfo?.PoseTypeIndices != null
+                    ? emoteInfo.PoseTypeIndices.ToDictionary(kv => kv.Key, kv => new List<int>(kv.Value))
+                    : new Dictionary<int, List<int>>(),
                 LastSeen = DateTime.UtcNow
             };
 

@@ -75,6 +75,29 @@ public sealed unsafe class PoseService : IDisposable
     }
 
     /// <summary>
+    /// Read the current selected pose indices for all pose types from PlayerState.
+    /// Returns (idle, sit, groundSit, doze) or null if unavailable.
+    /// </summary>
+    public (int idle, int sit, int groundSit, int doze)? GetCurrentPoseIndices()
+    {
+        try
+        {
+            var ps = PlayerState.Instance();
+            if (ps == null) return null;
+            return (
+                ps->SelectedPoses[(int)EmoteController.PoseType.Idle],
+                ps->SelectedPoses[(int)EmoteController.PoseType.Sit],
+                ps->SelectedPoses[(int)EmoteController.PoseType.GroundSit],
+                ps->SelectedPoses[(int)EmoteController.PoseType.Doze]
+            );
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Execute chair-sit anywhere by saving position, then calling useEmote(96).
     /// Position is restored on stand-up via the ShouldSnapUnsit hook.
     /// </summary>
