@@ -23,6 +23,12 @@ public class PenumbraService : IDisposable
     private ICallGateSubscriber<Guid, string, string, bool, int>? trySetModSubscriber;
     private ICallGateSubscriber<string, string, IReadOnlyDictionary<string, (string[], int)>?>? getAvailableModSettingsSubscriber;
 
+    // Temporary mod settings IPC (overrides without touching permanent/inherited state)
+    private ICallGateSubscriber<Guid, string, string,
+        (bool, bool, int, IReadOnlyDictionary<string, IReadOnlyList<string>>),
+        string, int, int>? setTemporaryModSettingsSubscriber;
+    private ICallGateSubscriber<Guid, string, string, int, int>? removeTemporaryModSettingsSubscriber;
+
     public bool IsAvailable { get; private set; }
     public int ApiVersion { get; private set; }
 
@@ -52,6 +58,13 @@ public class PenumbraService : IDisposable
                 trySetModSettingsSubscriber = pluginInterface.GetIpcSubscriber<Guid, string, string, string, IReadOnlyList<string>, int>("Penumbra.TrySetModSettings.V5");
                 trySetModSubscriber = pluginInterface.GetIpcSubscriber<Guid, string, string, bool, int>("Penumbra.TrySetMod.V5");
                 getAvailableModSettingsSubscriber = pluginInterface.GetIpcSubscriber<string, string, IReadOnlyDictionary<string, (string[], int)>?>("Penumbra.GetAvailableModSettings.V5");
+
+                // Temporary mod settings IPC
+                setTemporaryModSettingsSubscriber = pluginInterface.GetIpcSubscriber<Guid, string, string,
+                    (bool, bool, int, IReadOnlyDictionary<string, IReadOnlyList<string>>),
+                    string, int, int>("Penumbra.SetTemporaryModSettings.V5");
+                removeTemporaryModSettingsSubscriber = pluginInterface.GetIpcSubscriber<Guid, string, string, int, int>(
+                    "Penumbra.RemoveTemporaryModSettings.V5");
 
                 log.Information($"Penumbra IPC initialized successfully. API Version: {ApiVersion}");
             }
@@ -272,6 +285,68 @@ public class PenumbraService : IDisposable
         {
             log.Error($"Error getting mod directory: {ex}");
             return null;
+        }
+    }
+
+    public bool SetTemporaryModSettings(Guid collectionId, string modDirectory,
+        bool enabled, int priority,
+        Dictionary<string, List<string>> options,
+        string modName = "")
+    {
+        if (!IsAvailable || setTemporaryModSettingsSubscriber == null)
+            return false;
+
+        try
+        {
+            // Convert options to IReadOnlyDictionary<string, IReadOnlyList<string>>
+            var settings = new Dictionary<string, IReadOnlyList<string>>();
+            foreach (var (k, v) in options)
+                settings[k] = v;
+
+            var pseudoSettings = (false, enabled, priority,
+                (IReadOnlyDictionary<string, IReadOnlyList<string>>)settings);
+            var result = setTemporaryModSettingsSubscriber.InvokeFunc(
+                collectionId, modDirectory, modName, pseudoSettings, "Encore", 0);
+
+            if (result == 0 || result == 1) // Success or NothingChanged
+            {
+                log.Debug($"Set temp settings for {modDirectory} (enabled={enabled}, priority={priority})");
+                return true;
+            }
+
+            log.Warning($"Failed to set temp settings for {modDirectory}: code {result}");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            log.Error($"Failed to set temp settings for {modDirectory}: {ex.Message}");
+            return false;
+        }
+    }
+
+    public bool RemoveTemporaryModSettings(Guid collectionId, string modDirectory, string modName = "")
+    {
+        if (!IsAvailable || removeTemporaryModSettingsSubscriber == null)
+            return false;
+
+        try
+        {
+            var result = removeTemporaryModSettingsSubscriber.InvokeFunc(
+                collectionId, modDirectory, modName, 0);
+
+            if (result == 0 || result == 1) // Success or NothingChanged
+            {
+                log.Debug($"Removed temp settings for {modDirectory}");
+                return true;
+            }
+
+            log.Warning($"Failed to remove temp settings for {modDirectory}: code {result}");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            log.Error($"Failed to remove temp settings for {modDirectory}: {ex.Message}");
+            return false;
         }
     }
 

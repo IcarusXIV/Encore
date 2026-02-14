@@ -46,6 +46,17 @@ public class PresetEditorWindow : Window
     private Dictionary<string, List<string>> editModOptions = new();
     private IReadOnlyDictionary<string, (string[] options, int groupType)>? availableModSettings;
 
+    // Modifier editing
+    private List<PresetModifier> editModifiers = new();
+    private int expandedModifierIndex = -1;
+    private int dragModifierSourceIndex = -1;
+    private int renamingModifierIndex = -1;
+    private string renamingModifierName = "";
+
+    // Section collapse state
+    private bool modSettingsOpen = true;
+    private bool modifiersOpen = true;
+
     // Emote mods list
     private List<EmoteModInfo> emoteMods = new();
     private int selectedModIndex = -1;
@@ -243,6 +254,14 @@ public class PresetEditorWindow : Window
         isVanillaPreset = false;
         editModOptions = new();
         availableModSettings = null;
+        editModifiers = new();
+        expandedModifierIndex = -1;
+        renamingModifierIndex = -1;
+        renamingModifierName = "";
+        draftModifier = null;
+        draftModifierName = "";
+        modSettingsOpen = false;
+        modifiersOpen = false;
 
         needsRefresh = true;
         IsOpen = true;
@@ -275,6 +294,18 @@ public class PresetEditorWindow : Window
         {
             editModOptions[group] = new List<string>(opts);
         }
+
+        // Deep copy modifiers
+        editModifiers = new List<PresetModifier>();
+        foreach (var m in preset.Modifiers)
+            editModifiers.Add(m.Clone());
+        expandedModifierIndex = -1;
+        renamingModifierIndex = -1;
+        renamingModifierName = "";
+        draftModifier = null;
+        draftModifierName = "";
+        modSettingsOpen = false;
+        modifiersOpen = false;
 
         // Load available settings from Penumbra
         availableModSettings = null;
@@ -539,7 +570,7 @@ public class PresetEditorWindow : Window
         if (!isVanillaPreset)
         {
             // Mod Selection (only show when not vanilla)
-            UIStyles.SectionHeader("Select Dance Mod");
+            UIStyles.AccentSectionHeader("Select Dance Mod", new Vector4(0.4f, 0.7f, 1f, 1f));
 
         // Search
         var isSearchDisabled = isLoading;
@@ -725,7 +756,7 @@ public class PresetEditorWindow : Window
         {
             // Vanilla preset - just show emote input (required)
             ImGui.Spacing();
-            UIStyles.SectionHeader("Emote to Use");
+            UIStyles.AccentSectionHeader("Emote to Use", new Vector4(0.4f, 0.9f, 0.5f, 1f));
             ImGui.Text("Emote command (required):");
             ImGui.SetNextItemWidth(200);
             ImGui.Text("/");
@@ -903,11 +934,7 @@ public class PresetEditorWindow : Window
         // Mod Options section (only for non-vanilla presets with a mod selected that has settings)
         if (!isVanillaPreset && !string.IsNullOrEmpty(editModDirectory) && availableModSettings != null && availableModSettings.Count > 0)
         {
-            ImGui.Spacing();
-            ImGui.Separator();
-            ImGui.Spacing();
-
-            if (ImGui.TreeNodeEx("Mod Settings", ImGuiTreeNodeFlags.DefaultOpen))
+            if (UIStyles.CollapsibleAccentSectionHeader("Mod Settings", new Vector4(0.7f, 0.5f, 1f, 1f), ref modSettingsOpen))
             {
                 foreach (var (groupName, (options, groupType)) in availableModSettings)
                 {
@@ -977,9 +1004,15 @@ public class PresetEditorWindow : Window
 
                     ImGui.Spacing();
                 }
-
-                ImGui.TreePop();
             }
+
+            // Modifiers section (when mod has settings, multiple emotes, or multiple poses)
+            DrawModifiersSection();
+        }
+        else if (!isVanillaPreset && !string.IsNullOrEmpty(editModDirectory))
+        {
+            // Show modifiers even without mod settings (for mods with multiple emotes/poses)
+            DrawModifiersSection();
         }
 
         ImGui.Spacing();
@@ -988,6 +1021,534 @@ public class PresetEditorWindow : Window
 
         // Buttons
         DrawButtons(windowSize);
+    }
+
+    // Draft modifier being configured before committing
+    private PresetModifier? draftModifier = null;
+    private string draftModifierName = "";
+
+    private static readonly Vector4 ModifierAccentColor = new Vector4(0.9f, 0.65f, 0.2f, 1f);
+
+    private bool HasModifierRelevantContent()
+    {
+        // Mod has option groups to override
+        if (availableModSettings != null && availableModSettings.Count > 0)
+            return true;
+        // Mod has multiple emotes to choose from
+        if (detectedEmoteCommands.Count > 1)
+            return true;
+        // Mod has multiple pose indices
+        if (detectedPoseIndices.Count > 1)
+            return true;
+        return false;
+    }
+
+    private void DrawModifiersSection()
+    {
+        if (!HasModifierRelevantContent())
+            return;
+
+        if (!UIStyles.CollapsibleAccentSectionHeader("Modifiers", ModifierAccentColor, ref modifiersOpen))
+            return;
+
+        var scale = UIStyles.Scale;
+        var drawList = ImGui.GetWindowDrawList();
+
+        // Description (always visible)
+        ImGui.TextColored(new Vector4(0.55f, 0.55f, 0.55f, 1f),
+            "Switch between different mod options without creating separate presets.");
+
+        // Live usage examples
+        if (editModifiers.Count > 0 && !string.IsNullOrWhiteSpace(editCommand))
+        {
+            var examples = string.Join("  ", editModifiers.Select(m => $"/{editCommand} {m.Name}"));
+            ImGui.TextColored(new Vector4(0.55f, 0.55f, 0.55f, 1f), examples);
+        }
+
+        ImGui.Spacing();
+
+        // Rounded tab styling — cool neutrals, no warm tints
+        ImGui.PushStyleVar(ImGuiStyleVar.TabRounding, 6f * scale);
+        ImGui.PushStyleColor(ImGuiCol.Tab, new Vector4(0.14f, 0.14f, 0.15f, 0.9f));
+        ImGui.PushStyleColor(ImGuiCol.TabHovered, new Vector4(0.22f, 0.22f, 0.24f, 0.9f));
+        ImGui.PushStyleColor(ImGuiCol.TabActive, new Vector4(0.18f, 0.18f, 0.20f, 0.95f));
+
+        // Use channel splitting to draw background behind content
+        var boxStartPos = ImGui.GetCursorScreenPos();
+        var boxPadding = 8f * scale;
+        drawList.ChannelsSplit(2);
+        drawList.ChannelsSetCurrent(1); // Content first
+
+        // Indent content for the box padding
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + boxPadding);
+        ImGui.PushItemWidth(-boxPadding);
+        ImGui.BeginGroup();
+
+        ImGui.Spacing();
+
+        // Tab bar with overflow handling and trailing + button
+        var hasAnyTabs = editModifiers.Count > 0 || draftModifier != null;
+        if (hasAnyTabs && ImGui.BeginTabBar("##modifierTabs", ImGuiTabBarFlags.FittingPolicyResizeDown | ImGuiTabBarFlags.NoCloseWithMiddleMouseButton))
+        {
+            int deleteIndex = -1;
+            int dragTargetIdx = -1;
+
+            for (int i = 0; i < editModifiers.Count; i++)
+            {
+                var modifier = editModifiers[i];
+                var tabLabel = $"{modifier.Name}###modTab_{i}";
+
+                var tabFlags = ImGuiTabItemFlags.None;
+                if (expandedModifierIndex == i)
+                {
+                    tabFlags |= ImGuiTabItemFlags.SetSelected;
+                    expandedModifierIndex = -1;
+                }
+
+                var isSelected = ImGui.BeginTabItem(tabLabel, tabFlags);
+
+                // Right-click context menu on the tab
+                if (ImGui.IsItemClicked(ImGuiMouseButton.Right))
+                    ImGui.OpenPopup($"##tabCtx_{i}");
+                if (ImGui.BeginPopup($"##tabCtx_{i}"))
+                {
+                    if (ImGui.MenuItem("Rename"))
+                    {
+                        renamingModifierIndex = i;
+                        renamingModifierName = modifier.Name;
+                    }
+                    if (ImGui.MenuItem("Delete"))
+                        deleteIndex = i;
+                    ImGui.EndPopup();
+                }
+
+                // Drag and drop for tab reordering
+                var tabMin = ImGui.GetItemRectMin();
+                var tabMax = ImGui.GetItemRectMax();
+                if (ImGui.BeginDragDropSource(ImGuiDragDropFlags.SourceAllowNullId))
+                {
+                    dragModifierSourceIndex = i;
+                    ImGui.SetDragDropPayload("MODIFIER_TAB", ReadOnlySpan<byte>.Empty, ImGuiCond.None);
+                    ImGui.Text(modifier.Name);
+                    ImGui.EndDragDropSource();
+                }
+                if (dragModifierSourceIndex >= 0 && dragModifierSourceIndex != i &&
+                    ImGui.IsMouseHoveringRect(tabMin, tabMax) && ImGui.IsMouseReleased(ImGuiMouseButton.Left))
+                {
+                    dragTargetIdx = i;
+                }
+
+                if (isSelected)
+                {
+                    // Inline rename field
+                    if (renamingModifierIndex == i)
+                    {
+                        ImGui.Text("Name:");
+                        ImGui.SameLine();
+                        ImGui.SetNextItemWidth(150 * scale);
+                        var renameEnter = ImGui.InputText($"##renameMod_{i}", ref renamingModifierName, 30,
+                            ImGuiInputTextFlags.EnterReturnsTrue);
+
+                        var renameValid = !string.IsNullOrWhiteSpace(renamingModifierName) &&
+                                          !editModifiers.Where((m, idx) => idx != i)
+                                              .Any(m => string.Equals(m.Name, renamingModifierName, StringComparison.OrdinalIgnoreCase));
+
+                        ImGui.SameLine();
+                        if (!renameValid) ImGui.BeginDisabled();
+                        if (ImGui.SmallButton("OK") || (renameEnter && renameValid))
+                        {
+                            modifier.Name = renamingModifierName.Trim();
+                            renamingModifierIndex = -1;
+                        }
+                        if (!renameValid) ImGui.EndDisabled();
+
+                        ImGui.SameLine();
+                        if (ImGui.SmallButton("Cancel"))
+                            renamingModifierIndex = -1;
+
+                        ImGui.Spacing();
+                    }
+
+                    DrawModifierOptions(modifier);
+                    ImGui.EndTabItem();
+                }
+            }
+
+            // Draft tab (new modifier being configured)
+            if (draftModifier != null)
+            {
+                var draftFlags = ImGuiTabItemFlags.None;
+                if (expandedModifierIndex == -2)
+                {
+                    draftFlags |= ImGuiTabItemFlags.SetSelected;
+                    expandedModifierIndex = -1;
+                }
+
+                var draftSelected = ImGui.BeginTabItem("New...###draftTab", draftFlags);
+
+                // Right-click to cancel draft
+                if (ImGui.IsItemClicked(ImGuiMouseButton.Right))
+                    ImGui.OpenPopup("##draftCtx");
+                if (ImGui.BeginPopup("##draftCtx"))
+                {
+                    if (ImGui.MenuItem("Cancel"))
+                    {
+                        draftModifier = null;
+                        draftModifierName = "";
+                    }
+                    ImGui.EndPopup();
+                }
+
+                if (draftSelected)
+                {
+                    if (draftModifier != null)
+                    {
+                        ImGui.Spacing();
+
+                        // Options first
+                        DrawModifierOptions(draftModifier);
+
+                        ImGui.Spacing();
+                        ImGui.Separator();
+                        ImGui.Spacing();
+
+                        // Name + confirm at the bottom
+                        ImGui.Text("Modifier name:");
+                        ImGui.SameLine();
+                        ImGui.SetNextItemWidth(150 * scale);
+                        var enterPressed = ImGui.InputText("##draftModName", ref draftModifierName, 30,
+                            ImGuiInputTextFlags.EnterReturnsTrue);
+
+                        var canAdd = !string.IsNullOrWhiteSpace(draftModifierName) &&
+                                     !editModifiers.Any(m => string.Equals(m.Name, draftModifierName, StringComparison.OrdinalIgnoreCase));
+
+                        ImGui.SameLine();
+                        if (!canAdd) ImGui.BeginDisabled();
+                        if (ImGui.Button("Confirm") || (enterPressed && canAdd))
+                        {
+                            draftModifier.Name = draftModifierName.Trim();
+                            editModifiers.Add(draftModifier);
+                            expandedModifierIndex = editModifiers.Count - 1;
+                            draftModifier = null;
+                            draftModifierName = "";
+                        }
+                        if (!canAdd) ImGui.EndDisabled();
+
+                        // Validation
+                        if (!string.IsNullOrWhiteSpace(draftModifierName) &&
+                                 editModifiers.Any(m => string.Equals(m.Name, draftModifierName, StringComparison.OrdinalIgnoreCase)))
+                            ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), "Name already used");
+                    }
+
+                    ImGui.EndTabItem();
+                }
+            }
+
+            // Trailing + button to add new modifier (always visible in tab bar)
+            if (draftModifier == null)
+            {
+                if (ImGui.TabItemButton("+", ImGuiTabItemFlags.Trailing))
+                {
+                    draftModifier = new PresetModifier();
+                    draftModifierName = "";
+                    expandedModifierIndex = -2;  // Signal to select draft tab
+                }
+                if (ImGui.IsItemHovered())
+                {
+                    ImGui.SetTooltip("Add modifier");
+                }
+            }
+
+            ImGui.EndTabBar();
+
+            if (deleteIndex >= 0)
+                editModifiers.RemoveAt(deleteIndex);
+
+            // Handle tab reorder from drag and drop
+            if (dragTargetIdx >= 0 && dragModifierSourceIndex >= 0 && dragModifierSourceIndex != dragTargetIdx)
+            {
+                var item = editModifiers[dragModifierSourceIndex];
+                editModifiers.RemoveAt(dragModifierSourceIndex);
+                editModifiers.Insert(dragTargetIdx, item);
+                expandedModifierIndex = dragTargetIdx;
+                dragModifierSourceIndex = -1;
+            }
+
+            // Clear drag state on mouse release
+            if (dragModifierSourceIndex >= 0 && ImGui.IsMouseReleased(ImGuiMouseButton.Left))
+                dragModifierSourceIndex = -1;
+        }
+
+        // If no tabs yet, show centered empty state
+        if (!hasAnyTabs)
+        {
+            ImGui.Spacing();
+            ImGui.Spacing();
+
+            var regionWidth = ImGui.GetContentRegionAvail().X;
+
+            // Centered dimmed text
+            var noModText = "No modifiers yet";
+            var noModWidth = ImGui.CalcTextSize(noModText).X;
+            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (regionWidth - noModWidth) * 0.5f);
+            ImGui.TextDisabled(noModText);
+
+            ImGui.Spacing();
+
+            // Centered accent-styled button
+            var btnLabel = "+ Add Modifier";
+            var btnPadding = 24f * scale;
+            var btnWidth = ImGui.CalcTextSize(btnLabel).X + btnPadding * 2;
+            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (regionWidth - btnWidth) * 0.5f);
+
+            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(ModifierAccentColor.X * 0.15f, ModifierAccentColor.Y * 0.15f, ModifierAccentColor.Z * 0.15f, 0.8f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(ModifierAccentColor.X * 0.25f, ModifierAccentColor.Y * 0.25f, ModifierAccentColor.Z * 0.25f, 0.9f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(ModifierAccentColor.X * 0.3f, ModifierAccentColor.Y * 0.3f, ModifierAccentColor.Z * 0.3f, 0.9f));
+            if (ImGui.Button(btnLabel, new Vector2(btnWidth, 0)))
+            {
+                draftModifier = new PresetModifier();
+                draftModifierName = "";
+                expandedModifierIndex = -2;
+            }
+            ImGui.PopStyleColor(3);
+
+            ImGui.Spacing();
+        }
+
+        ImGui.Spacing();
+        ImGui.EndGroup();
+        ImGui.PopItemWidth();
+
+        // Measure content bounds and draw background box behind it
+        var boxEndPos = ImGui.GetCursorScreenPos();
+        var availWidth = ImGui.GetContentRegionAvail().X;
+        var boxHeight = boxEndPos.Y - boxStartPos.Y;
+
+        drawList.ChannelsSetCurrent(0); // Background
+        var boxColor = new Vector4(ModifierAccentColor.X * 0.06f, ModifierAccentColor.Y * 0.06f, ModifierAccentColor.Z * 0.06f, 0.5f);
+        var borderColor = new Vector4(ModifierAccentColor.X * 0.25f, ModifierAccentColor.Y * 0.25f, ModifierAccentColor.Z * 0.25f, 0.4f);
+        var rounding = 6f * scale;
+        drawList.AddRectFilled(
+            boxStartPos,
+            new Vector2(boxStartPos.X + availWidth, boxStartPos.Y + boxHeight),
+            ImGui.ColorConvertFloat4ToU32(boxColor),
+            rounding);
+        drawList.AddRect(
+            boxStartPos,
+            new Vector2(boxStartPos.X + availWidth, boxStartPos.Y + boxHeight),
+            ImGui.ColorConvertFloat4ToU32(borderColor),
+            rounding,
+            ImDrawFlags.None,
+            1f);
+        drawList.ChannelsMerge();
+
+        ImGui.PopStyleColor(3); // Tab colors
+        ImGui.PopStyleVar(1);   // TabRounding
+    }
+
+    private void DrawModifierOptions(PresetModifier modifier)
+    {
+        var modifierId = modifier.Name;
+        if (string.IsNullOrEmpty(modifierId)) modifierId = "draft";
+
+        // Emote override (only when mod has multiple emotes)
+        if (detectedEmoteCommands.Count > 1)
+        {
+            var hasEmoteOverride = modifier.EmoteCommandOverride != null;
+            var textColor = hasEmoteOverride
+                ? new Vector4(0.5f, 0.9f, 0.9f, 1f)
+                : new Vector4(0.5f, 0.5f, 0.5f, 1f);
+            ImGui.TextColored(textColor, "Emote");
+
+            var presetDefault = !string.IsNullOrEmpty(editEmoteCommand) ? editEmoteCommand : "(default)";
+            var previewLabel = modifier.EmoteCommandOverride ?? $"(use preset default: {presetDefault})";
+
+            ImGui.SetNextItemWidth(300 * UIStyles.Scale);
+            if (ImGui.BeginCombo($"##emoteOverride_{modifierId}", previewLabel))
+            {
+                if (ImGui.Selectable($"(use preset default: {presetDefault})", modifier.EmoteCommandOverride == null))
+                {
+                    modifier.EmoteCommandOverride = null;
+                    modifier.PoseIndexOverride = null;
+                }
+
+                for (int i = 0; i < detectedEmoteCommands.Count; i++)
+                {
+                    var cmd = detectedEmoteCommands[i];
+                    var isSelected = cmd == modifier.EmoteCommandOverride;
+                    if (ImGui.Selectable(cmd, isSelected))
+                    {
+                        modifier.EmoteCommandOverride = cmd;
+                        modifier.PoseIndexOverride = null;
+                    }
+                }
+                ImGui.EndCombo();
+            }
+
+            ImGui.Spacing();
+        }
+
+        // Pose index override — works with the effective command (override or base)
+        // Shows whenever the mod has pose indices for the relevant animation type
+        {
+            var effectiveCmd = modifier.EmoteCommandOverride ?? editEmoteCommand;
+            var effectiveAnimType = GetAnimationTypeForCommand(effectiveCmd);
+
+            // Also check the base preset's detected type for pure pose mods (no emote dropdown)
+            if (effectiveAnimType == EmoteDetectionService.AnimationType.Emote &&
+                detectedAnimationType != EmoteDetectionService.AnimationType.Emote &&
+                detectedAnimationType != EmoteDetectionService.AnimationType.None &&
+                detectedAnimationType != EmoteDetectionService.AnimationType.Movement)
+            {
+                effectiveAnimType = detectedAnimationType;
+            }
+
+            if (effectiveAnimType != EmoteDetectionService.AnimationType.Emote)
+            {
+                var typeKey = (int)effectiveAnimType;
+                var relevantIndices = (detectedPoseTypeIndices.Count > 0 && detectedPoseTypeIndices.TryGetValue(typeKey, out var typeIndices))
+                    ? typeIndices
+                    : detectedPoseIndices;
+
+                if (relevantIndices.Count > 1)
+                {
+                    var poseTypeName = effectiveAnimType switch
+                    {
+                        EmoteDetectionService.AnimationType.StandingIdle => "Idle",
+                        EmoteDetectionService.AnimationType.ChairSitting => "Sit",
+                        EmoteDetectionService.AnimationType.GroundSitting => "Ground Sit",
+                        EmoteDetectionService.AnimationType.LyingDozing => "Doze",
+                        _ => "Pose"
+                    };
+
+                    var hasPoseOverride = modifier.PoseIndexOverride != null;
+                    var poseTextColor = hasPoseOverride
+                        ? new Vector4(0.5f, 0.9f, 0.9f, 1f)
+                        : new Vector4(0.5f, 0.5f, 0.5f, 1f);
+                    ImGui.TextColored(poseTextColor, $"{poseTypeName} Pose");
+
+                    var baseDefault = $"Pose #{selectedPoseIndex}";
+                    var currentPoseIdx = modifier.PoseIndexOverride ?? -1;
+                    var previewPose = currentPoseIdx >= 0 ? $"Pose #{currentPoseIdx}" : $"(use preset default: {baseDefault})";
+
+                    ImGui.SetNextItemWidth(300 * UIStyles.Scale);
+                    if (ImGui.BeginCombo($"##modPose_{modifierId}", previewPose))
+                    {
+                        if (ImGui.Selectable($"(use preset default: {baseDefault})", modifier.PoseIndexOverride == null))
+                        {
+                            modifier.PoseIndexOverride = null;
+                        }
+
+                        for (int pi = 0; pi < relevantIndices.Count; pi++)
+                        {
+                            var idx = relevantIndices[pi];
+                            var isPoseSelected = idx == currentPoseIdx;
+                            if (ImGui.Selectable($"Pose #{idx}", isPoseSelected))
+                            {
+                                modifier.PoseIndexOverride = idx;
+                            }
+                        }
+                        ImGui.EndCombo();
+                    }
+
+                    ImGui.Spacing();
+                }
+            }
+        }
+
+        // Mod option overrides
+        if (availableModSettings == null) return;
+        foreach (var (groupName, (options, groupType)) in availableModSettings)
+        {
+            if (options.Length == 0) continue;
+
+            var hasOverride = modifier.OptionOverrides.ContainsKey(groupName);
+            var textColor = hasOverride
+                ? new Vector4(0.9f, 0.9f, 0.5f, 1f)
+                : new Vector4(0.5f, 0.5f, 0.5f, 1f);
+            ImGui.TextColored(textColor, groupName);
+
+            modifier.OptionOverrides.TryGetValue(groupName, out var currentOverride);
+
+            if (groupType == 0)
+            {
+                // Single-select combo
+                var selectedOption = currentOverride?.Count > 0 ? currentOverride[0] : null;
+
+                // Show what the preset default is for context
+                string presetDefault = "(default)";
+                if (editModOptions.TryGetValue(groupName, out var baseOpts) && baseOpts.Count > 0)
+                    presetDefault = baseOpts[0];
+
+                var previewLabel = selectedOption ?? $"(use preset default: {presetDefault})";
+
+                ImGui.SetNextItemWidth(300 * UIStyles.Scale);
+                if (ImGui.BeginCombo($"##{groupName}_mod", previewLabel))
+                {
+                    if (ImGui.Selectable($"(use preset default: {presetDefault})", selectedOption == null))
+                    {
+                        modifier.OptionOverrides.Remove(groupName);
+                    }
+
+                    for (int i = 0; i < options.Length; i++)
+                    {
+                        var isOptionSelected = options[i] == selectedOption;
+                        if (ImGui.Selectable(options[i], isOptionSelected))
+                        {
+                            modifier.OptionOverrides[groupName] = new List<string> { options[i] };
+                        }
+                    }
+                    ImGui.EndCombo();
+                }
+            }
+            else
+            {
+                // Multi-select: inherit toggle then checkboxes
+                var isInheriting = !hasOverride;
+                if (ImGui.Checkbox($"Use preset default##{groupName}_inh", ref isInheriting))
+                {
+                    if (isInheriting)
+                        modifier.OptionOverrides.Remove(groupName);
+                    else
+                        modifier.OptionOverrides[groupName] = new List<string>();
+                }
+
+                if (!isInheriting)
+                {
+                    var selectedSet = currentOverride != null
+                        ? new HashSet<string>(currentOverride, StringComparer.OrdinalIgnoreCase)
+                        : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                    bool changed = false;
+                    var contentMaxX = ImGui.GetWindowContentRegionMax().X;
+                    for (int i = 0; i < options.Length; i++)
+                    {
+                        // Try to place on same line, wrap if it would overflow
+                        var checkboxWidth = ImGui.CalcTextSize(options[i]).X + 30 * UIStyles.Scale;
+                        if (i > 0)
+                        {
+                            ImGui.SameLine();
+                            if (ImGui.GetCursorPosX() + checkboxWidth > contentMaxX)
+                                ImGui.NewLine();
+                        }
+                        var isChecked = selectedSet.Contains(options[i]);
+                        if (ImGui.Checkbox($"{options[i]}##{groupName}_mod_{i}", ref isChecked))
+                        {
+                            if (isChecked) selectedSet.Add(options[i]);
+                            else selectedSet.Remove(options[i]);
+                            changed = true;
+                        }
+                    }
+
+                    if (changed)
+                    {
+                        modifier.OptionOverrides[groupName] = selectedSet.ToList();
+                    }
+                }
+            }
+
+            ImGui.Spacing();
+        }
     }
 
     private void DrawButtons(Vector2 windowSize)
@@ -1095,6 +1656,11 @@ public class PresetEditorWindow : Window
         {
             CurrentPreset.ModOptions[group] = new List<string>(opts);
         }
+
+        // Save modifiers (deep copy)
+        CurrentPreset.Modifiers = new List<PresetModifier>();
+        foreach (var m in editModifiers)
+            CurrentPreset.Modifiers.Add(m.Clone());
     }
 
     private static EmoteDetectionService.AnimationType GetAnimationTypeForCommand(string? command)

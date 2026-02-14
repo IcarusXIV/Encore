@@ -142,6 +142,114 @@ public static class UIStyles
         ImGui.Spacing();
     }
 
+    /// <summary>
+    /// CS+ style section header: colored accent bar + uppercase title + fading horizontal line.
+    /// </summary>
+    public static void AccentSectionHeader(string text, Vector4 color)
+    {
+        var scale = Scale;
+        var drawList = ImGui.GetWindowDrawList();
+
+        ImGui.Spacing();
+        ImGui.Spacing();
+
+        var headerPos = ImGui.GetCursorScreenPos();
+        var availWidth = ImGui.GetContentRegionAvail().X;
+
+        // 4px accent bar
+        drawList.AddRectFilled(
+            headerPos,
+            new Vector2(headerPos.X + 4 * scale, headerPos.Y + 20 * scale),
+            ImGui.ColorConvertFloat4ToU32(color),
+            2f * scale);
+
+        // Title text
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + 12 * scale);
+        ImGui.PushStyleColor(ImGuiCol.Text, color);
+        ImGui.Text(text.ToUpperInvariant());
+        ImGui.PopStyleColor();
+
+        // Horizontal line extending from title to right edge
+        var titleWidth = ImGui.CalcTextSize(text.ToUpperInvariant()).X;
+        var lineStartX = headerPos.X + 12 * scale + titleWidth + 8 * scale;
+        var lineY = headerPos.Y + 10 * scale;
+        drawList.AddLine(
+            new Vector2(lineStartX, lineY),
+            new Vector2(headerPos.X + availWidth, lineY),
+            ImGui.ColorConvertFloat4ToU32(new Vector4(color.X * 0.3f, color.Y * 0.3f, color.Z * 0.3f, 1f)),
+            1f);
+
+        ImGui.Spacing();
+    }
+
+    /// <summary>
+    /// Collapsible version of AccentSectionHeader. Returns true if section is open.
+    /// Draws a clickable header with arrow indicator, accent bar, uppercase title, and fading line.
+    /// </summary>
+    public static bool CollapsibleAccentSectionHeader(string text, Vector4 color, ref bool isOpen)
+    {
+        var scale = Scale;
+        var drawList = ImGui.GetWindowDrawList();
+
+        ImGui.Spacing();
+        ImGui.Spacing();
+
+        var headerPos = ImGui.GetCursorScreenPos();
+        var availWidth = ImGui.GetContentRegionAvail().X;
+        var headerHeight = 20 * scale;
+
+        // 4px accent bar
+        drawList.AddRectFilled(
+            headerPos,
+            new Vector2(headerPos.X + 4 * scale, headerPos.Y + headerHeight),
+            ImGui.ColorConvertFloat4ToU32(color),
+            2f * scale);
+
+        // Arrow indicator
+        var arrowText = isOpen ? "v" : ">";
+        var arrowColor = new Vector4(color.X * 0.7f, color.Y * 0.7f, color.Z * 0.7f, 1f);
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + 10 * scale);
+        ImGui.PushStyleColor(ImGuiCol.Text, arrowColor);
+        ImGui.Text(arrowText);
+        ImGui.PopStyleColor();
+
+        // Title text on same line
+        ImGui.SameLine(0, 4 * scale);
+        ImGui.PushStyleColor(ImGuiCol.Text, color);
+        ImGui.Text(text.ToUpperInvariant());
+        ImGui.PopStyleColor();
+
+        // Horizontal line extending from title to right edge
+        var arrowWidth = ImGui.CalcTextSize(arrowText).X;
+        var titleWidth = ImGui.CalcTextSize(text.ToUpperInvariant()).X;
+        var lineStartX = headerPos.X + 10 * scale + arrowWidth + 4 * scale + titleWidth + 8 * scale;
+        var lineY = headerPos.Y + 10 * scale;
+        drawList.AddLine(
+            new Vector2(lineStartX, lineY),
+            new Vector2(headerPos.X + availWidth, lineY),
+            ImGui.ColorConvertFloat4ToU32(new Vector4(color.X * 0.3f, color.Y * 0.3f, color.Z * 0.3f, 1f)),
+            1f);
+
+        // Invisible button over entire header area for click detection
+        ImGui.SetCursorScreenPos(headerPos);
+        if (ImGui.InvisibleButton($"##collapse_{text}", new Vector2(availWidth, headerHeight)))
+        {
+            isOpen = !isOpen;
+        }
+        // Hover highlight
+        if (ImGui.IsItemHovered())
+        {
+            drawList.AddRectFilled(
+                headerPos,
+                new Vector2(headerPos.X + availWidth, headerPos.Y + headerHeight),
+                ImGui.ColorConvertFloat4ToU32(new Vector4(color.X * 0.1f, color.Y * 0.1f, color.Z * 0.1f, 0.3f)),
+                4f * scale);
+        }
+
+        ImGui.Spacing();
+        return isOpen;
+    }
+
     public static void HelpTooltip(string text)
     {
         ImGui.SameLine();

@@ -115,6 +115,7 @@ public class HelpWindow : Window
         DrawStep("5", "Select your mod", "Browse the list and click on the dance mod you want.");
         DrawStep("6", "Pick the emote", "If the mod replaces multiple emotes, choose which one to use.");
         DrawStep("7", "Configure mod settings (optional)", "If the mod has option groups, you can pick which settings to apply when the preset activates. These are restored when you switch away.");
+        DrawStep("8", "Add modifiers (optional)", "Create named variants that override specific options or switch emotes. e.g., /mydance slow. More on the next page!");
 
         ImGui.Spacing();
 
@@ -169,6 +170,40 @@ public class HelpWindow : Window
         DrawIconBullet(FontAwesomeIcon.ExclamationTriangle, "Sit & Doze Presets", warningColor);
         ImGui.PopStyleColor();
         ImGui.TextWrapped("By default, chair-sit and doze presets require nearby furniture. To sit/doze anywhere, enable 'Allow Sit/Doze Anywhere' in the settings (gear icon). This sends position data to the server and is not standard game behaviour.");
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        var modifierColor = new Vector4(0.95f, 0.6f, 0.2f, 1f);
+        ImGui.PushStyleColor(ImGuiCol.Text, modifierColor);
+        DrawIconBullet(FontAwesomeIcon.LayerGroup, "Modifiers - Multiple Variants, One Preset", modifierColor);
+        ImGui.PopStyleColor();
+        ImGui.TextWrapped("Instead of creating separate presets for each variation, add modifiers to a single preset. Each modifier can override the mod's options or switch to a different emote/pose.");
+
+        ImGui.Spacing();
+
+        ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "Example:");
+        ImGui.Indent(12 * UIStyles.Scale);
+        ImGui.TextWrapped("You have a jumping jacks mod with speed options. Create one preset '/jj' and add modifiers 'slow' and 'fast' that each select different speed settings.");
+        ImGui.Unindent(12 * UIStyles.Scale);
+
+        ImGui.Spacing();
+
+        ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "How to use:");
+        ImGui.Indent(12 * UIStyles.Scale);
+        ImGui.Bullet(); ImGui.SameLine();
+        ImGui.TextWrapped("Chat command: /jj slow  or  /jj fast");
+        ImGui.Bullet(); ImGui.SameLine();
+        ImGui.TextWrapped("Context menu: right-click the '...' button for 'Play: slow', 'Play: fast'");
+        ImGui.Unindent(12 * UIStyles.Scale);
+
+        ImGui.Spacing();
+
+        ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "Setup:");
+        ImGui.Indent(12 * UIStyles.Scale);
+        ImGui.TextWrapped("Edit a preset and expand the 'Modifiers' section at the bottom. Click '+' to add a modifier, configure which options to override, then save.");
+        ImGui.Unindent(12 * UIStyles.Scale);
 
         ImGui.Spacing();
         ImGui.Spacing();
@@ -291,7 +326,9 @@ public class HelpWindow : Window
         ImGui.SameLine();
         ImGui.Text(title);
         ImGui.Indent(24 * scale);
-        ImGui.TextColored(new Vector4(0.55f, 0.55f, 0.55f, 1f), description);
+        ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.55f, 0.55f, 0.55f, 1f));
+        ImGui.TextWrapped(description);
+        ImGui.PopStyleColor();
         ImGui.Unindent(24 * scale);
         ImGui.Spacing();
     }

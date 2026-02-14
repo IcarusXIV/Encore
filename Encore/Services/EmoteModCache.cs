@@ -12,7 +12,7 @@ namespace Encore.Services;
 // Cache data structure for emote mods - persisted to disk
 public class EmoteModCacheData
 {
-    public const int CurrentVersion = 9;
+    public const int CurrentVersion = 11;
 
     [JsonPropertyName("version")]
     public int Version { get; set; } = CurrentVersion;

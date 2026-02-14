@@ -24,6 +24,9 @@ public class Configuration : IPluginConfiguration
     // Mods we turned off (conflicted with preset)
     public HashSet<string> ModsWeDisabled { get; set; } = new();
 
+    // Mods with active temporary Penumbra settings ("collectionId|modDirectory" keys)
+    public HashSet<string> ModsWithTempSettings { get; set; } = new();
+
     // Mod directory names that should never be disabled by conflict detection
     public HashSet<string> PinnedModDirectories { get; set; } = new();
 
@@ -113,9 +116,12 @@ public class DancePreset
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public string? FolderId { get; set; }
 
+    // Named option-override variants (e.g., "slow", "fast")
+    public List<PresetModifier> Modifiers { get; set; } = new();
+
     public DancePreset Clone()
     {
-        return new DancePreset
+        var clone = new DancePreset
         {
             Id = Guid.NewGuid().ToString(),
             Name = Name + " (Copy)",
@@ -135,6 +141,33 @@ public class DancePreset
             IsVanilla = IsVanilla,
             CreatedAt = DateTime.UtcNow,
             FolderId = FolderId,
+            Modifiers = new List<PresetModifier>(),
         };
+        foreach (var m in Modifiers)
+            clone.Modifiers.Add(m.Clone());
+        return clone;
+    }
+}
+
+[Serializable]
+public class PresetModifier
+{
+    public string Name { get; set; } = "";
+    public string? EmoteCommandOverride { get; set; }
+    public int? PoseIndexOverride { get; set; }
+    public Dictionary<string, List<string>> OptionOverrides { get; set; } = new();
+
+    public PresetModifier Clone()
+    {
+        var clone = new PresetModifier
+        {
+            Name = Name,
+            EmoteCommandOverride = EmoteCommandOverride,
+            PoseIndexOverride = PoseIndexOverride,
+            OptionOverrides = new()
+        };
+        foreach (var (k, v) in OptionOverrides)
+            clone.OptionOverrides[k] = new List<string>(v);
+        return clone;
     }
 }

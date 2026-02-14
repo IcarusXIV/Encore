@@ -434,6 +434,7 @@ public class EmoteDetectionService
 
         // Ground Sit - /groundsit
         { "groundsit", "/groundsit" },
+        { "ground sit", "/groundsit" },
         { "jmn", "/groundsit" },
 
         // Lean - /lean
@@ -1106,7 +1107,7 @@ public class EmoteDetectionService
         { "loop_emot20", "/stepdance" },
         { "loop_emot21", "/harvestdance" },
         { "loop_emot22", "/golddance" },
-        { "loop_emot23", "/balldance" },
+        { "loop_emot23", "/lean" },
         { "loop_emot24", "/mandervilledance" },
         { "loop_emot25", "/bombdance" },
         { "loop_emot26", "/mogdance" },
@@ -1675,6 +1676,13 @@ public class EmoteDetectionService
                          detectedAnimationType == AnimationType.GroundSitting ||
                          detectedAnimationType == AnimationType.LyingDozing;
 
+        // Build a set of pose commands whose types were confirmed by file path analysis.
+        // If file paths detected specific pose types, Penumbra pose commands for OTHER types
+        // are likely false positives (e.g., Penumbra reports "Sit" for a groundsit-only mod).
+        var filePathConfirmedPoseTypes = poseTypeIndices.Count > 0
+            ? new HashSet<AnimationType>(poseTypeIndices.Keys)
+            : null; // null = no file path data, don't filter
+
         // Second pass: extract emote names
         foreach (var (itemName, _) in changedItems)
         {
@@ -1713,6 +1721,8 @@ public class EmoteDetectionService
             // Try direct match first
             if (EmoteToCommand.TryGetValue(cleanName, out var command))
             {
+                if (IsFalsePoseCommand(command, filePathConfirmedPoseTypes))
+                    continue;
                 if (!affectedEmotes.Contains(cleanName))
                     affectedEmotes.Add(cleanName);
                 if (!emoteCommands.Contains(command))
@@ -1724,6 +1734,8 @@ public class EmoteDetectionService
             var normalized = cleanName.Replace("-", "");
             if (normalized != cleanName && EmoteToCommand.TryGetValue(normalized, out command))
             {
+                if (IsFalsePoseCommand(command, filePathConfirmedPoseTypes))
+                    continue;
                 if (!affectedEmotes.Contains(normalized))
                     affectedEmotes.Add(normalized);
                 if (!emoteCommands.Contains(command))
@@ -1737,6 +1749,8 @@ public class EmoteDetectionService
             withoutFillers = System.Text.RegularExpressions.Regex.Replace(withoutFillers, @"\s+", " ");
             if (withoutFillers != cleanName && EmoteToCommand.TryGetValue(withoutFillers, out command))
             {
+                if (IsFalsePoseCommand(command, filePathConfirmedPoseTypes))
+                    continue;
                 if (!affectedEmotes.Contains(withoutFillers))
                     affectedEmotes.Add(withoutFillers);
                 if (!emoteCommands.Contains(command))
@@ -1764,6 +1778,9 @@ public class EmoteDetectionService
                     if (cleanName.Contains(emoteName.ToLowerInvariant()) ||
                         emoteName.ToLowerInvariant().Contains(cleanName))
                     {
+                        // Filter false pose commands in partial match too
+                        if (IsFalsePoseCommand(emoteCmd, filePathConfirmedPoseTypes))
+                            continue;
                         if (!affectedEmotes.Contains(emoteName))
                             affectedEmotes.Add(emoteName);
                         if (!emoteCommands.Contains(emoteCmd))
@@ -2023,7 +2040,8 @@ public class EmoteDetectionService
             //   /emote/beesknees/file.pap
             //   bt_common/emote/dance04_loop.pap
             //   bt_common/emote_sp/sp41_loop.pap
-            if (pathLower.Contains("emote/") || pathLower.Contains("emote_sp/") || pathLower.Contains("/emote"))
+            if ((pathLower.Contains("emote/") || pathLower.Contains("emote_sp/") || pathLower.Contains("/emote"))
+                && pathLower.EndsWith(".pap"))
             {
                 // Skip movement files
                 if (pathLower.Contains("move_"))
@@ -2236,6 +2254,32 @@ public class EmoteDetectionService
                 if (!emoteCommands.Contains("/doze")) emoteCommands.Add("/doze");
                 break;
         }
+    }
+
+    /// <summary>
+    /// Returns true if a command is a pose command (/sit, /groundsit, /doze, /cpose)
+    /// whose pose type was NOT confirmed by file path analysis.
+    /// Used to filter false positives from Penumbra's GetChangedItems.
+    /// Returns false (don't filter) if: not a pose command, or no file path data available.
+    /// </summary>
+    private static bool IsFalsePoseCommand(string command, HashSet<AnimationType>? confirmedTypes)
+    {
+        if (confirmedTypes == null) return false; // No file path data — don't filter
+
+        var poseType = command.ToLowerInvariant() switch
+        {
+            "/cpose" => AnimationType.StandingIdle,
+            "/sit" => AnimationType.ChairSitting,
+            "/groundsit" => AnimationType.GroundSitting,
+            "/doze" => AnimationType.LyingDozing,
+            _ => (AnimationType?)null
+        };
+
+        // Not a pose command — don't filter
+        if (poseType == null) return false;
+
+        // Filter if this pose type wasn't found in the actual mod files
+        return !confirmedTypes.Contains(poseType.Value);
     }
 
     /// <summary>

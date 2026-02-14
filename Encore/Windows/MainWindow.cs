@@ -894,6 +894,17 @@ public class MainWindow : Window, IDisposable
             // Context menu
             if (ImGui.BeginPopup($"presetMenu_{index}"))
             {
+                // Modifier play entries
+                if (preset.Modifiers.Count > 0)
+                {
+                    foreach (var modifier in preset.Modifiers)
+                    {
+                        if (ImGui.MenuItem($"Play: {modifier.Name}"))
+                            Plugin.Instance?.ExecutePreset(preset, modifier);
+                    }
+                    ImGui.Separator();
+                }
+
                 if (ImGui.MenuItem("Edit"))
                 {
                     editorWindow?.OpenEdit(preset);
