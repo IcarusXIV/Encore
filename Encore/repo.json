@@ -10,16 +10,16 @@
       "Penumbra"
     ],
     "InternalName": "Encore",
-    "AssemblyVersion": "1.0.0.3",
-    "TestingAssemblyVersion": "1.0.0.3",
+    "AssemblyVersion": "1.0.0.4",
+    "TestingAssemblyVersion": "1.0.0.4",
     "RepoUrl": "https://github.com/IcarusXIV/Encore",
     "ApplicableVersion": "any",
     "DalamudApiLevel": 14,
     "IsHide": "False",
     "IsTestingExclusive": "False",
-    "DownloadLinkInstall": "https://github.com/IcarusXIV/Encore/releases/download/1.0.0.3/Encore.zip",
-    "DownloadLinkTesting": "https://github.com/IcarusXIV/Encore/releases/download/1.0.0.3/Encore.zip",
-    "DownloadLinkUpdate": "https://github.com/IcarusXIV/Encore/releases/download/1.0.0.3/Encore.zip",
+    "DownloadLinkInstall": "https://github.com/IcarusXIV/Encore/releases/download/1.0.0.4/Encore.zip",
+    "DownloadLinkTesting": "https://github.com/IcarusXIV/Encore/releases/download/1.0.0.4/Encore.zip",
+    "DownloadLinkUpdate": "https://github.com/IcarusXIV/Encore/releases/download/1.0.0.4/Encore.zip",
     "IconUrl": "https://raw.githubusercontent.com/IcarusXIV/Encore/master/Encore/Assets/Icon.png"
   }
 ]
