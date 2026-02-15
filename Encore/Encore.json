@@ -2,7 +2,7 @@
     "Author": "Kid Icarus",
     "Name": "Encore",
     "InternalName": "Encore",
-    "AssemblyVersion": "1.0.0.3",
+    "AssemblyVersion": "1.0.0.4",
     "Description": "One-Click Dance & Emote Mod Management\n\nCreate presets for your favorite dance and emote mods, then activate them instantly with a single click or custom chat commands. Automatically handles Penumbra mod priorities, conflict resolution, and mod option switching so your animations always show correctly.\n\nKey Features: Custom chat commands, automatic priority management, smart emote detection, idle/sit/doze pose support, preset folders, icon picker, drag & drop organization, and align-to-target for group emotes. Perfect for anyone who uses multiple animation mods.\n",
     "ApplicableVersion": "any",
     "Tags": [

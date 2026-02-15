@@ -678,8 +678,28 @@ public sealed class Plugin : IDalamudPlugin
                                 if (isAlreadyActive && hasModifier &&
                                     string.Equals(emoteCmd, baseEmoteCmd, StringComparison.OrdinalIgnoreCase))
                                 {
-                                    // Same emote, just different options — redraw to reload mod files seamlessly
-                                    ExecuteRedraw();
+                                    // Same emote, just different options — check if still in emote mode
+                                    var isStillEmoting = false;
+                                    var lp = ObjectTable.LocalPlayer;
+                                    if (lp != null)
+                                    {
+                                        unsafe
+                                        {
+                                            var character = (Character*)lp.Address;
+                                            isStillEmoting = character->Mode != CharacterModes.Normal;
+                                        }
+                                    }
+
+                                    if (isStillEmoting)
+                                    {
+                                        // Still dancing — redraw to swap mod files without restarting animation
+                                        ExecuteRedraw();
+                                    }
+                                    else if (!string.IsNullOrEmpty(emoteCmd))
+                                    {
+                                        // No longer emoting — re-execute the dance
+                                        ExecuteEmote(emoteCmd);
+                                    }
                                 }
                                 else if (!string.IsNullOrEmpty(emoteCmd))
                                     ExecuteEmote(emoteCmd);
