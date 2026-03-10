@@ -45,8 +45,13 @@ public class Configuration : IPluginConfiguration
     public List<string> FolderOrder { get; set; } = new();
     // Opt-in: use game functions for sit/doze anywhere (sends position data to server)
     public bool AllowSitDozeAnywhere { get; set; } = false;
+    // Opt-in: bypass client-side emote unlock checks when Encore executes emotes
+    public bool AllowUnlockedEmotes { get; set; } = false;
     public List<string> PinnedFileBrowserPaths { get; set; } = new();
     public string? LastBrowserDirectory { get; set; }
+    public string LastSeenPatchNotesVersion { get; set; } = "";
+    public bool ShowPatchNotesOnStartup { get; set; } = true;
+    public bool IsMainWindowOpen { get; set; } = false;
 
     public void Save()
     {
@@ -113,6 +118,9 @@ public class DancePreset
     // Vanilla preset: only disables conflicts, doesn't enable any mod
     public bool IsVanilla { get; set; } = false;
 
+    // Emote unlock bypass: use carrier emote to play this mod's animation for locked emotes
+    public bool EmoteLocked { get; set; } = false;
+
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public string? FolderId { get; set; }
 
@@ -139,6 +147,7 @@ public class DancePreset
             AnimationType = AnimationType,
             PoseIndex = PoseIndex,
             IsVanilla = IsVanilla,
+            EmoteLocked = EmoteLocked,
             CreatedAt = DateTime.UtcNow,
             FolderId = FolderId,
             Modifiers = new List<PresetModifier>(),

@@ -7,6 +7,7 @@ using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
 using Dalamud.Interface.Windowing;
 using Dalamud.Interface.Textures.TextureWraps;
+using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using Encore.Styles;
 
 namespace Encore.Windows;
@@ -15,6 +16,7 @@ public class MainWindow : Window, IDisposable
 {
     private PresetEditorWindow? editorWindow;
     private HelpWindow? helpWindow;
+    private PatchNotesWindow? patchNotesWindow;
     private int selectedPresetIndex = -1;
 
     // Sorting options
@@ -73,6 +75,26 @@ public class MainWindow : Window, IDisposable
         Flags = ImGuiWindowFlags.None;
     }
 
+    public override void OnOpen()
+    {
+        base.OnOpen();
+        if (Plugin.Instance?.Configuration is { } config)
+        {
+            config.IsMainWindowOpen = true;
+            config.Save();
+        }
+    }
+
+    public override void OnClose()
+    {
+        base.OnClose();
+        if (Plugin.Instance?.Configuration is { } config)
+        {
+            config.IsMainWindowOpen = false;
+            config.Save();
+        }
+    }
+
     public override void PreDraw()
     {
         base.PreDraw();
@@ -109,6 +131,11 @@ public class MainWindow : Window, IDisposable
     public void SetHelpWindow(HelpWindow help)
     {
         helpWindow = help;
+    }
+
+    public void SetPatchNotesWindow(PatchNotesWindow patchNotes)
+    {
+        patchNotesWindow = patchNotes;
     }
 
     public override void Draw()
@@ -1023,15 +1050,22 @@ public class MainWindow : Window, IDisposable
                     };
                 }
 
+                // Append bypass indicator for EmoteLocked presets
+                if (preset.EmoteLocked)
+                    emoteText = emoteText + " [bypass]";
+
                 if (!string.IsNullOrEmpty(emoteText))
                 {
+                    var emoteColor = preset.EmoteLocked
+                        ? new Vector4(1f, 0.8f, 0.4f, 0.7f)  // Warm amber for locked
+                        : new Vector4(0.45f, 0.45f, 0.45f, 1f);
                     var emoteSize = ImGui.CalcTextSize(emoteText);
                     var windowPos = ImGui.GetWindowPos();
                     var windowSize = ImGui.GetWindowSize();
                     var textPos = new Vector2(
                         windowPos.X + windowSize.X - emoteSize.X - 10 * scale,
                         windowPos.Y + windowSize.Y - emoteSize.Y - 8 * scale);
-                    drawList.AddText(textPos, ImGui.ColorConvertFloat4ToU32(new Vector4(0.45f, 0.45f, 0.45f, 1f)), emoteText);
+                    drawList.AddText(textPos, ImGui.ColorConvertFloat4ToU32(emoteColor), emoteText);
                 }
             }
         }
@@ -1251,9 +1285,9 @@ public class MainWindow : Window, IDisposable
         ImGui.SameLine();
 
         // Align to target button (dynamic colour based on state)
-        var alignState = Plugin.Instance?.GetAlignState() ?? (false, "", 0f, false, true, false);
+        var alignState = Plugin.Instance?.GetAlignState() ?? (false, "", 0f, false, CharacterModes.Normal, false);
         var isWalking = alignState.isWalking;
-        var alignBlocked = alignState.hasTarget && !alignState.isStanding && !isWalking;
+        var alignBlocked = alignState.hasTarget && alignState.mode != CharacterModes.Normal && !isWalking;
 
         if (isWalking)
         {
@@ -1317,7 +1351,15 @@ public class MainWindow : Window, IDisposable
             }
             else if (alignBlocked)
             {
-                ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f), "Stand up first.");
+                var blockedMsg = alignState.mode switch
+                {
+                    CharacterModes.Mounted => "Dismount first.",
+                    CharacterModes.EmoteLoop => "Stop your emote first.",
+                    CharacterModes.InPositionLoop => "Stand up first.",
+                    CharacterModes.Performance => "Stop performing first.",
+                    _ => "Stop what you're doing first.",
+                };
+                ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f), blockedMsg);
                 ImGui.Text($"Target: {alignState.targetName}");
             }
             else if (alignState.inRange)
@@ -1368,8 +1410,9 @@ public class MainWindow : Window, IDisposable
             ImGui.EndTooltip();
         }
 
-        // Help button (right edge, with room for gear button)
-        var rightButtonsWidth = 30 * scale + ImGui.GetStyle().ItemSpacing.X + 30 * scale;
+        // Right-side buttons (help, what's new, gear)
+        var spacing = ImGui.GetStyle().ItemSpacing.X;
+        var rightButtonsWidth = 30 * scale + spacing + 30 * scale + spacing + 30 * scale;
         ImGui.SameLine();
         ImGui.SetCursorPosX(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - rightButtonsWidth);
         if (ImGui.Button("?", new Vector2(30 * scale, 30 * scale)))
@@ -1379,6 +1422,23 @@ public class MainWindow : Window, IDisposable
         if (ImGui.IsItemHovered())
         {
             ImGui.SetTooltip("Help & Guide");
+        }
+
+        ImGui.SameLine();
+
+        // What's New button
+        ImGui.PushFont(UiBuilder.IconFont);
+        var whatsNewClicked = ImGui.Button(FontAwesomeIcon.Gift.ToIconString(), new Vector2(30 * scale, 30 * scale));
+        ImGui.PopFont();
+
+        if (whatsNewClicked)
+        {
+            if (patchNotesWindow != null)
+                patchNotesWindow.IsOpen = true;
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("What's New");
         }
 
         ImGui.SameLine();
@@ -1526,6 +1586,49 @@ public class MainWindow : Window, IDisposable
                     ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f),
                         "When off, /sit and /doze require furniture.");
                 }
+
+                ImGui.Spacing();
+                ImGui.Separator();
+                ImGui.Spacing();
+
+                // Allow All Emotes toggle
+                var allowUnlocked = config.AllowUnlockedEmotes;
+                if (ImGui.Checkbox("Allow All Emotes", ref allowUnlocked))
+                {
+                    config.AllowUnlockedEmotes = allowUnlocked;
+                    config.Save();
+                }
+                ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f),
+                    "Use your modded animations regardless of");
+                ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f),
+                    "whether you have the base emote.");
+                if (allowUnlocked)
+                {
+                    ImGui.Spacing();
+                    ImGui.TextColored(new Vector4(0.5f, 0.8f, 0.5f, 1f),
+                        "Use preset checkbox or /vanilla <emote>.");
+                    ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f),
+                        "Like other mods, may not show to others on first play.");
+                }
+                else
+                {
+                    ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f),
+                        "Presets require having the base emote.");
+                }
+
+                ImGui.Spacing();
+                ImGui.Separator();
+                ImGui.Spacing();
+
+                // Show patch notes on update toggle
+                var showPatchNotes = config.ShowPatchNotesOnStartup;
+                if (ImGui.Checkbox("Show patch notes on update", ref showPatchNotes))
+                {
+                    config.ShowPatchNotesOnStartup = showPatchNotes;
+                    config.Save();
+                }
+                ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f),
+                    "Opens the What's New window after updates.");
 
             }
 

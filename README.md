@@ -11,23 +11,31 @@ https://raw.githubusercontent.com/IcarusXIV/Encore/master/Encore/repo.json
 
 Requires [Penumbra](https://github.com/xivdev/Penumbra).
 
-## What Does It Do?
+## What Can It Do?
 
 **Switch dances instantly** -- Pick a preset, click play (or type your command), and you're dancing. No more digging through Penumbra to swap priorities every time you want a different dance.
 
 **Custom chat commands** -- Give each preset its own command like `/hips` or `/mydance`. Type it in chat and go.
 
+**Preset modifiers** -- One preset, multiple variants. Add modifiers that override specific mod options or the emote command. Trigger them by adding a word after the chat command (`/jj slow`, `/jj fast`) or from the context menu.
+
+**Emote unlock bypass** -- Don't have the emote? No problem. With "Allow All Emotes" enabled in settings, your dance and emote mod presets work regardless of whether you have the base emote or not. Just check "I don't have this emote" when creating a preset. You can also use `/vanilla <emote>` for a quick one-off. This automatically creates a Penumbra mod called _EncoreEmoteSwap in your mod directory -- this is normal and required for the bypass to work. Like other mods through sync plugins, the animation may not be visible to others on the first play -- just give it a second to load, then do the emote again
+
+**Vanilla emotes** -- Want the original game animation? Type `/vanilla <emote>` to temporarily disable all mods for that emote and play it unmodded. Or create a vanilla preset for one-click access.
+
 **Pose presets** -- Not just emotes. Encore supports idle poses, sitting poses, ground sitting, and doze animations. It writes the pose index, triggers a redraw, and cycles `/cpose` automatically so you don't have to.
 
-**Sit & doze anywhere** -- Chair-sit and doze presets place your character into the sit or doze state without needing furniture. No chair required. (Opt-in via settings button)
+**Movement mods** -- Walking, sprinting, and jogging animation mods are detected and supported. Just enable and go -- no emote execution needed.
+
+**Sit & doze anywhere** -- Opt-in setting that lets chair-sit and doze presets place your character into the sit or doze state without needing furniture. Enable it in the settings popup (gear icon).
 
 **Conflict handling** -- When you activate a preset, Encore temporarily disables other mods that affect the same emote so yours always wins. Pin your important mods to protect them from being disabled.
 
-**Mod option switching** -- If your mod has option groups (music, ear wiggles, different animations, etc.), you can configure which options to apply per preset. They get restored when you switch away.
+**Mod option switching** -- If your mod has option groups (outfits, variants, etc.), you can configure which options to apply per preset. They get restored when you switch away.
 
-**Vanilla presets** -- Want to go back to the original game animation? Create a vanilla preset that just disables conflicting mods without enabling anything.
+**Emote looping** -- `/loop <emote>` continuously repeats any non-looping emote until you move or type `/loop` again.
 
-**Align to target** -- For duo or group emotes, use `/align` (or the button in the main window) to move to your partner's exact position. Stand next to them first -- it only works within a short distance.
+**Align to target** -- For duo or group emotes, use `/align` (or the button in the main window) to walk to your partner's exact position. Stand close first -- it only works within a short distance.
 
 ## Organising Your Presets
 
@@ -36,7 +44,7 @@ Requires [Penumbra](https://github.com/xivdev/Penumbra).
 - **Sort modes** -- Custom, Name, Command, Favourites, Newest, Oldest
 - **Search** -- Filter presets by name
 - **Favourites** -- Star your go-to presets for quick access
-- **Icons** -- Pick from hundreds of game icons to make each preset recognizable at a glance
+- **Icons** -- Pick from hundreds of game icons, or upload your own custom images
 
 ## Commands
 
@@ -44,17 +52,18 @@ Requires [Penumbra](https://github.com/xivdev/Penumbra).
 |---------|-------------|
 | `/encore` | Open the main window |
 | `/encorereset` | Restore all mods to their original state |
-| `/align` | Warp to your target's position (must be close) |
+| `/align` | Walk to your target's position (must be close) |
+| `/loop <emote>` | Loop a non-looping emote. `/loop` alone stops it |
+| `/vanilla <emote>` | Play an emote with all mods disabled |
 | `/yourcommand` | Activate a preset (you define these) |
+| `/yourcommand modifier` | Activate a preset modifier variant |
 
 ## Getting Started
 
 1. Open Encore with `/encore`
-2. Click **New Preset**
+2. Click **New Preset** and pick a dance mod from your Penumbra library
 3. Give it a name, a chat command, and an icon
-4. Pick a dance mod (populated from your Penumbra Library)
-5. Choose which base dance (if multiple options) & optionally set mod options
-6. Hit **Save** and you're done -- click play or type your command to activate it
+4. Hit **Save** and you're done -- click play or type your command to activate it
 
 Everything is restored when you switch to a different preset or use `/encorereset`.
 
@@ -66,6 +75,4 @@ Everything is restored when you switch to a different preset or use `/encorerese
 
 ## Credits
 
-- **Ottermandias** -- AutoVisor: Pose index writing and /cpose cycling
-- **SoyaX** -- DozeAnywhere: Sit/doze anywhere hooks and function signatures
-- Created by **Icarus**
+Created by **Icarus**

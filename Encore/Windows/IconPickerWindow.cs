@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Windowing;
 using Dalamud.Interface.Textures.TextureWraps;
+using Lumina.Excel.Sheets;
 using Encore.Styles;
 
 namespace Encore.Windows;
@@ -16,6 +17,7 @@ public class IconPickerWindow : Window
     public bool Confirmed { get; set; }
 
     private readonly Dictionary<string, List<(uint start, uint end)>> iconCategories;
+    private readonly Dictionary<uint, string> iconNames = new();
     private string selectedCategory = "Emotes";
     private List<uint> currentIcons = new();
     private double lastClickTime;
@@ -93,7 +95,60 @@ public class IconPickerWindow : Window
             }
         };
 
+        BuildIconNameLookup();
         LoadIconsForCategory(selectedCategory);
+    }
+
+    private void BuildIconNameLookup()
+    {
+        try
+        {
+            var emoteSheet = Plugin.DataManager.GetExcelSheet<Emote>();
+            if (emoteSheet != null)
+            {
+                foreach (var row in emoteSheet)
+                {
+                    if (row.Icon != 0)
+                    {
+                        var name = row.Name.ToString();
+                        if (!string.IsNullOrEmpty(name))
+                            iconNames.TryAdd(row.Icon, name);
+                    }
+                }
+            }
+
+            var mountSheet = Plugin.DataManager.GetExcelSheet<Mount>();
+            if (mountSheet != null)
+            {
+                foreach (var row in mountSheet)
+                {
+                    if (row.Icon != 0)
+                    {
+                        var name = row.Singular.ToString();
+                        if (!string.IsNullOrEmpty(name))
+                            iconNames.TryAdd(row.Icon, name);
+                    }
+                }
+            }
+
+            var companionSheet = Plugin.DataManager.GetExcelSheet<Companion>();
+            if (companionSheet != null)
+            {
+                foreach (var row in companionSheet)
+                {
+                    if (row.Icon != 0)
+                    {
+                        var name = row.Singular.ToString();
+                        if (!string.IsNullOrEmpty(name))
+                            iconNames.TryAdd(row.Icon, name);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Warning($"Failed to build icon name lookup: {ex.Message}");
+        }
     }
 
     public override void PreDraw()
@@ -133,9 +188,11 @@ public class IconPickerWindow : Window
 
         if (!string.IsNullOrWhiteSpace(searchFilter))
         {
-            var filterLower = searchFilter.ToLower();
+            var filterLower = searchFilter.ToLowerInvariant();
             currentIcons = currentIcons.Where(id =>
-                id.ToString().Contains(filterLower)).ToList();
+                id.ToString().Contains(filterLower) ||
+                (iconNames.TryGetValue(id, out var name) && name.ToLowerInvariant().Contains(filterLower))
+            ).ToList();
         }
     }
 
@@ -195,7 +252,7 @@ public class IconPickerWindow : Window
             ImGui.BeginGroup();
 
             // Search
-            ImGui.Text("Search by ID:");
+            ImGui.Text("Search:");
             ImGui.SetNextItemWidth(-1);
             if (ImGui.InputText("##search", ref searchFilter, 50))
             {
@@ -377,7 +434,9 @@ public class IconPickerWindow : Window
             if (isHovered)
             {
                 ImGui.BeginTooltip();
-                ImGui.Text($"Icon ID: {iconId}");
+                if (iconNames.TryGetValue(iconId, out var iconName))
+                    ImGui.Text(iconName);
+                ImGui.TextDisabled($"Icon ID: {iconId}");
                 ImGui.TextDisabled(isFavorite ? "Right-click to unfavorite" : "Right-click to favorite");
                 ImGui.EndTooltip();
             }

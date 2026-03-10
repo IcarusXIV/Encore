@@ -42,6 +42,9 @@ public class PresetEditorWindow : Window
     // Vanilla preset mode
     private bool isVanillaPreset = false;
 
+    // Emote unlock bypass for locked emotes
+    private bool editEmoteLocked = false;
+
     // Mod options editing
     private Dictionary<string, List<string>> editModOptions = new();
     private IReadOnlyDictionary<string, (string[] options, int groupType)>? availableModSettings;
@@ -75,8 +78,8 @@ public class PresetEditorWindow : Window
     // Validation error messages
     private string? nameError = null;
     private string? commandError = null;  // Hard block (plugin conflicts, duplicate presets)
-    private string? commandWarning = null;  // Soft warning (game command conflicts)
-    private bool gameCommandWarningAcknowledged = false;  // User acknowledged the warning
+    private string? commandWarning = null;  // Currently unused, kept for future soft warnings
+    private bool gameCommandWarningAcknowledged = false;  // Currently unused, kept for future soft warnings
 
     // Base sizes (before scaling)
     private const float BaseWidth = 500f;
@@ -252,6 +255,7 @@ public class PresetEditorWindow : Window
         commandWarning = null;
         gameCommandWarningAcknowledged = false;
         isVanillaPreset = false;
+        editEmoteLocked = false;
         editModOptions = new();
         availableModSettings = null;
         editModifiers = new();
@@ -287,6 +291,7 @@ public class PresetEditorWindow : Window
         commandWarning = null;
         gameCommandWarningAcknowledged = false;
         isVanillaPreset = preset.IsVanilla;
+        editEmoteLocked = preset.EmoteLocked;
 
         // Load mod options from preset (deep copy)
         editModOptions = new Dictionary<string, List<string>>();
@@ -925,6 +930,20 @@ public class PresetEditorWindow : Window
                             ImGui.TextColored(new Vector4(0.6f, 0.8f, 1f, 1f), $"{poseTypeName} pose #{relevantIndices[0]}");
                             selectedPoseIndex = relevantIndices[0];
                         }
+                    }
+                }
+
+                // Emote bypass checkbox — for emotes not on the character (not pose, not movement)
+                if (!isVanillaPreset)
+                {
+                    ImGui.Spacing();
+                    ImGui.Checkbox("I don't have this emote", ref editEmoteLocked);
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip("Your mod's animation will play regardless.\nRequires 'Allow All Emotes' in settings.");
+                    if (editEmoteLocked)
+                    {
+                        ImGui.SameLine();
+                        ImGui.TextColored(new Vector4(1f, 0.8f, 0.4f, 1f), "(bypass)");
                     }
                 }
             }
@@ -1649,6 +1668,7 @@ public class PresetEditorWindow : Window
         }
 
         CurrentPreset.IsVanilla = isVanillaPreset;
+        CurrentPreset.EmoteLocked = editEmoteLocked;
 
         // Save mod options (deep copy)
         CurrentPreset.ModOptions = new Dictionary<string, List<string>>();
@@ -1732,31 +1752,45 @@ public class PresetEditorWindow : Window
         {
             try
             {
-                var destName = $"{Guid.NewGuid()}.png";
-                var destPath = Path.Combine(Plugin.IconsDirectory, destName);
+                var destPath = Path.Combine(Plugin.IconsDirectory, $"{Guid.NewGuid()}.png");
 
-                // Resize to max 128x128 for crisp icon display (avoids crunchy downscaling)
-                using var image = Image.Load(sourcePath);
-                const int maxSize = 128;
-                if (image.Width > maxSize || image.Height > maxSize)
+                try
                 {
-                    image.Mutate(x => x.Resize(new ResizeOptions
-                    {
-                        Size = new SixLabors.ImageSharp.Size(maxSize, maxSize),
-                        Mode = ResizeMode.Max
-                    }));
+                    ResizeAndSaveIcon(sourcePath, destPath);
                 }
-                image.SaveAsPng(destPath);
+                catch
+                {
+                    // ImageSharp unavailable or image load failed — copy source file as-is
+                    File.Copy(sourcePath, destPath, true);
+                }
 
                 editCustomIconPath = destPath;
                 editIconId = null;
             }
             catch (Exception ex)
             {
-                Plugin.Log.Error($"Failed to copy icon: {ex.Message}");
+                Plugin.Log.Error($"Failed to import icon: {ex.Message}");
             }
         };
         browser.Open();
+    }
+
+    /// <summary>Resize image to max 128x128 via ImageSharp. Isolated in its own method so the
+    /// assembly dependency only triggers JIT resolution here — callers can catch and fall back.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void ResizeAndSaveIcon(string sourcePath, string destPath)
+    {
+        using var image = Image.Load(sourcePath);
+        const int maxSize = 128;
+        if (image.Width > maxSize || image.Height > maxSize)
+        {
+            image.Mutate(x => x.Resize(new ResizeOptions
+            {
+                Size = new SixLabors.ImageSharp.Size(maxSize, maxSize),
+                Mode = ResizeMode.Max
+            }));
+        }
+        image.SaveAsPng(destPath);
     }
 
     private void ValidateUniqueness()
@@ -1822,19 +1856,12 @@ public class PresetEditorWindow : Window
                 return;
             }
 
-            // 4. Check for known game commands (soft warning)
+            // 4. Check for known game commands (hard block — can't intercept native game commands)
             if (EmoteDetectionService.IsKnownGameCommand(cleanCommand))
             {
-                commandWarning = $"This will override the game's /{cleanCommand} command while active";
-                // Reset acknowledgment if command changed
-                if (commandWarning != null && !commandWarning.Contains(cleanCommand))
-                {
-                    gameCommandWarningAcknowledged = false;
-                }
-            }
-            else
-            {
+                commandError = $"/{cleanCommand} is a game command and can't be used as a preset command";
                 commandWarning = null;
+                return;
             }
         }
         else

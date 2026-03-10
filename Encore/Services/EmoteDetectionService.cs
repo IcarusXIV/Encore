@@ -46,16 +46,71 @@ public class EmoteDetectionService
     // FFXIV emote_sp special emote IDs -> emote names
     // These map sp## filenames (from bt_common/emote_sp/) to their EmoteToCommand keys
     // The emote_sp folder contains "special" emotes that use sp## naming instead of descriptive names
+    // Populated dynamically from Lumina data at startup via PopulateSpToEmote()
     private static readonly Dictionary<string, string> SpToEmote = new(StringComparer.OrdinalIgnoreCase)
     {
+        // Fallback hardcoded entries (overwritten by Lumina data if available)
         { "sp41", "showleft" },
         { "sp42", "showright" },
     };
 
+    /// <summary>
+    /// Populate SpToEmote from Lumina ActionTimeline data. Called by Plugin.cs after reading the Emote sheet.
+    /// Extracts sp## identifiers from timeline keys like "emote_sp/sp25" and maps them to emote command keys.
+    /// Returns the number of entries added.
+    /// </summary>
+    public static int PopulateSpToEmote(Dictionary<ushort, List<(int slot, string key, bool isLoop, byte loadType)>> emoteIdToTimelines,
+        Dictionary<string, ushort> commandToId)
+    {
+        // Build reverse: emoteId → command key (first command found)
+        var idToCommand = new Dictionary<ushort, string>();
+        foreach (var (cmd, id) in commandToId)
+        {
+            if (!idToCommand.ContainsKey(id))
+                idToCommand[id] = cmd;
+        }
+
+        int added = 0;
+        foreach (var (emoteId, entries) in emoteIdToTimelines)
+        {
+            if (!idToCommand.TryGetValue(emoteId, out var cmdKey)) continue;
+
+            foreach (var (slot, key, isLoop, loadType) in entries)
+            {
+                // Look for emote_sp/sp## pattern in timeline keys
+                var spIdx = key.IndexOf("emote_sp/", StringComparison.OrdinalIgnoreCase);
+                if (spIdx < 0) continue;
+
+                var afterSp = key.Substring(spIdx + 9); // length of "emote_sp/"
+                // Handle sub-paths (e.g., "emote_sp/add_sp20")
+                var lastSlash = afterSp.LastIndexOf('/');
+                if (lastSlash >= 0)
+                    afterSp = afterSp.Substring(lastSlash + 1);
+                // Remove animation suffixes (_loop, _start, _end, _2lp etc.)
+                var underIdx = afterSp.IndexOf('_');
+                if (underIdx > 0 && afterSp.StartsWith("sp", StringComparison.OrdinalIgnoreCase))
+                    afterSp = afterSp.Substring(0, underIdx);
+
+                if (afterSp.StartsWith("sp", StringComparison.OrdinalIgnoreCase) && afterSp.Length > 2)
+                {
+                    // Map the emote command to EmoteToCommand format (without leading /)
+                    var emoteName = cmdKey.TrimStart('/');
+                    if (!string.IsNullOrEmpty(emoteName) && !SpToEmote.ContainsKey(afterSp))
+                    {
+                        SpToEmote[afterSp] = emoteName;
+                        added++;
+                    }
+                }
+            }
+        }
+
+        return added;
+    }
+
     // FFXIV's actual emote commands - comprehensive mapping from file names to slash commands
     // Based on FFXIV game data: ActionTimeline sheet, emote file paths, and game data mining
     // Format: file name (without extension) -> slash command
-    private static readonly Dictionary<string, string> EmoteToCommand = new(StringComparer.OrdinalIgnoreCase)
+    internal static readonly Dictionary<string, string> EmoteToCommand = new(StringComparer.OrdinalIgnoreCase)
     {
         // ============================================
         // DANCE EMOTES (Primary focus for this plugin)
@@ -66,21 +121,24 @@ public class EmoteDetectionService
         // When we see dance_female_loop.pap, we let GetChangedItems tell us which emote it actually affects
         { "dance", "/dance" },
 
-        // Step Dance - /stepdance (dance02)
+        // Step Dance - /stepdance (dance02, /dance2)
+        { "dance2", "/stepdance" },
         { "dance02", "/stepdance" },
         { "stepdance", "/stepdance" },
         { "step dance", "/stepdance" },  // Penumbra returns with space
         { "step", "/stepdance" },
         { "sdance", "/stepdance" },
 
-        // Harvest Dance - /harvestdance (dance03)
+        // Harvest Dance - /harvestdance (dance03, /dance3)
+        { "dance3", "/harvestdance" },
         { "dance03", "/harvestdance" },
         { "harvestdance", "/harvestdance" },
         { "harvest dance", "/harvestdance" },  // Penumbra returns with space
         { "harvest", "/harvestdance" },
         { "hdance", "/harvestdance" },
 
-        // Gold Dance - /golddance (dance04)
+        // Gold Dance - /golddance (dance04, /dance4)
+        { "dance4", "/golddance" },
         { "dance04", "/golddance" },
         { "golddance", "/golddance" },
         { "gold dance", "/golddance" },  // Penumbra returns with space
@@ -89,10 +147,16 @@ public class EmoteDetectionService
 
         // Numbered dances (dance05-dance21) - FFXIV internal animation IDs
         // These map to specific emotes based on when they were added to the game
+        // Non-zero-padded variants (dance5-dance9) for FFXIV /danceN chat shortcuts
+        { "dance5", "/balldance" },
         { "dance05", "/balldance" },
+        { "dance6", "/mandervilledance" },
         { "dance06", "/mandervilledance" },
+        { "dance7", "/bombdance" },
         { "dance07", "/bombdance" },
+        { "dance8", "/mogdance" },
         { "dance08", "/mogdance" },
+        { "dance9", "/songbird" },
         { "dance09", "/songbird" },
         { "dance10", "/thavdance" },
         { "dance11", "/easterndance" },
@@ -646,6 +710,7 @@ public class EmoteDetectionService
 
         // Flower Shower - /flowershower
         { "flowershower", "/flowershower" },
+        { "flower shower", "/flowershower" },  // Penumbra returns "Emote: Flower Shower"
         { "petals", "/flowershower" },
 
         // Bouquet - /bouquet
@@ -914,7 +979,9 @@ public class EmoteDetectionService
 
         // Show Left/Right - /showleft /showright
         { "showleft", "/showleft" },
+        { "show left", "/showleft" },
         { "showright", "/showright" },
+        { "show right", "/showright" },
 
         // Runway Walk - /runwaywalk
         { "runwaywalk", "/runwaywalk" },

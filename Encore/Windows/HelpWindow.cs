@@ -110,12 +110,13 @@ public class HelpWindow : Window
 
         DrawStep("1", "Click 'New Preset'", "The button is at the bottom of the main window.");
         DrawStep("2", "Name your preset", "Something memorable like 'Victory Dance'.");
-        DrawStep("3", "Set a chat command", "A short command like 'vdance' - you'll use /vdance to trigger it.");
+        DrawStep("3", "Set a chat command", "A short command like 'vdance' - you'll use /vdance to trigger it. Must not be an existing game command (e.g., /dance, /beesknees).");
         DrawStep("4", "Choose an icon", "(Optional) Pick a game icon to represent this preset.");
         DrawStep("5", "Select your mod", "Browse the list and click on the dance mod you want.");
         DrawStep("6", "Pick the emote", "If the mod replaces multiple emotes, choose which one to use.");
-        DrawStep("7", "Configure mod settings (optional)", "If the mod has option groups, you can pick which settings to apply when the preset activates. These are restored when you switch away.");
-        DrawStep("8", "Add modifiers (optional)", "Create named variants that override specific options or switch emotes. e.g., /mydance slow. More on the next page!");
+        DrawStep("7", "Don't have the emote? (optional)", "Check 'I don't have this emote' and your mod's animation will play regardless. Requires 'Allow All Emotes' in settings.");
+        DrawStep("8", "Configure mod settings (optional)", "If the mod has option groups, you can pick which settings to apply when the preset activates. These are restored when you switch away.");
+        DrawStep("9", "Add modifiers (optional)", "Create named variants that override specific options or switch emotes. e.g., /mydance slow. More on the next page!");
 
         ImGui.Spacing();
 
@@ -241,8 +242,13 @@ public class HelpWindow : Window
         ImGui.Separator();
         ImGui.Spacing();
 
-        DrawIconBullet(FontAwesomeIcon.Ban, "Vanilla preset - use the original game animation.");
-        ImGui.TextWrapped("Check 'Use vanilla animation' when creating a preset. Enter the emote command (e.g., /dance). This disables conflicting mods without enabling any, letting you use the vanilla animation.");
+        DrawIconBullet(FontAwesomeIcon.Ban, "Vanilla emotes - use the original game animation.");
+        ImGui.TextWrapped("Use /vanilla <emote> in chat (e.g., /vanilla beesknees) to quickly play any emote with mods disabled. For a permanent setup, check 'Use vanilla animation' when creating a preset. Both methods temporarily disable conflicting mods without enabling any, letting you use the vanilla animation.");
+
+        ImGui.Spacing();
+
+        DrawIconBullet(FontAwesomeIcon.Star, "Don't have the emote? No problem.");
+        ImGui.TextWrapped("With 'Allow All Emotes' enabled in settings (gear icon), your dance and emote mod presets work regardless of whether you have the base emote or not. Just check 'I don't have this emote' when creating a preset. You can also use /vanilla <emote> in chat for a quick one-off. This automatically creates a Penumbra mod called _EncoreEmoteSwap in your mod directory -- this is normal and required for the bypass to work. Like other mods through sync plugins, the animation may not be visible to others on the first play -- just give it a second to load, then do the emote again!");
 
         ImGui.Spacing();
         ImGui.Separator();
@@ -271,6 +277,9 @@ public class HelpWindow : Window
         ImGui.Text("/loop <emote>");
         ImGui.SameLine(140 * UIStyles.Scale);
         ImGui.Text("Loop an emote (move to stop)");
+        ImGui.Text("/vanilla <emote>");
+        ImGui.SameLine(140 * UIStyles.Scale);
+        ImGui.Text("Play vanilla emotes, even ones you don't have");
     }
 
     private void DrawNavigation()

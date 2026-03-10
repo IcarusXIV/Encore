@@ -121,6 +121,17 @@ public sealed unsafe class PoseService : IDisposable
         log.Debug("Executed sit-anywhere (emote 96)");
     }
 
+    /// <summary>
+    /// Execute an emote by its row ID directly via the game's internal useEmote function.
+    /// Bypasses all chat command validation including unlock checks.
+    /// </summary>
+    public void ExecuteEmoteById(ushort emoteId)
+    {
+        var agent = AgentModule.Instance()->GetAgentByInternalId(AgentId.Emote);
+        useEmote((nint)agent, emoteId, nint.Zero, 0, 0);
+        log.Debug($"Executed emote by ID: {emoteId}");
+    }
+
     // Execute doze anywhere by suppressing snap, then calling useEmote(88).
     public void ExecuteDozeAnywhere()
     {

@@ -350,6 +350,128 @@ public class PenumbraService : IDisposable
         }
     }
 
+    public bool AddMod(string modDirectory)
+    {
+        if (!IsAvailable)
+            return false;
+
+        try
+        {
+            var ipc = pluginInterface.GetIpcSubscriber<string, int>("Penumbra.AddMod.V5");
+            var result = ipc.InvokeFunc(modDirectory);
+
+            if (result == 0 || result == 1) // Success or NothingChanged
+            {
+                log.Debug($"Added mod: {modDirectory}");
+                return true;
+            }
+
+            log.Warning($"Failed to add mod {modDirectory}: code {result}");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            log.Error($"Failed to add mod {modDirectory}: {ex.Message}");
+            return false;
+        }
+    }
+
+    public bool ReloadMod(string modDirectory, string modName = "")
+    {
+        if (!IsAvailable)
+            return false;
+
+        try
+        {
+            var ipc = pluginInterface.GetIpcSubscriber<string, string, int>("Penumbra.ReloadMod.V5");
+            var result = ipc.InvokeFunc(modDirectory, modName);
+
+            if (result == 0 || result == 1)
+            {
+                log.Debug($"Reloaded mod: {modDirectory}");
+                return true;
+            }
+
+            log.Warning($"Failed to reload mod {modDirectory}: code {result}");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            log.Error($"Failed to reload mod {modDirectory}: {ex.Message}");
+            return false;
+        }
+    }
+
+    public bool AddTemporaryMod(string tag, Guid collectionId, Dictionary<string, string> paths, int priority)
+    {
+        if (!IsAvailable)
+            return false;
+
+        try
+        {
+            var ipc = pluginInterface.GetIpcSubscriber<string, Guid, Dictionary<string, string>, string, int, int>(
+                "Penumbra.AddTemporaryMod.V5");
+            var result = ipc.InvokeFunc(tag, collectionId, paths, "", priority);
+
+            if (result == 0) // Success
+            {
+                log.Debug($"Added temporary mod '{tag}' with {paths.Count} paths, priority={priority}");
+                return true;
+            }
+
+            log.Warning($"Failed to add temporary mod '{tag}': code {result}");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            log.Error($"Failed to add temporary mod '{tag}': {ex.Message}");
+            return false;
+        }
+    }
+
+    public bool RemoveTemporaryMod(string tag, Guid collectionId, int priority)
+    {
+        if (!IsAvailable)
+            return false;
+
+        try
+        {
+            var ipc = pluginInterface.GetIpcSubscriber<string, Guid, int, int>(
+                "Penumbra.RemoveTemporaryMod.V5");
+            var result = ipc.InvokeFunc(tag, collectionId, priority);
+
+            if (result == 0 || result == 1) // Success or NothingChanged
+            {
+                log.Debug($"Removed temporary mod '{tag}'");
+                return true;
+            }
+
+            log.Warning($"Failed to remove temporary mod '{tag}': code {result}");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            log.Error($"Failed to remove temporary mod '{tag}': {ex.Message}");
+            return false;
+        }
+    }
+
+    public string? ResolvePlayerPath(string gamePath)
+    {
+        if (!IsAvailable) return null;
+
+        try
+        {
+            var ipc = pluginInterface.GetIpcSubscriber<string, string>("Penumbra.ResolvePlayerPath");
+            return ipc.InvokeFunc(gamePath);
+        }
+        catch (Exception ex)
+        {
+            log.Error($"Failed to resolve player path '{gamePath}': {ex.Message}");
+            return null;
+        }
+    }
+
     public void Dispose()
     {
         // IPC subscribers don't need explicit disposal

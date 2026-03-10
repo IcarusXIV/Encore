@@ -10,7 +10,6 @@ namespace Encore.Services;
 public sealed unsafe class MovementService : IDisposable
 {
     private readonly IObjectTable objectTable;
-    private readonly IGameConfig gameConfig;
     private readonly IPluginLog log;
 
     // RMIWalk hook — overrides movement input to walk the character to a destination
@@ -28,9 +27,11 @@ public sealed unsafe class MovementService : IDisposable
     private Action? onArrived;
     private Action? onCancelled;
     private long walkStartTick;
-    private bool legacyMode;
 
-    private const float ArrivalPrecision = 0.01f;
+    // Snap callback — called when close enough to snap directly (avoids overshoot jitter)
+    private Action<Vector3>? onSnap;
+
+    private const float SnapDistance = 0.05f;
     private const long TimeoutMs = 2000;
 
     /// <summary>Whether a walk-to-destination is currently in progress.</summary>
@@ -42,7 +43,6 @@ public sealed unsafe class MovementService : IDisposable
     public MovementService(IGameInteropProvider gameInteropProvider, IObjectTable objectTable, IGameConfig gameConfig, IPluginLog log)
     {
         this.objectTable = objectTable;
-        this.gameConfig = gameConfig;
         this.log = log;
 
         try
@@ -67,18 +67,20 @@ public sealed unsafe class MovementService : IDisposable
     /// Start walking the local player toward the given destination.
     /// Cancels automatically if the user provides movement input or after 2 seconds.
     /// </summary>
-    public void WalkTo(Vector3 dest, Action? arrived = null, Action? cancelled = null)
+    /// <param name="dest">World-space destination position.</param>
+    /// <param name="arrived">Called when the character arrives (after snap).</param>
+    /// <param name="cancelled">Called if the user cancels by providing movement input.</param>
+    /// <param name="snap">Called to SetPosition the character for the final sub-0.05 unit snap. If null, arrival fires at snap distance without repositioning.</param>
+    public void WalkTo(Vector3 dest, Action? arrived = null, Action? cancelled = null, Action<Vector3>? snap = null)
     {
         destination = dest;
         onArrived = arrived;
         onCancelled = cancelled;
+        onSnap = snap;
         walkStartTick = Environment.TickCount64;
 
-        // Cache movement mode at start (won't change during a < 2s walk)
-        legacyMode = gameConfig.UiControl.TryGetUInt("MoveMode", out var mode) && mode == 1;
-
         isWalking = true;
-        log.Debug($"WalkTo: destination=({dest.X:F2}, {dest.Y:F2}, {dest.Z:F2}), legacy={legacyMode}");
+        log.Debug($"WalkTo: destination=({dest.X:F2}, {dest.Y:F2}, {dest.Z:F2})");
     }
 
     /// <summary>Cancel an in-progress walk. Safe to call even if not walking.</summary>
@@ -89,6 +91,7 @@ public sealed unsafe class MovementService : IDisposable
         var cb = onCancelled;
         onCancelled = null;
         onArrived = null;
+        onSnap = null;
         cb?.Invoke();
         log.Debug("Walk cancelled");
     }
@@ -96,10 +99,14 @@ public sealed unsafe class MovementService : IDisposable
     private void Arrive()
     {
         isWalking = false;
-        var cb = onArrived;
+        // Snap to exact position first, then fire arrived callback
+        var snapCb = onSnap;
+        var arrivedCb = onArrived;
+        onSnap = null;
         onArrived = null;
         onCancelled = null;
-        cb?.Invoke();
+        snapCb?.Invoke(destination);
+        arrivedCb?.Invoke();
         log.Debug("Walk arrived at destination");
     }
 
@@ -141,8 +148,8 @@ public sealed unsafe class MovementService : IDisposable
         var diff = destination - playerPos;
         var horizDist = MathF.Sqrt(diff.X * diff.X + diff.Z * diff.Z);
 
-        // Check if arrived
-        if (horizDist <= ArrivalPrecision)
+        // Close enough — snap to exact position instead of risking overshoot
+        if (horizDist <= SnapDistance)
         {
             Arrive();
             return;
@@ -151,29 +158,38 @@ public sealed unsafe class MovementService : IDisposable
         // World-space direction to destination
         var dirH = MathF.Atan2(diff.X, diff.Z);
 
-        // Reference direction depends on movement mode
+        // Movement input is always relative to camera direction in both standard and legacy mode.
+        // The game interprets sumForward/sumLeft relative to camera, then handles character
+        // rotation differently per mode — but the input frame is always camera-relative.
+        var camera = CameraManager.Instance()->GetActiveCamera();
         float refDir;
-        if (legacyMode)
+        if (camera != null)
         {
-            var camera = CameraManager.Instance()->GetActiveCamera();
-            if (camera != null)
-            {
-                // DirH at offset 0x140 in the camera struct
-                refDir = *(float*)((byte*)camera + 0x140) + MathF.PI;
-            }
-            else
-            {
-                refDir = player.Rotation;
-            }
+            refDir = *(float*)((byte*)camera + 0x140) + MathF.PI;
         }
         else
         {
+            // Shouldn't happen, but fall back to player rotation
             refDir = player.Rotation;
         }
 
         // Decompose relative direction into left/forward components
         var relAngle = dirH - refDir;
-        *sumLeft = MathF.Sin(relAngle);
-        *sumForward = MathF.Cos(relAngle);
+        var forward = MathF.Cos(relAngle);
+        var left = MathF.Sin(relAngle);
+
+        // Scale down speed when close to destination to reduce overshoot
+        const float slowdownRadius = 0.3f;
+        if (horizDist < slowdownRadius)
+        {
+            var scale = horizDist / slowdownRadius;
+            // Clamp minimum so the character doesn't stop moving entirely
+            scale = MathF.Max(scale, 0.15f);
+            forward *= scale;
+            left *= scale;
+        }
+
+        *sumForward = forward;
+        *sumLeft = left;
     }
 }
