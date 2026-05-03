@@ -20,17 +20,16 @@ public sealed unsafe class PoseService : IDisposable
     private readonly IFramework framework;
     private readonly IPluginLog log;
 
-    // useEmote function pointer
     [Signature("E8 ?? ?? ?? ?? 40 84 ED 74 ?? 48 8B 4B ?? 48 8B 01 FF 90")]
     private readonly delegate* unmanaged<nint, ushort, nint, byte, byte, void> useEmote = null!;
 
-    // Hook to suppress snap-to-furniture on sit/doze
     private delegate byte ShouldSnapDelegate(Character* a1, SnapPosition* a2);
 
+    // suppress snap-to-furniture on sit/doze
     [Signature("E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 4C 8D 74 24", DetourName = nameof(ShouldSnapDetour))]
     private Hook<ShouldSnapDelegate>? ShouldSnapHook { get; init; } = null;
 
-    // Hook to restore position on unsit/undoze
+    // restore position on unsit/undoze
     [Signature("48 83 EC 38 F3 0F 10 05 ?? ?? ?? ?? 45 33 C9", DetourName = nameof(ShouldSnapUnsitDetour))]
     private Hook<ShouldSnapDelegate>? ShouldSnapUnsitHook { get; init; } = null;
 
@@ -43,7 +42,6 @@ public sealed unsafe class PoseService : IDisposable
         [FieldOffset(0x30)] public float RotationB;
     }
 
-    // State for snap suppression and position restore
     private bool suppressSnap;
     private Vector3? savedPosition;
     private float? savedRotation;
@@ -67,17 +65,12 @@ public sealed unsafe class PoseService : IDisposable
         ShouldSnapUnsitHook?.Dispose();
     }
 
-    // Write a pose index directly to PlayerState for the given pose type.
     public void SetPoseIndex(EmoteController.PoseType type, byte index)
     {
         PlayerState.Instance()->SelectedPoses[(int)type] = index;
         log.Debug($"Set pose index for {type} to {index}");
     }
 
-    /// <summary>
-    /// Read the current selected pose indices for all pose types from PlayerState.
-    /// Returns (idle, sit, groundSit, doze) or null if unavailable.
-    /// </summary>
     public (int idle, int sit, int groundSit, int doze)? GetCurrentPoseIndices()
     {
         try
@@ -97,10 +90,36 @@ public sealed unsafe class PoseService : IDisposable
         }
     }
 
-    /// <summary>
-    /// Execute chair-sit anywhere by saving position, then calling useEmote(96).
-    /// Position is restored on stand-up via the ShouldSnapUnsit hook.
-    /// </summary>
+    // Mode -> pose type mapping (matches AutoVisor/CS+). null when not in an idle pose state.
+    public EmoteController.PoseType? GetCurrentPoseType()
+    {
+        try
+        {
+            var localPlayer = objectTable.LocalPlayer;
+            if (localPlayer == null || localPlayer.Address == nint.Zero) return null;
+            var ch = (Character*)localPlayer.Address;
+            var mode = ch->Mode;
+            if (mode == CharacterModes.Normal)
+                return EmoteController.PoseType.Idle;
+            if (mode == CharacterModes.InPositionLoop)
+            {
+                return ch->ModeParam switch
+                {
+                    1 => EmoteController.PoseType.GroundSit,
+                    2 => EmoteController.PoseType.Sit,
+                    3 => EmoteController.PoseType.Doze,
+                    _ => EmoteController.PoseType.Idle,
+                };
+            }
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    // useEmote(96); ShouldSnapUnsit hook restores position on stand-up
     public void ExecuteSitAnywhere()
     {
         var player = (Character*)(objectTable.LocalPlayer?.Address ?? nint.Zero);
@@ -121,10 +140,7 @@ public sealed unsafe class PoseService : IDisposable
         log.Debug("Executed sit-anywhere (emote 96)");
     }
 
-    /// <summary>
-    /// Execute an emote by its row ID directly via the game's internal useEmote function.
-    /// Bypasses all chat command validation including unlock checks.
-    /// </summary>
+    // direct useEmote call, bypasses unlock checks
     public void ExecuteEmoteById(ushort emoteId)
     {
         var agent = AgentModule.Instance()->GetAgentByInternalId(AgentId.Emote);
@@ -132,7 +148,6 @@ public sealed unsafe class PoseService : IDisposable
         log.Debug($"Executed emote by ID: {emoteId}");
     }
 
-    // Execute doze anywhere by suppressing snap, then calling useEmote(88).
     public void ExecuteDozeAnywhere()
     {
         suppressSnap = true;
@@ -142,7 +157,6 @@ public sealed unsafe class PoseService : IDisposable
         log.Debug("Executed doze-anywhere (emote 88)");
     }
 
-    // Cycle /cpose until the character's visible pose matches the target index.
     public void CycleCPoseToIndex(byte targetIndex)
     {
         var player = (Character*)(objectTable.LocalPlayer?.Address ?? nint.Zero);
@@ -152,7 +166,6 @@ public sealed unsafe class PoseService : IDisposable
             return;
         }
 
-        // Check if already at the target pose
         if (player->EmoteController.CPoseState == targetIndex)
         {
             log.Debug($"Already at cpose {targetIndex}, no cycling needed");
@@ -161,8 +174,7 @@ public sealed unsafe class PoseService : IDisposable
 
         log.Debug($"Cycling /cpose from {player->EmoteController.CPoseState} to {targetIndex}");
 
-        // Run cycling in background to avoid blocking the framework thread
-        // Use Task.Delay().Wait() instead of await to avoid CS4004 (unsafe context)
+        // Task.Delay().Wait() (await would error CS4004 in unsafe context)
         Task.Run(() =>
         {
             for (var i = 0; i < 8; i++)
@@ -170,7 +182,6 @@ public sealed unsafe class PoseService : IDisposable
                 framework.RunOnFrameworkThread(() => ExecuteChatCommand("/cpose"));
                 Task.Delay(80).Wait();
 
-                // Check if we reached the target
                 var reached = false;
                 framework.RunOnFrameworkThread(() =>
                 {
@@ -200,13 +211,11 @@ public sealed unsafe class PoseService : IDisposable
         }
     }
 
-    // Hook detour: suppress snap-to-furniture when we're doing sit/doze anywhere
     private byte ShouldSnapDetour(Character* a1, SnapPosition* a2)
     {
         return (byte)(suppressSnap ? 0 : ShouldSnapHook!.Original(a1, a2));
     }
 
-    // Hook detour: restore saved position when standing up from sit-anywhere
     private byte ShouldSnapUnsitDetour(Character* player, SnapPosition* snapPosition)
     {
         var orig = ShouldSnapUnsitHook!.Original(player, snapPosition);

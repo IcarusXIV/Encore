@@ -23,46 +23,32 @@ internal class ModGroup
     public List<ModOption>? Options { get; set; }
 }
 
-/// <summary>
-/// Service for detecting emote-related mods and their properties.
-/// Uses the same categorisation logic and caching pattern as Character Select+.
-/// </summary>
+// Detects emote-related mods. Categorisation and caching pattern mirror CS+.
 public class EmoteDetectionService
 {
     private readonly PenumbraService penumbraService;
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly IPluginLog log;
 
-    // Cache for emote mod detection
     private readonly EmoteModCache cache;
     private bool isInitializing;
-    private int scanGeneration;  // Incremented each time we start a new scan
+    private int scanGeneration;
 
     public bool IsInitialized => cache.IsInitialized;
     public bool IsInitializing => isInitializing;
 
     public int GetCachedModCount() => cache.GetCachedModCount();
 
-    // FFXIV emote_sp special emote IDs -> emote names
-    // These map sp## filenames (from bt_common/emote_sp/) to their EmoteToCommand keys
-    // The emote_sp folder contains "special" emotes that use sp## naming instead of descriptive names
-    // Populated dynamically from Lumina data at startup via PopulateSpToEmote()
+    // sp## (bt_common/emote_sp/) -> EmoteToCommand keys. Populated from Lumina at startup.
     private static readonly Dictionary<string, string> SpToEmote = new(StringComparer.OrdinalIgnoreCase)
     {
-        // Fallback hardcoded entries (overwritten by Lumina data if available)
         { "sp41", "showleft" },
         { "sp42", "showright" },
     };
 
-    /// <summary>
-    /// Populate SpToEmote from Lumina ActionTimeline data. Called by Plugin.cs after reading the Emote sheet.
-    /// Extracts sp## identifiers from timeline keys like "emote_sp/sp25" and maps them to emote command keys.
-    /// Returns the number of entries added.
-    /// </summary>
     public static int PopulateSpToEmote(Dictionary<ushort, List<(int slot, string key, bool isLoop, byte loadType)>> emoteIdToTimelines,
         Dictionary<string, ushort> commandToId)
     {
-        // Build reverse: emoteId → command key (first command found)
         var idToCommand = new Dictionary<ushort, string>();
         foreach (var (cmd, id) in commandToId)
         {
@@ -77,16 +63,15 @@ public class EmoteDetectionService
 
             foreach (var (slot, key, isLoop, loadType) in entries)
             {
-                // Look for emote_sp/sp## pattern in timeline keys
                 var spIdx = key.IndexOf("emote_sp/", StringComparison.OrdinalIgnoreCase);
                 if (spIdx < 0) continue;
 
-                var afterSp = key.Substring(spIdx + 9); // length of "emote_sp/"
-                // Handle sub-paths (e.g., "emote_sp/add_sp20")
+                var afterSp = key.Substring(spIdx + 9);
+                // strip sub-path (e.g., "emote_sp/add_sp20")
                 var lastSlash = afterSp.LastIndexOf('/');
                 if (lastSlash >= 0)
                     afterSp = afterSp.Substring(lastSlash + 1);
-                // Remove animation suffixes (_loop, _start, _end, _2lp etc.)
+                // strip animation suffixes (_loop, _start, _end, _2lp)
                 var underIdx = afterSp.IndexOf('_');
                 if (underIdx > 0 && afterSp.StartsWith("sp", StringComparison.OrdinalIgnoreCase))
                     afterSp = afterSp.Substring(0, underIdx);
@@ -112,13 +97,8 @@ public class EmoteDetectionService
     // Format: file name (without extension) -> slash command
     internal static readonly Dictionary<string, string> EmoteToCommand = new(StringComparer.OrdinalIgnoreCase)
     {
-        // ============================================
-        // DANCE EMOTES (Primary focus for this plugin)
-        // ============================================
-        // Base dance - /dance
-        // NOTE: We only map "dance" directly, NOT race/gender variants like dance_female, dance_male
-        // Those variants are ambiguous - they could be used by ANY dance emote (base, harvest, step, etc.)
-        // When we see dance_female_loop.pap, we let GetChangedItems tell us which emote it actually affects
+        // DANCE EMOTES
+        // race/gender variants (dance_female etc.) intentionally NOT mapped: ambiguous, GetChangedItems disambiguates
         { "dance", "/dance" },
 
         // Step Dance - /stepdance (dance02, /dance2)
@@ -273,10 +253,7 @@ public class EmoteDetectionService
         // Lophop - /lophop
         { "lophop", "/lophop" },
 
-        // ============================================
         // EXPRESSION EMOTES
-        // ============================================
-        // Joy - /joy
         { "joy", "/joy" },
 
         // Cheer - /cheer
@@ -390,6 +367,7 @@ public class EmoteDetectionService
         // Air Quotes - /airquotes
         { "airquotes", "/airquotes" },
         { "airquote", "/airquotes" },
+        { "air quotes", "/airquotes" },
 
         // Amazed - /amazed
         { "amazed", "/amazed" },
@@ -459,6 +437,7 @@ public class EmoteDetectionService
 
         // Thumbs Up - /thumbsup
         { "thumbsup", "/thumbsup" },
+        { "thumbs up", "/thumbsup" },
 
         // Comfort - /comfort
         { "comfort", "/comfort" },
@@ -472,6 +451,7 @@ public class EmoteDetectionService
 
         // Blow Kiss - /blowkiss
         { "blowkiss", "/blowkiss" },
+        { "blow kiss", "/blowkiss" },
 
         // Pet - /pet (stroke in files)
         { "pet", "/pet" },
@@ -487,10 +467,7 @@ public class EmoteDetectionService
         // Soothe - /soothe
         { "soothe", "/soothe" },
 
-        // ============================================
         // SITTING / RESTING EMOTES
-        // ============================================
-        // Doze - /doze
         { "doze", "/doze" },
 
         // Sit (chair) - /sit
@@ -508,10 +485,7 @@ public class EmoteDetectionService
         { "playdead", "/playdead" },
         { "pdead", "/playdead" },
 
-        // ============================================
         // ACTION EMOTES
-        // ============================================
-        // Box - /box
         { "box", "/box" },
 
         // Box Step - /boxstep
@@ -664,10 +638,7 @@ public class EmoteDetectionService
         // Annoy - /annoy (was missing)
         { "annoy", "/annoy" },
 
-        // ============================================
         // SPECIAL / EVENT EMOTES
-        // ============================================
-        // Change Step (Dancer) - /changestep
         { "changestep", "/changestep" },
 
         // Gentleman Pose - /gentlemanpose
@@ -755,8 +726,11 @@ public class EmoteDetectionService
 
         // Divine Arm/Disk/Tiara - Pandaemonium emotes
         { "divinearm", "/divinearm" },
+        { "divine arm", "/divinearm" },
         { "divinedisk", "/divinedisk" },
+        { "divine disk", "/divinedisk" },
         { "divinetiara", "/divinetiara" },
+        { "divine tiara", "/divinetiara" },
 
         // Ranger Poses (Super Sentai) - only Red, Black, Yellow exist
         // Primary commands are /rangerpose#r and /rangerpose#l
@@ -867,9 +841,11 @@ public class EmoteDetectionService
 
         // Big Grin - /biggrin
         { "biggrin", "/biggrin" },
+        { "big grin", "/biggrin" },
 
         // Fake Smile - /fakesmile
         { "fakesmile", "/fakesmile" },
+        { "fake smile", "/fakesmile" },
 
         // Sad - /sad
         { "sad", "/sad" },
@@ -888,6 +864,7 @@ public class EmoteDetectionService
 
         // Shut Eyes - /shuteyes
         { "shuteyes", "/shuteyes" },
+        { "shut eyes", "/shuteyes" },
 
         // Concentrate - /concentrate
         { "concentrate", "/concentrate" },
@@ -897,6 +874,7 @@ public class EmoteDetectionService
 
         // Pucker Up - /puckerup
         { "puckerup", "/puckerup" },
+        { "pucker up", "/puckerup" },
 
         // Consider - /consider
         { "consider", "/consider" },
@@ -918,54 +896,81 @@ public class EmoteDetectionService
 
         // Wring Hands - /wringhands
         { "wringhands", "/wringhands" },
+        { "wring hands", "/wringhands" },
 
         // Hand Over - /handover
         { "handover", "/handover" },
+        { "hand over", "/handover" },
 
         // Hand to Heart - /handtoheart
         { "handtoheart", "/handtoheart" },
+        { "hand to heart", "/handtoheart" },
 
         // At Ease - /atease
         { "atease", "/atease" },
+        { "at ease", "/atease" },
 
         // Attend - /attend
         { "attend", "/attend" },
 
         // Eat/Drink emotes
         { "eatapple", "/eatapple" },
+        { "eat apple", "/eatapple" },
         { "apple", "/eatapple" },
         { "eatchicken", "/eatchicken" },
+        { "eat chicken", "/eatchicken" },
         { "eatpizza", "/eatpizza" },
+        { "eat pizza", "/eatpizza" },
         { "pizza", "/eatpizza" },
         { "eatchocolate", "/eatchocolate" },
+        { "eat chocolate", "/eatchocolate" },
         { "choco", "/eatchocolate" },
         { "eategg", "/eategg" },
+        { "eat egg", "/eategg" },
         { "egg", "/eategg" },
         { "eatpumpkincookie", "/eatpumpkincookie" },
+        { "eat pumpkin cookie", "/eatpumpkincookie" },
+        { "pumpkin cookie", "/eatpumpkincookie" },
         { "cookie", "/eatpumpkincookie" },
         { "eatriceball", "/eatriceball" },
+        { "eat rice ball", "/eatriceball" },
+        { "rice ball", "/eatriceball" },
         { "riceball", "/eatriceball" },
         { "breakfast", "/breakfast" },
         { "bread", "/breakfast" },
         { "fryegg", "/fryegg" },
+        { "fry egg", "/fryegg" },
         { "drinkgreentea", "/drinkgreentea" },
+        { "drink green tea", "/drinkgreentea" },
+        { "green tea", "/drinkgreentea" },
         { "tea", "/drinkgreentea" },
         { "savortea", "/savortea" },
+        { "savor tea", "/savortea" },
         { "shakedrink", "/shakedrink" },
+        { "shake drink", "/shakedrink" },
 
         // City sip/gulp emotes
         { "gridaniansip", "/gridaniansip" },
+        { "gridanian sip", "/gridaniansip" },
         { "lominsansip", "/lominsansip" },
+        { "lominsan sip", "/lominsansip" },
         { "uldahnsip", "/uldahnsip" },
+        { "ul'dahn sip", "/uldahnsip" },
+        { "uldahn sip", "/uldahnsip" },
         { "gridaniangulp", "/gridaniangulp" },
+        { "gridanian gulp", "/gridaniangulp" },
         { "lominsangulp", "/lominsangulp" },
+        { "lominsan gulp", "/lominsangulp" },
         { "uldahngulp", "/uldahngulp" },
+        { "ul'dahn gulp", "/uldahngulp" },
+        { "uldahn gulp", "/uldahngulp" },
 
         // Haurchefant - /haurchefant
         { "haurchefant", "/haurchefant" },
 
         // Humble Triumph - /humbletriumph
         { "humbletriumph", "/humbletriumph" },
+        { "humble triumph", "/humbletriumph" },
         { "waitforit", "/humbletriumph" },
 
         // Frighten - /frighten
@@ -973,6 +978,7 @@ public class EmoteDetectionService
 
         // Blow Bubbles - /blowbubbles
         { "blowbubbles", "/blowbubbles" },
+        { "blow bubbles", "/blowbubbles" },
 
         // Draw (weapon) - /draw
         { "draw", "/draw" },
@@ -985,9 +991,11 @@ public class EmoteDetectionService
 
         // Runway Walk - /runwaywalk
         { "runwaywalk", "/runwaywalk" },
+        { "runway walk", "/runwaywalk" },
 
         // Stand Up - /standup
         { "standup", "/standup" },
+        { "stand up", "/standup" },
 
         // Greet - /greet
         { "greet", "/greet" },
@@ -1147,10 +1155,8 @@ public class EmoteDetectionService
         { "victory pose", "/victorypose" },
         { "hildibrand", "/hildibrand" },
 
-        // ============================================
         // INTERNAL FFXIV ANIMATION NAMES
         // These are the loop_emot## and act_emot## patterns used internally
-        // ============================================
         // Loop emote patterns (loop_emot## -> specific emotes)
         { "loop_emot01", "/joy" },
         { "loop_emot02", "/angry" },
@@ -1213,10 +1219,8 @@ public class EmoteDetectionService
         { "act_emot16", "/pet" },
         { "act_emot17", "/blowkiss" },
 
-        // ============================================
         // ADDITIONAL FOLDER NAME VARIANTS
         // FFXIV uses various folder naming conventions
-        // ============================================
         // Show emotes (folder names)
         { "show_left", "/showleft" },
         { "show_right", "/showright" },
@@ -1276,9 +1280,7 @@ public class EmoteDetectionService
     // Source: https://na.finalfantasyxiv.com/lodestone/playguide/db/text_command/
     private static readonly HashSet<string> OtherGameCommands = new(StringComparer.OrdinalIgnoreCase)
     {
-        // ============================================
         // CHAT COMMANDS
-        // ============================================
         "say", "yell", "shout", "tell", "reply", "cleartellhistory",
         "party", "alliance", "freecompany", "pvpteam",
         "cwlinkshell", "cwlinkshell1", "cwlinkshell2", "cwlinkshell3", "cwlinkshell4",
@@ -1287,9 +1289,7 @@ public class EmoteDetectionService
         "linkshell5", "linkshell6", "linkshell7", "linkshell8",
         "novice", "echo", "clearlog", "quickchat", "emote", "emotelog",
 
-        // ============================================
         // PARTY & SOCIAL COMMANDS
-        // ============================================
         "join", "decline", "invite", "kick", "leader", "leave", "disband",
         "partycmd", "partysort", "recordready", "readycheck", "ready", "hold",
         "countdown", "strategyboard", "friendlist", "blacklist",
@@ -1297,35 +1297,25 @@ public class EmoteDetectionService
         "lookingforparty", "lookingtomeld", "searchcomment",
         "ridepillion", "meldrequest",
 
-        // ============================================
         // TARGET COMMANDS
-        // ============================================
         "check", "target", "targetpc", "targetnpc", "targetenemy",
         "battletarget", "assist", "facetarget", "nexttarget", "previoustarget",
         "targetlasttarget", "targetlastenemy", "lockon", "focustarget",
         "enemysign", "targetself", "automove", "follow",
 
-        // ============================================
         // HOTBAR COMMANDS
-        // ============================================
         "action", "blueaction", "pvpaction", "generalaction",
         "companionaction", "petaction", "mount", "minion", "fashion", "facewear",
         "recast", "additionalaction", "bluespellbook", "addpvpaction",
         "hotbar", "pvphotbar", "crosshotbar", "pvpcrosshotbar",
 
-        // ============================================
         // BATTLE COMMANDS
-        // ============================================
         "battlemode", "statusoff", "waymark",
 
-        // ============================================
         // PET COMMANDS
-        // ============================================
         "petglamour", "egiglamour", "petsize", "bahamutsize",
 
-        // ============================================
         // SYSTEM & UI COMMANDS
-        // ============================================
         "instance", "title", "gearset", "itemsort", "itemsearch",
         "levelsync", "visor", "legacymark", "facecamera", "grouppose", "gpose",
         "idlingcamera", "alarm", "commandpanel",
@@ -1336,20 +1326,14 @@ public class EmoteDetectionService
         "novicenetworkinvitation", "novicenetworkleave", "novicenetwork",
         "duelswitch", "patchnote",
 
-        // ============================================
         // MAGIA BOARD (EUREKA/BOZJA)
-        // ============================================
         "magiaright", "magialeft", "magiaattack", "magiadefense", "magiaauto",
 
-        // ============================================
         // MACRO COMMANDS
-        // ============================================
         "wait", "macroicon", "micon", "macrolock", "mlock",
         "macroerror", "macrocancel", "macro", "macros",
 
-        // ============================================
         // CAMERA & DISPLAY SETTINGS
-        // ============================================
         "tiltcamera", "autolockon", "autofacetarget",
         "targetring", "targetline", "aggroline",
         "autotarget", "autotargetpriority",
@@ -1361,18 +1345,14 @@ public class EmoteDetectionService
         "chatlog", "actionerror", "recasterror",
         "camera", "fov", "screenshot",
 
-        // ============================================
         // AUDIO SETTINGS
-        // ============================================
         "graphicpresets", "mastervolume", "bgm",
         "soundeffects", "voice", "systemsounds", "ambientsounds",
         "soundeffectsself", "soundeffectsparty", "soundeffectsother",
         "systemsoundsspeaker", "performsounds", "mountbgm",
         "visualalerts", "colorfiltering",
 
-        // ============================================
         // MAIN MENU / WINDOWS
-        // ============================================
         "character", "armourychest", "inventory", "saddlebag",
         "companion", "mountguide", "minionguide", "facewearlist", "fashionguide",
         "pvpprofile", "goldsaucer", "gold", "achievements", "recommended",
@@ -1389,9 +1369,7 @@ public class EmoteDetectionService
         "contactlist", "mutelist", "termfilter",
         "supportdesk", "officialsite", "playguide",
 
-        // ============================================
         // CONFIGURATION
-        // ============================================
         "activehelp", "characterconfig", "systemconfig",
         "keybind", "logcolor", "marking"
     };
@@ -1578,33 +1556,20 @@ public class EmoteDetectionService
         log.Information($"[EmoteDetection] Cache initialized: {cachedCount} cached, {newModCount} new, {emoteModCount} emote mods total");
     }
 
-    /// <summary>
-    /// Get all emote mods (uses cache)
-    /// Returns whatever is cached so far, even during scanning
-    /// </summary>
     public List<EmoteModInfo> GetEmoteMods()
     {
-        // Return whatever we have cached, even if scan isn't complete
-        // This lets the UI show progress as mods are discovered
         return cache.GetCachedEmoteMods()
             .OrderBy(m => m.ModName)
             .ToList();
     }
 
-    /// <summary>
-    /// Analyze a specific mod (uses cache if available, does NOT update cache)
-    /// This is used by the UI when clicking on mods - we don't want to overwrite
-    /// cache data that might be better from the full background scan.
-    /// </summary>
+    // returns cached entry if available; never updates the cache
     public EmoteModInfo? AnalyzeMod(string modDirectory, string modName)
     {
-        // Check cache first - this is the preferred source
         var cached = cache.GetCachedEntry(modDirectory);
         if (cached != null)
         {
-            // Return cached data even if IsEmoteMod is false - UI will show "unknown"
-            // but we won't corrupt the cache by re-analyzing
-            // Clone lists to prevent callers from mutating cache data
+            // clone lists so callers can't mutate cache
             return new EmoteModInfo
             {
                 ModDirectory = modDirectory,
@@ -1623,30 +1588,23 @@ public class EmoteDetectionService
             };
         }
 
-        // Not cached - analyze but DON'T update cache
-        // The background scan will handle caching properly
-        // This prevents incomplete analysis from overwriting good cache data
+        // not cached: analyze without updating cache (background scan owns the cache)
         var result = AnalyzeModInternal(modDirectory, modName);
         return result;
     }
 
-    /// <summary>
-    /// Internal method to analyze a mod (no caching)
-    /// MERGES results from both file path analysis AND Penumbra's GetChangedItems
-    /// to get the most complete picture of what emotes a mod affects.
-    /// </summary>
+    // merges file-path analysis with Penumbra's GetChangedItems
     private EmoteModInfo? AnalyzeModInternal(string modDirectory, string modName)
     {
         var affectedEmotes = new List<string>();
         var emoteCommands = new List<string>();
         var emotePaths = new List<string>();
 
-        // Track animation type and pose indices from file path analysis
         AnimationType detectedAnimationType = AnimationType.None;
         var detectedPoseIndices = new HashSet<int>();
         var poseTypeIndices = new Dictionary<AnimationType, HashSet<int>>();
 
-        // 1. Get emotes from file path analysis (good for specific IDs like loop_emot19)
+        // 1. file-path analysis (catches specific IDs like loop_emot19)
         var filePathResult = AnalyzeModByFilePaths(modDirectory, modName);
         if (filePathResult != null)
         {
@@ -1662,7 +1620,6 @@ public class EmoteDetectionService
             }
             emotePaths = filePathResult.EmotePaths;
 
-            // Preserve animation type and pose indices from file path analysis
             detectedAnimationType = filePathResult.AnimationType;
             if (filePathResult.AffectedPoseIndices.Count > 0)
                 foreach (var idx in filePathResult.AffectedPoseIndices)
@@ -1670,7 +1627,6 @@ public class EmoteDetectionService
             else if (filePathResult.PoseIndex >= 0)
                 detectedPoseIndices.Add(filePathResult.PoseIndex);
 
-            // Collect per-type pose indices from file path analysis
             if (filePathResult.PoseTypeIndices.Count > 0)
             {
                 foreach (var (typeKey, indices) in filePathResult.PoseTypeIndices)
@@ -1797,7 +1753,7 @@ public class EmoteDetectionService
                 continue;
             }
 
-            // Normalize: remove hyphens (e.g., "push-ups" → "pushups")
+            // strip hyphens ("push-ups" -> "pushups")
             var normalized = cleanName.Replace("-", "");
             if (normalized != cleanName && EmoteToCommand.TryGetValue(normalized, out command))
             {
@@ -1810,8 +1766,7 @@ public class EmoteDetectionService
                 continue;
             }
 
-            // Normalize: remove filler words "it"/"a"/"the" and collapse spaces
-            // Handles "Paint It Black" → "paint black", etc.
+            // strip filler words ("Paint It Black" -> "paint black")
             var withoutFillers = System.Text.RegularExpressions.Regex.Replace(cleanName, @"\b(it|a|the)\b", "").Trim();
             withoutFillers = System.Text.RegularExpressions.Regex.Replace(withoutFillers, @"\s+", " ");
             if (withoutFillers != cleanName && EmoteToCommand.TryGetValue(withoutFillers, out command))
@@ -1835,13 +1790,10 @@ public class EmoteDetectionService
                 // Try to match against known emotes (longest first)
                 foreach (var (emoteName, emoteCmd) in EmoteToCommand.OrderByDescending(e => e.Key.Length))
                 {
-                    // Skip "pose" in partial matching — too short, matches many unrelated items
-                    // ("Change Pose" → "pose", "Pose of the Unbound" → "pose", etc.)
-                    // Direct match handles the actual /pose emote; this prevents false positives.
+                    // skip "pose" in partial match: matches "Change Pose", "Pose of the Unbound", etc.
                     if (emoteName == "pose")
                         continue;
 
-                    // Check if the clean name contains or matches this emote
                     if (cleanName.Contains(emoteName.ToLowerInvariant()) ||
                         emoteName.ToLowerInvariant().Contains(cleanName))
                     {
@@ -1858,11 +1810,7 @@ public class EmoteDetectionService
             }
         }
 
-        // Mixed-type mod detection: if we classified as a pose mod but also found
-        // real emote commands (dances, cheers, etc.), this is a mega mod that covers
-        // multiple animation types. Classify as Emote so the preset editor shows the
-        // full emote dropdown, but preserve the original pose type so users can still
-        // create pose presets from it.
+        // mixed-type mods (pose + real emote commands) reclassify as Emote; original pose type preserved
         AnimationType originalPoseType = AnimationType.None;
         if (isPoseMod && emoteCommands.Count > 0)
         {
@@ -1872,23 +1820,19 @@ public class EmoteDetectionService
             {
                 originalPoseType = detectedAnimationType;
                 detectedAnimationType = AnimationType.Emote;
-                log.Debug($"Mod '{modName}' has both emotes and poses — classifying as Emote (mixed-type mod, pose type: {originalPoseType})");
+                log.Debug($"Mod '{modName}' has both emotes and poses: classifying as Emote (mixed-type mod, pose type: {originalPoseType})");
             }
         }
 
-        // Multi-pose-type reclassification: if the mod has multiple pose types
-        // (e.g., idle+sit+groundsit+doze) but no real emote animations, reclassify
-        // as Emote so the preset editor shows the command dropdown for all types.
-        // Also add commands for all detected pose types.
+        // multi-pose-type mods (idle+sit+groundsit+doze) reclassify as Emote; commands for each type added
         if (isPoseMod && poseTypeIndices.Count > 1 && originalPoseType == AnimationType.None)
         {
-            // Add commands for all detected pose types
             foreach (var type in poseTypeIndices.Keys)
                 AddPoseCommandsForType(type, affectedEmotes, emoteCommands);
 
             originalPoseType = detectedAnimationType;
             detectedAnimationType = AnimationType.Emote;
-            log.Debug($"Mod '{modName}' has {poseTypeIndices.Count} pose types — classifying as Emote (multi-pose-type mod, original: {originalPoseType})");
+            log.Debug($"Mod '{modName}' has {poseTypeIndices.Count} pose types: classifying as Emote (multi-pose-type mod, original: {originalPoseType})");
         }
 
         // Movement mods: tag with "walk" identifier (no emote command needed)
@@ -1952,9 +1896,6 @@ public class EmoteDetectionService
         };
     }
 
-    /// <summary>
-    /// Fallback: Analyze mod by reading file paths from JSON
-    /// </summary>
     private EmoteModInfo? AnalyzeModByFilePaths(string modDirectory, string modName)
     {
         var modFiles = GetModFilePaths(modDirectory);
@@ -1969,7 +1910,6 @@ public class EmoteDetectionService
         int otherCount = 0;
         int weaponCount = 0;
 
-        // Track detected animation type and pose indices from paths
         AnimationType detectedType = AnimationType.None;
         var detectedPoseIndices = new HashSet<int>();
         var poseTypeIndices = new Dictionary<AnimationType, HashSet<int>>();
@@ -1978,7 +1918,7 @@ public class EmoteDetectionService
         {
             var pathLower = path.ToLowerInvariant();
 
-            // Track weapon files - if mostly weapons, skip this mod
+            // mostly-weapon mods are skipped
             if (pathLower.Contains("/weapon/") || pathLower.Contains("_weapon") ||
                 pathLower.Contains("/action/") || pathLower.Contains("ability/"))
             {
@@ -1986,9 +1926,7 @@ public class EmoteDetectionService
                 continue;
             }
 
-            // Filter out weapon stance animations (bt_stf, bt_2sw, bt_nin_nin, etc.)
-            // These are job-specific battle stances, NOT the bt_common folder
-            // Pattern: bt_ followed by anything other than "common"
+            // bt_stf/bt_2sw/etc are job-specific battle stances; only bt_common is emote data
             if (System.Text.RegularExpressions.Regex.IsMatch(pathLower, @"/bt_(?!common)[a-z0-9_]+/"))
             {
                 weaponCount++;
@@ -2005,11 +1943,7 @@ public class EmoteDetectionService
                 continue;
             }
 
-            // Check for pose files FIRST (they're in specific locations)
-            // Standing idle patterns:
-            //   /resident/idle.pap, /resident/pose##.pap (standard)
-            //   bt_common/resident/idle.pap (some mods)
-            //   Files with idle_pose or standing pose patterns
+            // pose files first; standing idle: /resident/idle.pap, /resident/pose##.pap, bt_common/resident/idle.pap
             if (pathLower.EndsWith(".pap"))
             {
                 // Standard resident folder pattern
@@ -2101,16 +2035,10 @@ public class EmoteDetectionService
                 }
             }
 
-            // Look for emote files - can be /emote/ folder, bt_common/emote/ path,
-            // or emote_sp/ folder (special emotes like Show Left/Right)
-            // Path examples:
-            //   /emote/beesknees/file.pap
-            //   bt_common/emote/dance04_loop.pap
-            //   bt_common/emote_sp/sp41_loop.pap
+            // /emote/, bt_common/emote/, emote_sp/ (showleft/showright/etc.)
             if ((pathLower.Contains("emote/") || pathLower.Contains("emote_sp/") || pathLower.Contains("/emote"))
                 && pathLower.EndsWith(".pap"))
             {
-                // Skip movement files
                 if (pathLower.Contains("move_"))
                 {
                     otherCount++;
@@ -2223,10 +2151,7 @@ public class EmoteDetectionService
             kv => (int)kv.Key,
             kv => kv.Value.OrderBy(i => i).ToList());
 
-        // Multi-pose-type reclassification: if the mod has multiple pose types
-        // (e.g., idle+sit+groundsit+doze) but no real emote animations, reclassify
-        // as Emote so the preset editor shows the command dropdown for all types.
-        // The existing "auto-detect pose commands" logic handles the rest.
+        // multi-pose-type mods reclassify as Emote (auto-detect pose commands handles the rest)
         AnimationType originalPoseType = AnimationType.None;
         bool isPoseMod = detectedType == AnimationType.StandingIdle ||
                          detectedType == AnimationType.ChairSitting ||
@@ -2236,7 +2161,7 @@ public class EmoteDetectionService
         {
             originalPoseType = detectedType;
             detectedType = AnimationType.Emote;
-            log.Debug($"Mod '{modName}' has {poseTypeIndices.Count} pose types — classifying as Emote (multi-pose-type mod, original: {originalPoseType})");
+            log.Debug($"Mod '{modName}' has {poseTypeIndices.Count} pose types: classifying as Emote (multi-pose-type mod, original: {originalPoseType})");
         }
 
         // Return mod info
@@ -2323,15 +2248,10 @@ public class EmoteDetectionService
         }
     }
 
-    /// <summary>
-    /// Returns true if a command is a pose command (/sit, /groundsit, /doze, /cpose)
-    /// whose pose type was NOT confirmed by file path analysis.
-    /// Used to filter false positives from Penumbra's GetChangedItems.
-    /// Returns false (don't filter) if: not a pose command, or no file path data available.
-    /// </summary>
+    // pose command not confirmed by file-path analysis (filters Penumbra GetChangedItems false positives)
     private static bool IsFalsePoseCommand(string command, HashSet<AnimationType>? confirmedTypes)
     {
-        if (confirmedTypes == null) return false; // No file path data — don't filter
+        if (confirmedTypes == null) return false;
 
         var poseType = command.ToLowerInvariant() switch
         {
@@ -2342,17 +2262,10 @@ public class EmoteDetectionService
             _ => (AnimationType?)null
         };
 
-        // Not a pose command — don't filter
         if (poseType == null) return false;
-
-        // Filter if this pose type wasn't found in the actual mod files
         return !confirmedTypes.Contains(poseType.Value);
     }
 
-    /// <summary>
-    /// Get file paths from a mod by reading its JSON files directly.
-    /// Same approach as CS+ GetModFilePathsFromJson.
-    /// </summary>
     private List<string> GetModFilePaths(string modDirectory)
     {
         var filePaths = new List<string>();
@@ -2409,7 +2322,6 @@ public class EmoteDetectionService
                 }
                 catch
                 {
-                    // Skip files that fail to parse
                 }
             }
         }
@@ -2421,30 +2333,19 @@ public class EmoteDetectionService
         return filePaths;
     }
 
-    /// <summary>
-    /// Extract emote name from a file path and try to find a matching command.
-    /// Returns the emote identifier that should be looked up in EmoteToCommand.
-    /// Handles paths like:
-    ///   - /emote/beesknees/file.pap (folder name is emote)
-    ///   - bt_common/emote/dance04_loop.pap (filename is emote)
-    ///   - emote/dance03/dance_female_loop.pap (folder dance03 = harvestdance, not dance_female)
-    /// </summary>
     private string ExtractEmoteNameFromPath(string path)
     {
         var pathLower = path.ToLowerInvariant();
 
-        // Check for emote_sp/ paths FIRST (special emotes like Show Left/Right use sp## naming)
-        // Example: bt_common/emote_sp/sp41_loop.pap -> sp41 -> showleft
+        // emote_sp/sp## (showleft/showright/etc.)
         var emoteSpIdx = pathLower.IndexOf("emote_sp/");
         if (emoteSpIdx >= 0)
         {
-            var afterEmoteSp = pathLower.Substring(emoteSpIdx + 9); // length of "emote_sp/"
-            // Extract the sp## identifier from the filename (e.g., "sp41_loop.pap" -> "sp41")
+            var afterEmoteSp = pathLower.Substring(emoteSpIdx + 9);
             var spFile = afterEmoteSp;
             var slashIdx = spFile.IndexOf('/');
             if (slashIdx >= 0)
                 spFile = spFile.Substring(slashIdx + 1);
-            // Remove .pap extension
             if (spFile.EndsWith(".pap"))
                 spFile = spFile.Substring(0, spFile.Length - 4);
             // Remove animation suffixes (_loop, _start, _end)
@@ -2512,34 +2413,26 @@ public class EmoteDetectionService
         return "";
     }
 
-    /// <summary>
-    /// Find the longest matching emote name that appears in the given text.
-    /// Returns the emote key (not the command).
-    /// </summary>
     private string FindLongestEmoteMatch(string text)
     {
         if (string.IsNullOrEmpty(text))
             return "";
 
-        // Sort by key length descending to match longest first
-        // This ensures "harvestdance" matches before "dance", "showleft" before "show", etc.
+        // longest-first so "harvestdance" beats "dance", "showleft" beats "show"
         var sortedEmotes = EmoteToCommand
             .OrderByDescending(e => e.Key.Length)
             .ToList();
 
         foreach (var (emoteName, _) in sortedEmotes)
         {
-            // Skip very short names that could match too broadly
             if (emoteName.Length < 3)
                 continue;
 
-            // Skip matching just "dance" when we have dance variants like "dance_female", "dance_male"
-            // These are ambiguous - they could be any dance emote, not just the base /dance
+            // "dance" with variants ("dance_female" etc) is ambiguous; let GetChangedItems disambiguate
             if (emoteName == "dance" && text.Contains("dance_"))
                 continue;
 
-            // Skip matching "pose" when text is a numbered pose file (pose01, pose02, etc.)
-            // These are idle pose animation files, not the /pose emote
+            // numbered pose files (pose01/pose02) are idle poses, not the /pose emote
             if (emoteName == "pose" && System.Text.RegularExpressions.Regex.IsMatch(text, @"pose\d"))
                 continue;
 
@@ -2550,23 +2443,17 @@ public class EmoteDetectionService
         return "";
     }
 
-    /// <summary>
-    /// Generate candidate emote names from a filename.
-    /// Tries various transformations to find a matching emote.
-    /// </summary>
     private List<string> GenerateEmoteCandidates(string filename)
     {
         var candidates = new List<string>();
 
-        // 1. Try the full filename first (e.g., "dance_male_loop")
         candidates.Add(filename);
 
-        // 2. Remove common animation suffixes
         var cleaned = RemoveAnimationSuffixes(filename);
         if (!string.IsNullOrEmpty(cleaned) && cleaned != filename)
             candidates.Add(cleaned);
 
-        // 3. For seated/ground emotes with prefixes (s_, j_, u_, l_)
+        // s_/j_/u_/l_ prefixes (seated/ground/etc.)
         if (cleaned.StartsWith("s_") || cleaned.StartsWith("j_") ||
             cleaned.StartsWith("u_") || cleaned.StartsWith("l_"))
         {
@@ -2574,20 +2461,15 @@ public class EmoteDetectionService
             candidates.Add(withoutPrefix);
         }
 
-        // 4. Try with underscores replaced
         var noUnderscores = cleaned.Replace("_", "");
         if (noUnderscores != cleaned)
             candidates.Add(noUnderscores);
 
-        // 5. For dance variants (dance_male, dance_female, dance_elezen, etc.)
-        // DON'T add these as candidates - they're ambiguous and could be ANY dance emote
-        // Let GetChangedItems tell us which emote is actually affected
-        // (We removed dance_male, dance_female, etc. from EmoteToCommand for this reason)
+        // dance variants (dance_male etc) intentionally NOT added: ambiguous, GetChangedItems disambiguates
 
-        // 6. For numbered dances (dance02, dance03, dance04, etc.)
         if (cleaned.StartsWith("dance") && cleaned.Length > 5 && char.IsDigit(cleaned[5]))
         {
-            candidates.Add(cleaned); // e.g., dance04
+            candidates.Add(cleaned);
         }
 
         return candidates;
@@ -2595,7 +2477,6 @@ public class EmoteDetectionService
 
     private string RemoveAnimationSuffixes(string name)
     {
-        // Remove standard suffixes
         var suffixes = new[] { "_loop", "_start", "_end", "_sp", "_idle", "_base", "_st" };
         bool changed;
         do
@@ -2697,28 +2578,15 @@ public class EmoteModInfo
 
     public EmoteDetectionService.AnimationType AnimationType { get; set; } = EmoteDetectionService.AnimationType.Emote;
 
-    /// <summary>
-    /// For mixed-type mods (e.g., mega mods with dances + poses): the original pose type
-    /// before reclassification to Emote. None if not a mixed mod.
-    /// </summary>
+    // for mixed-type mods (dances + poses): original pose type before reclassification to Emote
     public EmoteDetectionService.AnimationType PoseAnimationType { get; set; } = EmoteDetectionService.AnimationType.None;
 
-    /// <summary>
-    /// The pose index (0-6) for pose mods, or -1 if not applicable/unknown.
-    /// For multi-pose mods, this is the lowest index.
-    /// </summary>
+    // -1 if N/A; for multi-pose mods, the lowest index
     public int PoseIndex { get; set; } = -1;
 
-    /// <summary>
-    /// All pose indices this mod affects (e.g., a mod replacing both groundsit 1 and 2).
-    /// Empty for non-pose mods.
-    /// </summary>
     public List<int> AffectedPoseIndices { get; set; } = new();
 
-    /// <summary>
-    /// Maps each AnimationType (as int) to its list of pose indices.
-    /// For mods with multiple pose types (e.g., idle+sit+groundsit+doze).
-    /// </summary>
+    // AnimationType -> pose indices for mods spanning multiple pose types
     public Dictionary<int, List<int>> PoseTypeIndices { get; set; } = new();
 
     public bool RequiresRedraw => AnimationType switch

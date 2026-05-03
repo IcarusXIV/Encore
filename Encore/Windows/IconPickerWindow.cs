@@ -154,7 +154,7 @@ public class IconPickerWindow : Window
     public override void PreDraw()
     {
         base.PreDraw();
-        var scale = UIStyles.Scale;
+        var scale = UIStyles.WindowScale;
 
         // Apply scaled size on first use
         Size = new Vector2(BaseWidth * scale, BaseHeight * scale);
@@ -165,6 +165,13 @@ public class IconPickerWindow : Window
             MinimumSize = new Vector2(BaseWidth * scale, BaseHeight * scale),
             MaximumSize = new Vector2(BaseMaxWidth * scale, BaseMaxHeight * scale)
         };
+        UIStyles.PushEncoreWindow();
+    }
+
+    public override void PostDraw()
+    {
+        UIStyles.PopEncoreWindow();
+        base.PostDraw();
     }
 
     private void LoadIconsForCategory(string category)
@@ -199,6 +206,7 @@ public class IconPickerWindow : Window
     public override void Draw()
     {
         UIStyles.PushMainWindowStyle();
+        UIStyles.PushEncoreContent();
 
         try
         {
@@ -313,6 +321,7 @@ public class IconPickerWindow : Window
         }
         finally
         {
+            UIStyles.PopEncoreContent();
             UIStyles.PopMainWindowStyle();
         }
     }

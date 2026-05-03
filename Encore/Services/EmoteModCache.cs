@@ -9,10 +9,9 @@ using Dalamud.Plugin.Services;
 
 namespace Encore.Services;
 
-// Cache data structure for emote mods - persisted to disk
 public class EmoteModCacheData
 {
-    public const int CurrentVersion = 13;
+    public const int CurrentVersion = 14;
 
     [JsonPropertyName("version")]
     public int Version { get; set; } = CurrentVersion;
@@ -24,7 +23,6 @@ public class EmoteModCacheData
     public Dictionary<string, EmoteModCacheEntry> Mods { get; set; } = new();
 }
 
-// Individual cache entry for an emote mod
 public class EmoteModCacheEntry
 {
     [JsonPropertyName("name")]
@@ -46,13 +44,13 @@ public class EmoteModCacheEntry
     public string PrimaryCommand { get; set; } = "";
 
     [JsonPropertyName("animationType")]
-    public int AnimationType { get; set; } = 1; // Default to Emote (1)
+    public int AnimationType { get; set; } = 1;
 
     [JsonPropertyName("poseAnimationType")]
-    public int PoseAnimationType { get; set; } = 0; // For mixed mods: original pose type before reclassification
+    public int PoseAnimationType { get; set; } = 0;
 
     [JsonPropertyName("poseIndex")]
-    public int PoseIndex { get; set; } = -1; // -1 = not applicable/unknown
+    public int PoseIndex { get; set; } = -1;
 
     [JsonPropertyName("affectedPoseIndices")]
     public List<int> AffectedPoseIndices { get; set; } = new();
@@ -64,17 +62,12 @@ public class EmoteModCacheEntry
     public DateTime LastSeen { get; set; }
 }
 
-/// <summary>
-/// Manages caching of emote mod detection results.
-/// Uses the same caching pattern as Character Select+.
-/// </summary>
 public class EmoteModCache
 {
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly IPluginLog log;
     private readonly string cacheFilePath;
 
-    // In-memory cache
     private Dictionary<string, EmoteModCacheEntry>? memoryCache;
     private bool isInitialized;
     private readonly object cacheLock = new object();

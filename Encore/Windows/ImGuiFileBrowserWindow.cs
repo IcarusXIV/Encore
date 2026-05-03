@@ -8,13 +8,11 @@ using Dalamud.Interface;
 using Dalamud.Interface.Windowing;
 using Dalamud.Interface.Textures;
 using Dalamud.Interface.Textures.TextureWraps;
+using Encore.Styles;
 
 namespace Encore.Windows
 {
-    /// <summary>
-    /// ImGui-based file browser window for selecting image files.
-    /// Alternative to Windows file dialog for Linux/Wine users.
-    /// </summary>
+    // Linux/Wine-friendly alternative to the Windows file dialog
     public class ImGuiFileBrowserWindow : Window
     {
         public string? SelectedPath { get; private set; }
@@ -45,7 +43,6 @@ namespace Encore.Windows
         public ImGuiFileBrowserWindow(string title = "Select File", string[]? extensions = null)
             : base($"{title}###ImGuiFileBrowser")
         {
-            Size = new Vector2(900, 600);
             SizeCondition = ImGuiCond.FirstUseEver;
             Flags = ImGuiWindowFlags.NoDocking;
 
@@ -201,6 +198,18 @@ namespace Encore.Windows
             var parent = Directory.GetParent(currentDirectory);
             if (parent != null)
                 NavigateTo(parent.FullName);
+        }
+
+        public override void PreDraw()
+        {
+            base.PreDraw();
+            var scale = UIStyles.WindowScale;
+            Size = new Vector2(900f * scale, 600f * scale);
+            SizeConstraints = new WindowSizeConstraints
+            {
+                MinimumSize = new Vector2(600f * scale, 400f * scale),
+                MaximumSize = new Vector2(1400f * scale, 1000f * scale),
+            };
         }
 
         public override void Draw()

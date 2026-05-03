@@ -1,21 +1,26 @@
+using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Game.Command;
+using Dalamud.Game.Text.SeStringHandling;
+using Dalamud.Hooking;
 using Dalamud.IoC;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Ipc;
+using Dalamud.Interface.ManagedFontAtlas;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin.Services;
 using Dalamud.Game.Text;
-using Dalamud.Game.Text.SeStringHandling;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using FFXIVClientStructs.FFXIV.Client.System.String;
 using FFXIVClientStructs.FFXIV.Client.UI;
+using FFXIVClientStructs.FFXIV.Component.Shell;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.Loader;
+using System.Net.Http;
 using System.Text;
 using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
@@ -41,6 +46,10 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static ITargetManager TargetManager { get; private set; } = null!;
     [PluginService] internal static IGameConfig GameConfig { get; private set; } = null!;
     [PluginService] internal static IDataManager DataManager { get; private set; } = null!;
+    [PluginService] internal static ICondition Condition { get; private set; } = null!;
+    [PluginService] internal static IClientState ClientState { get; private set; } = null!;
+    [PluginService] internal static IGameGui GameGui { get; private set; } = null!;
+    [PluginService] internal static ISigScanner SigScanner { get; private set; } = null!;
 
     // Icons directory for custom preset images
     internal static string IconsDirectory => Path.Combine(PluginInterface.GetPluginConfigDirectory(), "icons");
@@ -48,8 +57,15 @@ public sealed class Plugin : IDalamudPlugin
     // Main command
     private const string MainCommand = "/encore";
 
-    // Patch notes version — bump when patch notes content changes (not every build)
-    public const string PatchNotesVersion = "1.0.0.5";
+    // Patch notes version - bump when patch notes content changes (not every build)
+    public const string PatchNotesVersion = "1.0.0.6";
+
+    // Update check: fetches repo.json from GitHub to compare versions
+    private const string UpdateCheckUrl = "https://raw.githubusercontent.com/IcarusXIV/Encore/master/Encore/repo.json";
+    private const int UpdateCheckIntervalMs = 30 * 60 * 1000; // 30 minutes
+    private static readonly HttpClient updateHttpClient = new();
+    private System.Threading.Timer? updateCheckTimer;
+    private bool updateNotified = false;
 
     // Configuration
     public Configuration Configuration { get; init; }
@@ -59,26 +75,79 @@ public sealed class Plugin : IDalamudPlugin
     public EmoteDetectionService? EmoteDetectionService { get; private set; }
     public MovementService? MovementService { get; private set; }
     public PoseService? PoseService { get; private set; }
+    public SimpleHeelsService? SimpleHeelsService { get; private set; }
+    public BgmAnalysisService? BgmAnalysisService { get; private set; }
+    public BgmTrackerService? BgmTrackerService { get; private set; }
+
+    // beat-matched visuals Hz; falls back to 2.0 (120 BPM) when idle or undetected
+    public float CurrentBgmHz
+    {
+        get
+        {
+            bool performing = !string.IsNullOrEmpty(Configuration?.ActivePresetId)
+                           || !string.IsNullOrEmpty(ActiveRoutineName);
+            if (!performing) return 2.0f;
+            var bpm = BgmTrackerService?.CurrentBpm;
+            if (bpm == null || bpm <= 30f || bpm >= 250f) return 2.0f;
+            return bpm.Value / 60f;
+        }
+    }
 
     // Windows
     public readonly WindowSystem WindowSystem = new("Encore");
     private MainWindow MainWindow { get; init; }
     private PresetEditorWindow PresetEditorWindow { get; init; }
+    private RoutineEditorWindow RoutineEditorWindow { get; init; }
     private IconPickerWindow IconPickerWindow { get; init; }
     private HelpWindow HelpWindow { get; init; }
     private PatchNotesWindow PatchNotesWindow { get; init; }
+    internal SettingsWindow SettingsWindow { get; init; }
     internal ImGuiFileBrowserWindow FileBrowserWindow { get; init; }
+    internal HeelsGizmoOverlay HeelsGizmoOverlay { get; init; }
 
-    // Dynamic command tracking
+    internal IFontHandle? HeaderFont { get; private set; }
+    internal IFontHandle? BannerFont { get; private set; }
+    internal IFontHandle? NumeralFont { get; private set; }
+    internal IFontHandle? TitleFont { get; private set; }
+
+
     private readonly HashSet<string> registeredPresetCommands = new();
 
     // Prevent overlapping preset executions
     private volatile bool isExecutingPreset = false;
 
+    // Routine state
+    private Routine? activeRoutine;
+    private System.Threading.CancellationTokenSource? routineCts;
+    private int activeRoutineStepIndex = 0;
+    private DateTime activeRoutineStepStartedUtc;
+    private ushort routineStepEmoteId = 0;
+    private uint routineStepTimeline = 0;
+    private bool routineWaitingForEmoteStart = false;
+    private ushort routinePrevEmoteId = 0;
+    private uint routinePrevTimeline = 0;
+    private System.Numerics.Vector3 routinePrevPosition;
+    private bool routineMovementBaselineSet = false;
+    // Set to true by RunMacroAsync when a macro step's commands finish naturally (not cancelled).
+    // Used by UpdateActiveRoutine to advance "Until macro ends" macro steps.
+    private volatile bool routineMacroCompleted = false;
+    private DateTime routineMacroCompletedAt = DateTime.MinValue;
+    // Preset IDs whose priorities + conflict disables were applied at routine start.
+    // Steps for these presets skip ExecutePreset's full cycle - they just fire their emote.
+    private readonly HashSet<string> routineBulkAppliedPresetIds = new();
+    private bool isAdvancingRoutine = false;  // suppresses cancellation while we run step transitions
+    private readonly HashSet<string> registeredRoutineCommands = new();
+
     // Emote unlock bypass: Lumina-based lookup tables for PAP rewriting
     private Dictionary<string, ushort>? emoteCommandToId;
-    // emote ID → all ActionTimeline entries (slot index, key string, isLoop flag, loadType: 0=Facial, 1=PerJob, 2=Normal)
+    // emote ID -> all ActionTimeline entries (slot index, key string, isLoop flag, loadType: 0=Facial, 1=PerJob, 2=Normal)
     private Dictionary<ushort, List<(int slot, string key, bool isLoop, byte loadType)>>? emoteIdToTimelineKeys;
+    // Per-emote set of ActionTimeline row IDs - used to tell "internal intro->loop transition" from "emote ended"
+    private Dictionary<ushort, HashSet<ushort>>? emoteIdToTimelineRowIds;
+
+    // List of expression emotes (face-only) for the routine editor dropdown.
+    // Each entry: (command like "/smile", display label like "Smile").
+    public List<(string Command, string Label)> ExpressionEmotes { get; private set; } = new();
     // Track active emote swap state
     private bool emoteSwapActive = false;
     private int emoteSwapPriority = 0;
@@ -90,24 +159,88 @@ public sealed class Plugin : IDalamudPlugin
     private int emoteSwapFileCounter = 0;
     // Cache carrier PAP names to avoid re-reading from game data each call
     private readonly Dictionary<ushort, string> carrierPapNameCache = new();
-    // Carrier sticking: reuse the same carrier for the same emote across repeated bypass calls.
-    // Penumbra's ChangeCounter-based cache invalidation ensures the game reloads resources when
-    // mod settings change, so rotating carriers is unnecessary. Sticking enables sync plugin compatibility
-    // by keeping the animation on a consistent carrier path.
+    // carrier sticking: reuse same carrier for same emote (sync plugin compat)
     private string? lastBypassEmoteCommand = null;
     private string? lastBypassCarrierCommand = null;
     private ushort lastBypassCarrierId = 0;
     private string? lastBypassRaceCode = null;
-    // One-shot emote swap auto-cleanup: detect when a one-shot carrier finishes and soft-disable the swap.
-    // Soft disable = remove Penumbra temp settings (carrier returns to normal) but keep swap files + sticking
-    // state intact so the next /vanilla call for the same emote can re-enable without full re-setup.
-    private bool emoteSwapIsOneShot = false;
-    private ushort emoteSwapCarrierId = 0;
-    private bool emoteSwapWaitingForStart = false;
+    // session-wide carrier tracking; game caches PAP per-animation-key (Penumbra ChangeCounter only busts TMBs)
+    private readonly HashSet<ushort> usedCarrierIds = new();
+    // Soft-disabled state: swap files + sticking state preserved, but Penumbra temp settings removed.
+    // Re-enabled on next bypass for same emote via sticking check in TrySetupEmoteBypass.
     private bool emoteSwapSoftDisabled = false;
-    // Emote ConditionMode lookup: maps emote ID → EmoteMode.ConditionMode
-    // 0 = works in any state (sitting, dozing, etc.), 3 = standing only
+    // Guard flag: true while we're executing the carrier emote as part of bypass.
+    // Prevents the ExecuteCommandInner hook from detecting our own carrier execution
+    // and clearing the swap (the hook should only clear on USER-initiated carrier commands).
+    private volatile bool isExecutingBypassCarrier = false;
+    // EmoteMode.ConditionMode: 0 = any state, 3 = standing only
     private Dictionary<ushort, byte>? emoteIdToConditionMode;
+    // Emote-type preset tracking; poses/movement stay sticky
+    private ushort activePresetEmoteId = 0;
+    private bool activePresetEmoteSeen = false;
+    // either EmoteId or Timeline matching keeps the preset "alive"
+    private ushort activePresetEmoteTimeline = 0;
+    // frames where neither signal matches; tolerates brief blips
+    private int activePresetEndCandidateFrames = 0;
+    // EmoteId already playing when preset started; skipped to avoid latching onto previous preset's tail
+    private ushort activePresetEmoteIgnoreId = 0;
+    private bool activePresetIgnoreSnapshotted = false;
+    private long activePresetIgnoreExpiryTicks = 0;
+
+    // resolves the active SCD via option-group selections; falls back to game BGM if no mod music
+    private void TryWireModMusicForBpm(DancePreset preset, PresetModifier? modifier)
+    {
+        try
+        {
+            if (BgmTrackerService == null) return;
+            if (preset.IsVanilla || string.IsNullOrEmpty(preset.ModDirectory))
+            {
+                BgmTrackerService.ClearModScd();
+                return;
+            }
+
+            var penumbraRoot = PenumbraService?.GetModDirectory();
+            if (string.IsNullOrEmpty(penumbraRoot)) return;
+
+            var modRoot = System.IO.Path.Combine(penumbraRoot, preset.ModDirectory);
+            if (!System.IO.Directory.Exists(modRoot)) return;
+
+            // mirror ApplyTempSettings: preset selections + modifier OptionOverrides on top
+            var merged = new Dictionary<string, List<string>>(preset.ModOptions);
+            if (modifier != null)
+            {
+                foreach (var (g, o) in modifier.OptionOverrides)
+                    merged[g] = o;
+            }
+
+            var scdPath = ModMusicFinder.FindActiveScd(modRoot, merged, Log);
+            // Always log what we resolved (or didn't) so users debugging
+            // multi-music modifiers can see the resolution chain in /xllog.
+            string mergedStr = merged.Count == 0 ? "(none)"
+                : string.Join(", ", merged.Select(kv => $"{kv.Key}=[{string.Join(",", kv.Value)}]"));
+            Log.Debug($"[BGM] preset='{preset.Name}' mod='{preset.ModDirectory}' modifier='{modifier?.Name ?? "-"}' opts={mergedStr} -> SCD: {scdPath ?? "(none)"}");
+            if (scdPath == null)
+            {
+                BgmTrackerService.ClearModScd();
+                return;
+            }
+            BgmTrackerService.SetModScd(scdPath);
+        }
+        catch (Exception ex)
+        {
+            Log.Debug($"[BGM] mod music detection failed: {ex.Message}");
+        }
+    }
+
+    private void ArmPresetEmoteIgnore(DancePreset preset)
+    {
+        activePresetEmoteIgnoreId = 0;
+        activePresetIgnoreSnapshotted = false;
+        activePresetIgnoreExpiryTicks = preset.AnimationType == 1
+            ? Environment.TickCount64 + 1500
+            : 0;
+    }
+
     // Emote loop tracking (/loop command)
     private string? loopingEmoteCommand = null;
     private ushort previousEmoteId = 0;
@@ -119,6 +252,13 @@ public sealed class Plugin : IDalamudPlugin
     // Locked emote loop: re-execute via carrier instead of normal ExecuteEmote
     private string? loopCarrierCommand = null;
     private ushort loopCarrierId = 0;
+    // Weapon drawn state tracking for /loop cancellation
+    private bool loopPreviousWeaponDrawn = false;
+
+    // ShellCommandModule hook: intercept native emote commands for locked emote bypass
+    private Hook<ShellCommandModule.Delegates.ExecuteCommandInner>? executeCommandInnerHook;
+    // ConditionFlag tracking for /loop cancellation
+    private bool conditionLoopCancelRegistered = false;
 
     public Plugin()
     {
@@ -156,7 +296,7 @@ public sealed class Plugin : IDalamudPlugin
                 }
             }
         }
-        catch { /* Non-critical — custom icon resize will fall back to file copy */ }
+        catch { /* Non-critical - custom icon resize will fall back to file copy */ }
 
         // Load configuration
         Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
@@ -189,6 +329,21 @@ public sealed class Plugin : IDalamudPlugin
             EmoteDetectionService = new EmoteDetectionService(PenumbraService, PluginInterface, Log);
             PoseService = new PoseService(GameInteropProvider, ObjectTable, Framework, Log);
             MovementService = new MovementService(GameInteropProvider, ObjectTable, GameConfig, Log);
+            SimpleHeelsService = new SimpleHeelsService(PluginInterface, ObjectTable, Log);
+
+            try
+            {
+                BgmAnalysisService = new BgmAnalysisService(
+                    PluginInterface.GetPluginConfigDirectory(), Log);
+                BgmTrackerService = new BgmTrackerService(
+                    SigScanner, DataManager, Log, BgmAnalysisService);
+            }
+            catch (Exception bgmEx)
+            {
+                Log.Warning($"BGM BPM tracking unavailable: {bgmEx.Message}");
+                BgmAnalysisService = null;
+                BgmTrackerService = null;
+            }
 
             // Initialize emote mod cache in background (like CS+)
             if (PenumbraService.IsAvailable)
@@ -236,11 +391,12 @@ public sealed class Plugin : IDalamudPlugin
             Log.Error($"Failed to initialize services: {ex.Message}");
         }
 
-        // Build emote command → ID and emote ID → timeline keys lookups from Lumina
+        // Build emote command -> ID and emote ID -> timeline keys lookups from Lumina
         try
         {
             emoteCommandToId = new Dictionary<string, ushort>(StringComparer.OrdinalIgnoreCase);
             emoteIdToTimelineKeys = new Dictionary<ushort, List<(int slot, string key, bool isLoop, byte loadType)>>();
+            emoteIdToTimelineRowIds = new Dictionary<ushort, HashSet<ushort>>();
             emoteIdToConditionMode = new Dictionary<ushort, byte>();
             var emoteSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Emote>();
             if (emoteSheet != null)
@@ -257,6 +413,7 @@ public sealed class Plugin : IDalamudPlugin
                     // Store ActionTimeline entries with loop detection and load type
                     // LoadType: 0=Facial expression, 1=PerJob, 2=Normal body animation
                     var entries = new List<(int slot, string key, bool isLoop, byte loadType)>();
+                    var rowIds = new HashSet<ushort>();
                     for (int i = 0; i < 7; i++)
                     {
                         var tlRef = row.ActionTimeline[i];
@@ -267,10 +424,14 @@ public sealed class Plugin : IDalamudPlugin
                         {
                             bool isLoop = key.Contains("loop", StringComparison.OrdinalIgnoreCase);
                             entries.Add((i, key, isLoop, tl.LoadType));
+                            rowIds.Add((ushort)tlRef.RowId);
                         }
                     }
                     if (entries.Count > 0)
+                    {
                         emoteIdToTimelineKeys.TryAdd(emoteId, entries);
+                        emoteIdToTimelineRowIds.TryAdd(emoteId, rowIds);
+                    }
 
                     // Map all command variants to emote ID
                     var textCmd = row.TextCommand.ValueNullable;
@@ -291,10 +452,27 @@ public sealed class Plugin : IDalamudPlugin
                     var shortAlias = textCmd.Value.ShortAlias.ToString();
                     if (!string.IsNullOrEmpty(shortAlias))
                         emoteCommandToId.TryAdd(shortAlias.ToLowerInvariant(), emoteId);
+
+                    // Build the expressions list for the routine editor dropdown.
+                    // Filter to emotes whose category is "Expressions".
+                    var category = row.EmoteCategory.ValueNullable;
+                    if (category != null &&
+                        string.Equals(category.Value.Name.ExtractText(), "Expressions", StringComparison.OrdinalIgnoreCase) &&
+                        !string.IsNullOrEmpty(cmd))
+                    {
+                        var label = row.Name.ExtractText();
+                        if (string.IsNullOrEmpty(label)) label = cmd.TrimStart('/');
+                        ExpressionEmotes.Add((cmd, label));
+                    }
                 }
 
+                // Sort expressions alphabetically by label
+                ExpressionEmotes = ExpressionEmotes
+                    .OrderBy(e => e.Label, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
                 var emotesWithTimelines = emoteIdToTimelineKeys.Count;
-                // Count emotes that have facial (LoadType 0) entries — needed for expression support in unlock bypass
+                // Count emotes that have facial (LoadType 0) entries - needed for expression support in unlock bypass
                 int emotesWithFacial = 0;
                 foreach (var (id, entries2) in emoteIdToTimelineKeys)
                 {
@@ -328,24 +506,34 @@ public sealed class Plugin : IDalamudPlugin
         // Create windows
         MainWindow = new MainWindow();
         PresetEditorWindow = new PresetEditorWindow();
+        RoutineEditorWindow = new RoutineEditorWindow();
         IconPickerWindow = new IconPickerWindow();
         HelpWindow = new HelpWindow();
         PatchNotesWindow = new PatchNotesWindow(this);
+        SettingsWindow = new SettingsWindow();
         FileBrowserWindow = new ImGuiFileBrowserWindow("Select Icon Image");
         FileBrowserWindow.SetConfiguration(Configuration);
+        HeelsGizmoOverlay = new HeelsGizmoOverlay(PluginInterface, Condition, ObjectTable, GameGui);
+        HeelsGizmoOverlay.OnChanged = t =>
+        {
+            if (SimpleHeelsService == null || !SimpleHeelsService.IsAvailable) return;
+            SimpleHeelsService.ApplyOffset(t.X, t.Y, t.Z, t.Rotation, t.Pitch, t.Roll);
+        };
 
-        // Wire up window dependencies
         MainWindow.SetEditorWindow(PresetEditorWindow);
+        MainWindow.SetRoutineEditor(RoutineEditorWindow);
         MainWindow.SetHelpWindow(HelpWindow);
         MainWindow.SetPatchNotesWindow(PatchNotesWindow);
         PresetEditorWindow.SetIconPicker(IconPickerWindow);
+        RoutineEditorWindow.SetIconPicker(IconPickerWindow);
 
-        // Add windows to system
         WindowSystem.AddWindow(MainWindow);
         WindowSystem.AddWindow(PresetEditorWindow);
+        WindowSystem.AddWindow(RoutineEditorWindow);
         WindowSystem.AddWindow(IconPickerWindow);
         WindowSystem.AddWindow(HelpWindow);
         WindowSystem.AddWindow(PatchNotesWindow);
+        WindowSystem.AddWindow(SettingsWindow);
         WindowSystem.AddWindow(FileBrowserWindow);
 
         // Register main command
@@ -386,23 +574,169 @@ public sealed class Plugin : IDalamudPlugin
         {
             HelpWindow.IsOpen = true;
             Configuration.HasSeenHelp = true;
-            // First-time user — mark patch notes as seen so they don't get both windows
+            // first-time users skip patch notes
             Configuration.LastSeenPatchNotesVersion = PatchNotesVersion;
             Configuration.Save();
         }
         else if (Configuration.LastSeenPatchNotesVersion != PatchNotesVersion &&
                  Configuration.ShowPatchNotesOnStartup)
         {
-            // Existing user updating — show what's new
             PatchNotesWindow.IsOpen = true;
             Configuration.LastSeenPatchNotesVersion = PatchNotesVersion;
             Configuration.Save();
         }
 
-        // Restore main window open state from last session
         if (Configuration.IsMainWindowOpen)
         {
             MainWindow.IsOpen = true;
+        }
+
+        // Build the header banner font (used for "ENCORE" in the main window
+        // title bar). Real ~26px glyphs - not a scaled default font - so the
+        // text stays crisp.
+        try
+        {
+            HeaderFont = PluginInterface.UiBuilder.FontAtlas.NewDelegateFontHandle(e =>
+            {
+                e.OnPreBuild(tk => tk.AddDalamudDefaultFont(24f));
+            });
+            // Fire-and-forget WaitAsync so Dalamud kicks off the atlas
+            // build immediately instead of on first use - avoids the
+            // "small -> big" font pop when the window first opens.
+            _ = HeaderFont?.WaitAsync();
+        }
+        catch (Exception ex)
+        {
+            Log.Warning($"Failed to build header font: {ex.Message} - ENCORE banner will fall back to default font");
+            HeaderFont = null;
+        }
+
+        try
+        {
+            // Prefer a custom display TTF dropped into the plugin's Assets
+            // folder (e.g. Unbounded-Bold.ttf from Google Fonts) for a more
+            // distinctive wordmark. Falls back to the default Dalamud font.
+            var assetDir = PluginInterface.AssemblyLocation.Directory?.FullName;
+            var customPath = assetDir != null
+                ? Path.Combine(assetDir, "Assets", "Unbounded-Bold.ttf")
+                : null;
+            bool haveCustom = customPath != null && File.Exists(customPath);
+            BannerFont = PluginInterface.UiBuilder.FontAtlas.NewDelegateFontHandle(e =>
+            {
+                if (haveCustom)
+                {
+                    e.OnPreBuild(tk => tk.AddFontFromFile(
+                        customPath!,
+                        new Dalamud.Interface.ManagedFontAtlas.SafeFontConfig { SizePx = 56f }));
+                }
+                else
+                {
+                    e.OnPreBuild(tk => tk.AddDalamudDefaultFont(54f));
+                }
+            });
+            if (haveCustom) Log.Information($"Banner font loaded from {customPath}");
+            _ = BannerFont?.WaitAsync();
+        }
+        catch (Exception ex)
+        {
+            Log.Warning($"Failed to build banner font: {ex.Message} - patch notes banner will fall back to header font");
+            BannerFont = null;
+        }
+
+        try
+        {
+            // Unbounded-Bold (Assets) -> Segoe UI Black -> Dalamud Axis
+            var assetDir = PluginInterface.AssemblyLocation.Directory?.FullName;
+            var customPath = assetDir != null
+                ? Path.Combine(assetDir, "Assets", "Unbounded-Bold.ttf")
+                : null;
+            bool haveCustom = customPath != null && File.Exists(customPath);
+
+            string? systemBoldPath = null;
+            var winFonts = Environment.GetFolderPath(Environment.SpecialFolder.Fonts);
+            if (!string.IsNullOrEmpty(winFonts))
+            {
+                foreach (var name in new[] { "seguibl.ttf", "segoeuib.ttf", "ariblk.ttf" })
+                {
+                    var p = Path.Combine(winFonts, name);
+                    if (File.Exists(p)) { systemBoldPath = p; break; }
+                }
+            }
+
+            NumeralFont = PluginInterface.UiBuilder.FontAtlas.NewDelegateFontHandle(e =>
+            {
+                if (haveCustom)
+                {
+                    e.OnPreBuild(tk => tk.AddFontFromFile(
+                        customPath!,
+                        new Dalamud.Interface.ManagedFontAtlas.SafeFontConfig { SizePx = 84f }));
+                }
+                else if (systemBoldPath != null)
+                {
+                    e.OnPreBuild(tk => tk.AddFontFromFile(
+                        systemBoldPath,
+                        new Dalamud.Interface.ManagedFontAtlas.SafeFontConfig { SizePx = 84f }));
+                }
+                else
+                {
+                    e.OnPreBuild(tk => tk.AddDalamudDefaultFont(84f));
+                }
+            });
+            _ = NumeralFont?.WaitAsync();
+            if (!haveCustom && systemBoldPath != null)
+                Log.Information($"Numeral font using system bold fallback: {systemBoldPath}");
+        }
+        catch (Exception ex)
+        {
+            Log.Warning($"Failed to build numeral font: {ex.Message}. Guide chapter numerals will fall back to banner font.");
+            NumeralFont = null;
+        }
+
+        try
+        {
+            // 22px; same fallback chain as NumeralFont
+            var assetDir = PluginInterface.AssemblyLocation.Directory?.FullName;
+            var customPath = assetDir != null
+                ? Path.Combine(assetDir, "Assets", "Unbounded-Bold.ttf")
+                : null;
+            bool haveCustom = customPath != null && File.Exists(customPath);
+
+            string? systemBoldPath = null;
+            var winFonts = Environment.GetFolderPath(Environment.SpecialFolder.Fonts);
+            if (!string.IsNullOrEmpty(winFonts))
+            {
+                foreach (var name in new[] { "seguibl.ttf", "segoeuib.ttf", "ariblk.ttf" })
+                {
+                    var p = Path.Combine(winFonts, name);
+                    if (File.Exists(p)) { systemBoldPath = p; break; }
+                }
+            }
+
+            TitleFont = PluginInterface.UiBuilder.FontAtlas.NewDelegateFontHandle(e =>
+            {
+                if (haveCustom)
+                {
+                    e.OnPreBuild(tk => tk.AddFontFromFile(
+                        customPath!,
+                        new Dalamud.Interface.ManagedFontAtlas.SafeFontConfig { SizePx = 30f }));
+                }
+                else if (systemBoldPath != null)
+                {
+                    e.OnPreBuild(tk => tk.AddFontFromFile(
+                        systemBoldPath,
+                        new Dalamud.Interface.ManagedFontAtlas.SafeFontConfig { SizePx = 30f }));
+                }
+                else
+                {
+                    e.OnPreBuild(tk => tk.AddDalamudDefaultFont(30f));
+                }
+            });
+            _ = TitleFont?.WaitAsync();
+        }
+        catch (Exception ex)
+        {
+            Log.Warning($"Failed to build title font: {ex.Message}. Guide chapter titles will fall back to header font.");
+            TitleFont = null;
         }
 
         // Hook UI drawing
@@ -410,6 +744,39 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.OpenConfigUi += ToggleMainUi;
         PluginInterface.UiBuilder.OpenMainUi += ToggleMainUi;
         Framework.Update += OnFrameworkUpdate;
+
+        // Hook ShellCommandModule.ExecuteCommandInner to intercept native emote commands
+        // for locked emote bypass (allows typing /runwaywalk directly instead of /vanilla runwaywalk)
+        try
+        {
+            unsafe
+            {
+                executeCommandInnerHook = GameInteropProvider.HookFromAddress<ShellCommandModule.Delegates.ExecuteCommandInner>(
+                    ShellCommandModule.MemberFunctionPointers.ExecuteCommandInner,
+                    DetourExecuteCommandInner);
+                executeCommandInnerHook.Enable();
+                Log.Information("ExecuteCommandInner hook enabled for locked emote interception");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warning($"Failed to hook ExecuteCommandInner: {ex.Message} - /vanilla command still works");
+            executeCommandInnerHook = null;
+        }
+
+        // Subscribe to ConditionFlag changes for /loop cancellation
+        Condition.ConditionChange += OnConditionChanged;
+        conditionLoopCancelRegistered = true;
+
+        // Hydrate used-carrier tracking from persisted config so plugin reloads don't rotate back
+        // to carriers the game still has cached from the previous session.
+        foreach (var id in Configuration.UsedBypassCarrierIds)
+            usedCarrierIds.Add(id);
+        if (usedCarrierIds.Count > 0)
+            Log.Information($"[UnlockBypass] Restored {usedCarrierIds.Count} previously-used carrier(s) from config");
+
+        // Check for plugin updates in the background
+        CheckForUpdates();
 
         Log.Information($"Encore loaded. Penumbra available: {PenumbraService?.IsAvailable ?? false}");
     }
@@ -424,11 +791,36 @@ public sealed class Plugin : IDalamudPlugin
 
     public void Dispose()
     {
+        // Stop update check timer
+        updateCheckTimer?.Dispose();
+        updateCheckTimer = null;
+
         // Unhook UI and framework
         Framework.Update -= OnFrameworkUpdate;
         PluginInterface.UiBuilder.Draw -= WindowSystem.Draw;
         PluginInterface.UiBuilder.OpenConfigUi -= ToggleMainUi;
         PluginInterface.UiBuilder.OpenMainUi -= ToggleMainUi;
+
+        HeaderFont?.Dispose();
+        HeaderFont = null;
+        BannerFont?.Dispose();
+        BannerFont = null;
+        NumeralFont?.Dispose();
+        NumeralFont = null;
+        TitleFont?.Dispose();
+        TitleFont = null;
+
+        // Unsubscribe from condition changes
+        if (conditionLoopCancelRegistered)
+        {
+            Condition.ConditionChange -= OnConditionChanged;
+            conditionLoopCancelRegistered = false;
+        }
+
+        // Disable ExecuteCommandInner hook
+        executeCommandInnerHook?.Disable();
+        executeCommandInnerHook?.Dispose();
+        executeCommandInnerHook = null;
 
         // Unsubscribe from Penumbra events
         UnsubscribeFromPenumbraEvents();
@@ -447,6 +839,10 @@ public sealed class Plugin : IDalamudPlugin
         foreach (var cmd in registeredPresetCommands)
         {
             CommandManager.RemoveHandler($"/{cmd}");
+        }
+        foreach (var cmd in registeredRoutineCommands)
+        {
+            try { CommandManager.RemoveHandler($"/{cmd}"); } catch { }
         }
         registeredPresetCommands.Clear();
 
@@ -469,8 +865,12 @@ public sealed class Plugin : IDalamudPlugin
         }
 
         // Dispose services
+        HeelsGizmoOverlay?.Dispose();
         MovementService?.Dispose();
         PoseService?.Dispose();
+        SimpleHeelsService?.Dispose();
+        BgmTrackerService?.Dispose();
+        BgmAnalysisService?.Dispose();
         PenumbraService?.Dispose();
 
         Instance = null;
@@ -556,8 +956,90 @@ public sealed class Plugin : IDalamudPlugin
             return;
         }
 
+        if (args == "bpm" || args == "bpm clear")
+        {
+            var tracker = BgmTrackerService;
+            if (tracker == null)
+            {
+                ChatGui.Print("[Encore] BPM tracking unavailable (sig scan failed).");
+                return;
+            }
+            if (args == "bpm clear")
+            {
+                BgmAnalysisService?.ClearCache();
+                if (!string.IsNullOrEmpty(tracker.ModScdPath))
+                    tracker.SetModScd(tracker.ModScdPath);
+                ChatGui.Print("[Encore] BPM cache cleared. Re-analyzing current track.");
+                return;
+            }
+            var source = !string.IsNullOrEmpty(tracker.ModScdPath)
+                ? $"mod SCD: {tracker.ModScdPath}"
+                : $"BGM row {tracker.CurrentSongId}: {tracker.CurrentScdPath ?? "(none)"}";
+            ChatGui.Print($"[Encore] {source} - BPM: {(tracker.CurrentBpm.HasValue ? tracker.CurrentBpm.Value.ToString("F0") : "analyzing...")}");
+            return;
+        }
+
+        if (args == "random" || args.StartsWith("random "))
+        {
+            var folderQuery = args.Length > 6 ? args.Substring(7).Trim() : "";
+            ExecuteRandomPreset(folderQuery);
+            return;
+        }
+
+        if (args == "stoproutine")
+        {
+            if (activeRoutine != null) CancelRoutine(reason: "manual");
+            return;
+        }
+
         // Default: toggle main window
         MainWindow.Toggle();
+    }
+
+    private readonly Random randomGenerator = new();
+
+    private void ExecuteRandomPreset(string folderQuery)
+    {
+        // Filter presets by folder if a query was given
+        if (!string.IsNullOrEmpty(folderQuery))
+        {
+            // Fuzzy folder-name match: exact (case-insensitive) first, then prefix, then contains
+            var folder = Configuration.Folders.FirstOrDefault(f =>
+                string.Equals(f.Name, folderQuery, StringComparison.OrdinalIgnoreCase))
+                ?? Configuration.Folders.FirstOrDefault(f =>
+                    f.Name.StartsWith(folderQuery, StringComparison.OrdinalIgnoreCase))
+                ?? Configuration.Folders.FirstOrDefault(f =>
+                    f.Name.Contains(folderQuery, StringComparison.OrdinalIgnoreCase));
+
+            if (folder == null)
+            {
+                Log.Warning($"[Random] No folder matching \"{folderQuery}\".");
+                return;
+            }
+
+            ExecuteRandomFromFolder(folder.Id);
+            return;
+        }
+
+        ExecuteRandomFromFolder(null);
+    }
+
+    public void ExecuteRandomFromFolder(string? folderId)
+    {
+        var candidates = folderId == null
+            ? Configuration.Presets
+            : Configuration.Presets.Where(p => p.FolderId == folderId).ToList();
+
+        var list = candidates.ToList();
+        if (list.Count == 0)
+        {
+            Log.Warning("[Random] No presets to pick from.");
+            return;
+        }
+
+        var pick = list[randomGenerator.Next(list.Count)];
+        Log.Information($"[Random] Picked: {pick.Name}");
+        ExecutePreset(pick);
     }
 
     private void OnResetCommand(string command, string args)
@@ -604,6 +1086,7 @@ public sealed class Plugin : IDalamudPlugin
                 loopingEmoteId = 0;
                 emoteTimeline = 0;
                 loopWaitingForStart = true;
+                loopPreviousWeaponDrawn = ReadIsWeaponDrawn();
 
                 // Wait for Penumbra to process the temp mod before executing
                 Task.Run(async () =>
@@ -614,7 +1097,7 @@ public sealed class Plugin : IDalamudPlugin
 
                 return;
             }
-            // Bypass failed — fall through to normal (will fail silently via game rejection)
+            // Bypass failed - fall through to normal (will fail silently via game rejection)
         }
 
         // Start looping (normal unlocked emote path)
@@ -624,6 +1107,7 @@ public sealed class Plugin : IDalamudPlugin
         loopingEmoteId = 0;
         emoteTimeline = 0;
         loopWaitingForStart = true;
+        loopPreviousWeaponDrawn = ReadIsWeaponDrawn();
         ExecuteEmote(emote);
     }
 
@@ -644,7 +1128,7 @@ public sealed class Plugin : IDalamudPlugin
         if (!emote.StartsWith("/"))
             emote = "/" + emote;
 
-        // Resolve FFXIV aliases (e.g., /dance5 → /balldance) so mod matching works
+        // Resolve FFXIV aliases (e.g., /dance5 -> /balldance) so mod matching works
         var lookupKey = emote.TrimStart('/').ToLowerInvariant();
         if (Services.EmoteDetectionService.EmoteToCommand.TryGetValue(lookupKey, out var canonical))
         {
@@ -699,7 +1183,7 @@ public sealed class Plugin : IDalamudPlugin
                 Configuration.ActivePresetId = null;
                 Configuration.ActivePresetCollectionId = collectionId.ToString();
 
-                // Execute the emote — set up bypass first if needed, then execute carrier
+                // Execute the emote - set up bypass first if needed, then execute carrier
                 var emoteCmd = emoteCommand; // Capture for closure
                 string? bypassCommand = null;
                 ushort bypassCarrierId = 0;
@@ -720,30 +1204,29 @@ public sealed class Plugin : IDalamudPlugin
                 });
 
                 // Wait for Penumbra to process the temp mod / real mod before executing.
-                // Wait for Penumbra's CollectionCache to update before executing.
                 if (bypassCommand != null)
                     await Task.Delay(150);
 
                 // Execute the carrier (bypassed) or original emote
                 await Framework.RunOnFrameworkThread(() =>
                 {
+                    FaceTarget();
+
                     if (bypassCommand != null)
                     {
                         ExecuteEmoteDirect(bypassCommand);
-
-                        // Enable one-shot auto-cleanup for non-looping emotes
-                        if (!bypassTargetIsLoop)
-                        {
-                            emoteSwapIsOneShot = true;
-                            emoteSwapCarrierId = bypassCarrierId;
-                            emoteSwapWaitingForStart = true;
-                        }
+                        // Swap stays active after emote for sync - cleanup via carrier command detection
+                        // in DetourExecuteCommandInner, or next preset/vanilla/reset
                     }
                     else
                     {
                         ExecuteEmote(emoteCmd);
                     }
                 });
+
+                // delay during bypass: RemoveTemporaryModSettings disrupts in-flight TMB/PAP loads
+                if (bypassCommand != null && previousModsWithTemp.Count > 0)
+                    await Task.Delay(500);
 
                 // Restore previous preset's temp settings (empty modDirectory = nothing skipped)
                 if (previousModsWithTemp.Count > 0)
@@ -795,7 +1278,7 @@ public sealed class Plugin : IDalamudPlugin
             if (!modCommands.Contains(targetCmd) && !modEmotes.Contains(targetCmd))
                 continue;
 
-            // Check permanent state — skip mods that are already permanently disabled
+            // Check permanent state - skip mods that are already permanently disabled
             var (gotSettings, isEnabled, _, _) = PenumbraService.GetCurrentModSettings(collectionId, mod.ModDirectory, mod.ModName);
             if (!gotSettings || !isEnabled)
                 continue;
@@ -888,6 +1371,9 @@ public sealed class Plugin : IDalamudPlugin
                 Log.Warning($"Failed to register command /{cmd}: {ex.Message}");
             }
         }
+
+        // routines registered after presets for conflict skipping
+        UpdateRoutineCommands();
     }
 
     private void OnPresetCommand(string presetId, string args)
@@ -911,9 +1397,9 @@ public sealed class Plugin : IDalamudPlugin
     }
 
     /// <summary>
-    /// Execute a dance preset — adjust priorities, disable conflicts, and perform the emote/pose action.
+    /// Execute a dance preset - adjust priorities, disable conflicts, and perform the emote/pose action.
     /// </summary>
-    public void ExecutePreset(DancePreset preset, PresetModifier? modifier = null)
+    public void ExecutePreset(DancePreset preset, PresetModifier? modifier = null, bool forceBypass = false)
     {
         if (PenumbraService == null || !PenumbraService.IsAvailable)
         {
@@ -930,6 +1416,10 @@ public sealed class Plugin : IDalamudPlugin
             }
             // Vanilla preset - continue to conflict disabling
         }
+
+        // If a routine is running and this execution didn't come from the routine itself, cancel it
+        if (activeRoutine != null && !isAdvancingRoutine)
+            CancelRoutine(reason: "preset played");
 
         // Prevent overlapping executions
         if (isExecutingPreset)
@@ -958,8 +1448,23 @@ public sealed class Plugin : IDalamudPlugin
             : null;
         var wasMovementPreset = previousPreset?.AnimationType == 6;
 
+        // same-base-emote between different presets: force bypass (carrier emote retriggers animation)
+        if (!forceBypass && !isAlreadyActive && !preset.IsVanilla && !preset.EmoteLocked &&
+            previousPreset != null && previousPreset.Id != preset.Id &&
+            !string.IsNullOrWhiteSpace(previousPreset.EmoteCommand) &&
+            !string.IsNullOrWhiteSpace(preset.EmoteCommand) &&
+            string.Equals(previousPreset.EmoteCommand, preset.EmoteCommand, StringComparison.OrdinalIgnoreCase) &&
+            preset.AnimationType == 1)  // emote type only - poses handle this differently
+        {
+            Log.Debug($"[ExecutePreset] Same-base-emote transition ('{preset.EmoteCommand}') - forcing bypass");
+            forceBypass = true;
+        }
+
         // Snapshot which mods have active temp settings (from previous preset)
         var previousModsWithTemp = new HashSet<string>(Configuration.ModsWithTempSettings);
+
+        // snapshot before Task.Run; isAdvancingRoutine resets synchronously in BeginRoutineStep's finally
+        var runningAsRoutineStep = isAdvancingRoutine;
 
         isExecutingPreset = true;
 
@@ -979,30 +1484,35 @@ public sealed class Plugin : IDalamudPlugin
                     {
                         ApplyTempSettingsForPresetMod(collectionId, preset, modifier);
                     }
+                    TryWireModMusicForBpm(preset, modifier);
                 }
                 else
                 {
-                    // Apply new preset first (fast path)
                     newModsWithTemp = await ApplyPresetPriorities(preset, collectionId, modifier);
 
-                    // Track this as the active preset in this collection
                     Configuration.ActivePresetId = preset.Id;
                     Configuration.ActivePresetCollectionId = collectionId.ToString();
+                    // emote-end detection only for AnimationType 1; poses/movement stay sticky
+                    activePresetEmoteId = 0;
+                    activePresetEmoteSeen = preset.AnimationType != 1;
+                    ArmPresetEmoteIgnore(preset);
+                    // mod-bundled music: BPM tracker locks to that track
+                    // instead of the ambient game BGM.
+                    TryWireModMusicForBpm(preset, modifier);
                 }
 
-                // Determine effective emote command, animation type, and pose index
-                // (modifier can override emote + pose, which changes the execution path)
+                        Framework.RunOnFrameworkThread(() => ApplyPresetHeels(preset));
+
                 var effectiveEmoteCommand = preset.EmoteCommand;
                 var effectiveAnimationType = preset.AnimationType;
                 var effectivePoseIndex = preset.PoseIndex;
                 if (modifier != null)
                 {
-                    // Emote command override changes the execution path
                     if (modifier.EmoteCommandOverride != null)
                     {
                         effectiveEmoteCommand = modifier.EmoteCommandOverride;
                         var cmdAnimType = GetAnimationTypeForCommand(modifier.EmoteCommandOverride);
-                        if (cmdAnimType != 1) // Not a regular emote — it's a pose command
+                        if (cmdAnimType != 1)
                         {
                             effectiveAnimationType = cmdAnimType;
                             effectivePoseIndex = modifier.PoseIndexOverride ?? -1;
@@ -1019,24 +1529,28 @@ public sealed class Plugin : IDalamudPlugin
                     }
                 }
 
-                // Execute emote/pose action (immediate - don't wait)
-                // Movement presets always need redraw even if ExecuteEmote is false (legacy presets)
+                // Track whether EmoteLocked bypass was used (delay restore to avoid animation stutter)
+                var bypassUsed = false;
+
+                // movement presets always redraw even if ExecuteEmote=false
                 if (preset.ExecuteEmote || preset.AnimationType == 6)
                 {
-                    var emoteCmd = effectiveEmoteCommand; // Capture for closure
+                    var emoteCmd = effectiveEmoteCommand;
                     var animType = effectiveAnimationType;
                     var poseIdx = effectivePoseIndex;
                     var hasModifier = modifier != null;
-                    var presetHasModifiers = preset.Modifiers.Count > 0; // Preset supports variants — may need redraw even without modifier (returning to base)
-                    var baseEmoteCmd = preset.EmoteCommand; // For detecting same-emote modifier switches
+                    var presetHasModifiers = preset.Modifiers.Count > 0;
+                    var baseEmoteCmd = preset.EmoteCommand;
 
-                    // EmoteLocked bypass: for locked emote presets, use carrier emote to play the mod's animation.
-                    // This is async (needs 150ms delay for Penumbra) so it gets its own execution path.
-                    if (preset.EmoteLocked && animType == 1 && !preset.IsVanilla)
+                    // forceBypass: same-base-emote routine transitions reuse this pipeline
+                    if ((preset.EmoteLocked || forceBypass) && animType == 1 && !preset.IsVanilla)
                     {
                         string? bypassCommand = null;
                         ushort bypassCarrierId = 0;
                         bool bypassTargetIsLoop = false;
+
+                        // Penumbra IPC returns sync but its mod-resolution cache updates next tick
+                        await Task.Delay(300);
 
                         // Phase 1: Clear state, set up bypass on framework thread
                         await Framework.RunOnFrameworkThread(() =>
@@ -1054,26 +1568,54 @@ public sealed class Plugin : IDalamudPlugin
 
                         if (bypassCommand != null)
                         {
-                            // Wait for Penumbra to process the real mod before executing.
-                            // Wait for Penumbra's CollectionCache to update before executing.
+                            // wait for Penumbra to process the mod
                             await Task.Delay(150);
 
                             await Framework.RunOnFrameworkThread(() =>
                             {
+                                FaceTarget();
                                 ExecuteEmoteDirect(bypassCommand);
 
-                                // Enable one-shot auto-cleanup for non-looping emotes
-                                if (!bypassTargetIsLoop)
-                                {
-                                    emoteSwapIsOneShot = true;
-                                    emoteSwapCarrierId = bypassCarrierId;
-                                    emoteSwapWaitingForStart = true;
-                                }
+                                // swap stays active for sync; cleared via carrier-command detection
+                                // in DetourExecuteCommandInner, or next preset/vanilla/reset
                             });
+
+                            // chat pipeline silently drops emotes near hold-loop re-fires; retry once at 250ms, give up at 1000ms
+                            var capturedCarrierId = bypassCarrierId;
+                            var capturedCarrierCmd = bypassCommand;
+                            _ = Task.Run(async () =>
+                            {
+                                await Task.Delay(250);
+                                bool retried = false;
+                                await Framework.RunOnFrameworkThread(() =>
+                                {
+                                    var id = ReadCurrentEmoteId();
+                                    var tl = ReadBaseTimeline();
+                                    Log.Information($"[BypassCheck] 250ms post-carrier: EmoteId={id} (expected={capturedCarrierId}) TimelineSlot0={tl}");
+                                    if (id != capturedCarrierId && !string.IsNullOrEmpty(capturedCarrierCmd))
+                                    {
+                                        Log.Information($"[BypassCheck] Carrier didn't take - retrying once");
+                                        ExecuteEmoteDirect(capturedCarrierCmd!);
+                                        retried = true;
+                                    }
+                                });
+                                await Task.Delay(750);
+                                await Framework.RunOnFrameworkThread(() =>
+                                {
+                                    var id = ReadCurrentEmoteId();
+                                    var tl = ReadBaseTimeline();
+                                    Log.Information($"[BypassCheck] 1000ms post-carrier: EmoteId={id} (expected={capturedCarrierId}) TimelineSlot0={tl}{(retried ? " (after retry)" : "")}");
+                                });
+                            });
+
+                            // Wait for animation system to fully load TMB/PAP before restoring previous mods.
+                            // RemoveTemporaryModSettings changes Penumbra's ChangeCounter which can disrupt
+                            // in-flight animation resource loading and cause a visible stutter.
+                            bypassUsed = true;
                         }
                         else
                         {
-                            // Bypass failed — fall back to normal emote execution (will likely fail for locked emotes)
+                            // Bypass failed - fall back to normal emote execution (will likely fail for locked emotes)
                             Log.Warning($"[EmoteLocked] Bypass failed for '{emoteCmd}', falling back to normal execution");
                             await Framework.RunOnFrameworkThread(() =>
                             {
@@ -1089,7 +1631,7 @@ public sealed class Plugin : IDalamudPlugin
                         {
                             loopingEmoteCommand = null; // Clear any active loop
 
-                            // Switching away from a movement preset — redraw to reload original walk/run animations
+                            // Switching away from a movement preset - redraw to reload original walk/run animations
                             // (skip for types that already redraw: StandingIdle=2 and Movement=6)
                             if (wasMovementPreset && !isAlreadyActive && animType != 2 && animType != 6)
                             {
@@ -1129,15 +1671,15 @@ public sealed class Plugin : IDalamudPlugin
 
                                     if (isAlreadyActive && isCurrentlyPosed && PoseService != null && poseIdx >= 0)
                                     {
-                                        // Already in pose state — don't re-execute sit/groundsit/doze (would toggle out)
+                                        // Already in pose state - don't re-execute sit/groundsit/doze (would toggle out)
                                         if (presetHasModifiers)
-                                            ExecuteRedraw(); // Swap mod files (modifier→base or base→modifier)
+                                            ExecuteRedraw(); // Swap mod files (modifier->base or base->modifier)
                                         // Don't SetPoseIndex first (corrupts CPoseState, making cycling think it's already there)
                                         PoseService.CycleCPoseToIndex((byte)poseIdx);
                                     }
                                     else
                                     {
-                                        // Not yet in pose state — do full execution
+                                        // Not yet in pose state - do full execution
                                         var poseType = animType switch
                                         {
                                             3 => EmoteController.PoseType.Sit,
@@ -1170,13 +1712,18 @@ public sealed class Plugin : IDalamudPlugin
                                 }
                                     break;
 
-                                case 6: // Movement — just redraw to apply new walk/run animations
+                                case 6: // Movement - redraw to apply new walk/run animations; optionally execute an emote too
                                     ExecuteRedraw();
+                                    if (!string.IsNullOrEmpty(emoteCmd))
+                                    {
+                                        FaceTarget();
+                                        ExecuteEmote(emoteCmd);
+                                    }
                                     break;
 
                                 default: // AnimationType 1 (Emote) or unknown
-                                    // Modifier with same emote + still in emote mode → redraw only (seamless option swap mid-dance)
-                                    // Modifier with different emote, or stopped, or no modifier → execute emote
+                                    // Modifier with same emote + still in emote mode -> redraw only (seamless option swap mid-dance)
+                                    // Modifier with different emote, or stopped, or no modifier -> execute emote
                                     var isInEmoteMode = false;
                                     if (isAlreadyActive && hasModifier &&
                                         string.Equals(emoteCmd, baseEmoteCmd, StringComparison.OrdinalIgnoreCase))
@@ -1194,18 +1741,31 @@ public sealed class Plugin : IDalamudPlugin
                                     if (isInEmoteMode)
                                         ExecuteRedraw();
                                     else if (!string.IsNullOrEmpty(emoteCmd))
+                                    {
+                                        FaceTarget();
                                         ExecuteEmote(emoteCmd);
+                                    }
                                     break;
                             }
                         });
                     }
                 }
 
-                // Restore previous preset's temp settings in background (after emote starts)
-                if (!isAlreadyActive && previousModsWithTemp.Count > 0)
+                // When bypass was used, wait for animation to fully load before restoring previous mods.
+                // RemoveTemporaryModSettings changes Penumbra's ChangeCounter which can disrupt
+                // in-flight animation resource loading and cause a visible stutter.
+                if (bypassUsed && !isAlreadyActive && previousModsWithTemp.Count > 0)
+                    await Task.Delay(500);
+
+                // skip mid-routine: bulk-applied mods must stay enabled for later steps
+                if (!isAlreadyActive && previousModsWithTemp.Count > 0 && !runningAsRoutineStep)
                 {
                     Log.Debug("Restoring previous preset changes in background...");
                     await RestorePreviousChanges(collectionId, previousModsWithTemp, preset.ModDirectory, newModsWithTemp);
+                }
+                else if (runningAsRoutineStep)
+                {
+                    Log.Debug("[Routine] Skipping RestorePreviousChanges - preserving bulk-applied routine mods");
                 }
 
                 // Save config AFTER both apply and restore are complete
@@ -1228,6 +1788,669 @@ public sealed class Plugin : IDalamudPlugin
                 isExecutingPreset = false;
             }
         });
+    }
+
+    // ========== Routines ==========
+
+    public void ExecuteRoutine(Routine routine)
+    {
+        if (routine.Steps.Count == 0)
+        {
+            Log.Warning($"Routine '{routine.Name}' has no steps.");
+            return;
+        }
+
+        // Cancel any running routine (the new one replaces it)
+        if (activeRoutine != null)
+            CancelRoutine(reason: "new routine", announce: false);
+
+        activeRoutine = routine;
+        routineCts = new System.Threading.CancellationTokenSource();
+        activeRoutineStepIndex = -1;   // BeginStep increments to 0
+        routineMovementBaselineSet = false;
+        routineBulkAppliedPresetIds.Clear();
+
+        Log.Information($"[Routine] Started: {routine.Name}");
+
+        // Bulk-apply non-conflicting preset priorities upfront so step transitions only need to
+        // fire an emote (no Penumbra churn mid-routine). A preset is "non-conflicting" when it's
+        // the only mod in the routine that targets its EmoteCommand.
+        BulkApplyRoutinePriorities(routine);
+
+        BeginRoutineStep();
+    }
+
+    private void BulkApplyRoutinePriorities(Routine routine)
+    {
+        if (PenumbraService == null || !PenumbraService.IsAvailable) return;
+
+        var (ok, collectionId, _) = PenumbraService.GetCurrentCollection();
+        if (!ok) return;
+
+        // Gather all non-vanilla, non-macro preset steps with valid mods
+        var presetSteps = routine.Steps
+            .Where(s => !s.IsMacroStep)
+            .Select(s => Configuration.Presets.Find(p => p.Id == s.PresetId))
+            .Where(p => p != null && !p.IsVanilla && !string.IsNullOrWhiteSpace(p.ModDirectory))
+            .Select(p => p!)
+            .ToList();
+
+        // Group by EmoteCommand - presets with UNIQUE emotes within the routine are safe to bulk-apply.
+        // Presets sharing an emote with others stay per-step so dynamic priority swaps and bypass can handle them.
+        var byEmote = presetSteps
+            .GroupBy(p => (p.EmoteCommand ?? "").ToLowerInvariant())
+            .ToList();
+
+        var toBulkApply = new List<DancePreset>();
+        foreach (var group in byEmote)
+        {
+            var distinctMods = group.Select(p => p.ModDirectory).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+            if (distinctMods == 1)
+            {
+                // All steps using this emote use the same mod - one preset's state suffices
+                toBulkApply.Add(group.First());
+            }
+            // If >1 distinct mods share the emote, fall back to per-step execution (handles priority swap / bypass)
+        }
+
+        if (toBulkApply.Count == 0) return;
+
+        Log.Information($"[Routine] Bulk-applying {toBulkApply.Count} non-conflicting preset(s) at routine start");
+
+        // add to routineBulkAppliedPresetIds only after apply completes
+        // (early add would let step 0 fire before Penumbra knows the new priorities)
+        // ApplyPresetPriorities already calls DisableConflictingMods internally
+        var routineSnapshot = activeRoutine;
+        Task.Run(async () =>
+        {
+            try
+            {
+                foreach (var preset in toBulkApply)
+                {
+                    if (activeRoutine != routineSnapshot) return;
+                    await ApplyPresetPriorities(preset, collectionId);
+                    routineBulkAppliedPresetIds.Add(preset.Id);
+                }
+            }
+            catch (Exception ex) { Log.Debug($"[Routine] Bulk-apply error: {ex.Message}"); }
+        });
+    }
+
+    private void BeginRoutineStep()
+    {
+        if (activeRoutine == null) return;
+
+        var prevStepIndex = activeRoutineStepIndex;
+        var prevStep = prevStepIndex >= 0 && prevStepIndex < activeRoutine.Steps.Count
+            ? activeRoutine.Steps[prevStepIndex] : null;
+        var prevHadExpression = prevStep != null && !string.IsNullOrWhiteSpace(prevStep.LayeredEmote);
+        string? prevEmoteCommand = null;
+        if (prevStep != null && !prevStep.IsMacroStep)
+        {
+            var prevPreset = Configuration.Presets.Find(p => p.Id == prevStep.PresetId);
+            if (prevPreset != null)
+            {
+                var prevModifier = !string.IsNullOrWhiteSpace(prevStep.ModifierName)
+                    ? prevPreset.Modifiers.FirstOrDefault(m => string.Equals(m.Name, prevStep.ModifierName, StringComparison.OrdinalIgnoreCase))
+                    : null;
+                prevEmoteCommand = prevModifier?.EmoteCommandOverride ?? prevPreset.EmoteCommand;
+            }
+        }
+
+        activeRoutineStepIndex++;
+        if (activeRoutineStepIndex >= activeRoutine.Steps.Count)
+        {
+            if (activeRoutine.RepeatLoop)
+            {
+                activeRoutineStepIndex = 0;
+            }
+            else
+            {
+                Log.Information($"[Routine] Finished: {activeRoutine.Name}");
+                var finishedHadExpression = activeRoutine.Steps.Any(s => !string.IsNullOrWhiteSpace(s.LayeredEmote));
+                activeRoutine = null;
+                Task.Run(async () =>
+                {
+                    try
+                    {
+                        await Task.Delay(150);
+                        if (finishedHadExpression)
+                            await Framework.RunOnFrameworkThread(() => ExecuteEmoteDirect("/straightface"));
+                        await Task.Delay(350);
+                        await Framework.RunOnFrameworkThread(() => StopActiveEmoteAnimation());
+                    }
+                    catch (Exception ex) { Log.Debug($"[Routine] Finish cleanup error: {ex.Message}"); }
+                });
+                return;
+            }
+        }
+
+        var step = activeRoutine.Steps[activeRoutineStepIndex];
+        DancePreset? preset = null;
+        if (!step.IsMacroStep)
+        {
+            preset = Configuration.Presets.Find(p => p.Id == step.PresetId);
+            if (preset == null)
+            {
+                Log.Warning($"[Routine] Step {activeRoutineStepIndex} references missing preset - skipping");
+                BeginRoutineStep();
+                return;
+            }
+        }
+
+        // /straightface clears leftover expression; skip on same-base-emote (interferes with bypass handoff)
+        var willUseBypass = !step.IsMacroStep && preset != null &&
+                            !string.IsNullOrWhiteSpace(prevEmoteCommand) &&
+                            !string.IsNullOrWhiteSpace(preset.EmoteCommand) &&
+                            string.Equals(prevEmoteCommand, preset.EmoteCommand, StringComparison.OrdinalIgnoreCase);
+        if (prevHadExpression && string.IsNullOrWhiteSpace(step.LayeredEmote) && !willUseBypass)
+        {
+            Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(150);
+                    await Framework.RunOnFrameworkThread(() => ExecuteEmoteDirect("/straightface"));
+                }
+                catch (Exception ex) { Log.Debug($"[Routine] /straightface clear error: {ex.Message}"); }
+            });
+        }
+
+        activeRoutineStepStartedUtc = DateTime.UtcNow;
+        routineStepEmoteId = 0;
+        routineWaitingForEmoteStart = true;
+        routineMacroCompleted = false;
+
+        // Apply Simple Heels for this step. Per-step override (HeelsOverride) wins; otherwise falls
+        // back to the preset's own offset. Cleared if neither. Macro steps get cleared too since there's
+        // no preset to source from unless the step itself specifies an override.
+        if (step.IsMacroStep)
+        {
+            if (SimpleHeelsService != null && SimpleHeelsService.IsAvailable)
+            {
+                var h = step.HeelsOverride;
+                if (h != null && !h.IsZero())
+                    SimpleHeelsService.ApplyOffset(h.X, h.Y, h.Z, h.Rotation, h.Pitch, h.Roll);
+                else
+                    SimpleHeelsService.ClearOffset();
+            }
+        }
+        else if (preset != null)
+        {
+            ApplyPresetHeels(preset, step.HeelsOverride);
+        }
+
+        if (step.IsMacroStep)
+        {
+            // Run the macro text in the background, line-by-line, honoring /wait <seconds>.
+            // Cancellation tied to the routine CTS so step transitions stop in-flight macros.
+            var macroText = step.MacroText;
+            var routineSnapshotM = activeRoutine;
+            var stepSnapshotM = activeRoutineStepIndex;
+            var ctM = routineCts?.Token ?? System.Threading.CancellationToken.None;
+            Task.Run(async () =>
+            {
+                try { await RunMacroAsync(macroText, routineSnapshotM, stepSnapshotM, ctM); }
+                catch (TaskCanceledException) { /* normal */ }
+                catch (Exception ex) { Log.Debug($"[Routine] Macro error: {ex.Message}"); }
+            });
+        }
+        else
+        {
+            // Resolve optional step modifier - overrides the preset's default emote/options.
+            PresetModifier? stepModifier = null;
+            if (!string.IsNullOrWhiteSpace(step.ModifierName))
+            {
+                stepModifier = preset!.Modifiers.FirstOrDefault(m =>
+                    string.Equals(m.Name, step.ModifierName, StringComparison.OrdinalIgnoreCase));
+                if (stepModifier == null)
+                    Log.Warning($"[Routine] Step {activeRoutineStepIndex} references modifier '{step.ModifierName}' not found on preset '{preset.Name}'");
+            }
+
+            // Effective emote command accounts for modifier override when picking the transition path.
+            var effectiveStepEmote = stepModifier?.EmoteCommandOverride ?? preset!.EmoteCommand;
+
+            // If the previous step shared this preset's base emote, clear the emote state first so
+            // the game re-triggers the animation with the new mod (otherwise it won't reload anim).
+            var sameBaseEmote = !string.IsNullOrWhiteSpace(prevEmoteCommand) &&
+                                !string.IsNullOrWhiteSpace(effectiveStepEmote) &&
+                                string.Equals(prevEmoteCommand, effectiveStepEmote, StringComparison.OrdinalIgnoreCase);
+            Log.Information($"[Routine] step {activeRoutineStepIndex} transition: prevEmoteCmd='{prevEmoteCommand}' newEmoteCmd='{effectiveStepEmote}' sameBaseEmote={sameBaseEmote} modifier='{stepModifier?.Name ?? "(none)"}'");
+
+            // fast path requires: bulk-applied + no shared emote with prev + no modifier + not locked
+            bool presetEmoteIsLocked = false;
+            if (preset != null && preset.AnimationType == 1 && !preset.IsVanilla
+                && !string.IsNullOrWhiteSpace(preset.EmoteCommand)
+                && emoteCommandToId != null
+                && emoteCommandToId.TryGetValue(preset.EmoteCommand, out var _presetEmoteIdForLockCheck))
+            {
+                try { presetEmoteIsLocked = !IsEmoteUnlocked(_presetEmoteIdForLockCheck); }
+                catch { presetEmoteIsLocked = false; }
+            }
+            var requiresBypass = preset != null && (preset.EmoteLocked || presetEmoteIsLocked);
+
+            var bulkFastPath = routineBulkAppliedPresetIds.Contains(preset!.Id)
+                               && !sameBaseEmote
+                               && stepModifier == null
+                               && !requiresBypass;
+
+            if (bulkFastPath)
+            {
+                var fastEmote = preset.EmoteCommand;
+                if (!string.IsNullOrWhiteSpace(fastEmote))
+                {
+                    Framework.RunOnFrameworkThread(() =>
+                    {
+                        FaceTarget();
+                        ExecuteEmote(fastEmote);
+                    });
+                }
+                Configuration.ActivePresetId = preset.Id;
+                activePresetEmoteId = 0;
+                activePresetEmoteSeen = preset.AnimationType != 1;
+                ArmPresetEmoteIgnore(preset);
+            }
+            else if (sameBaseEmote)
+            {
+                // Reuse the emote-bypass pipeline. Before firing the bypass we give the game ~1.5s
+                // to settle from the previous step's hold-loop emote activity - the game's emote
+                // input pipeline drops rapid consecutive commands, which silently rejects the carrier.
+                var presetSnapshot = preset!;
+                var modifierSnapshot = stepModifier;
+                var routineSnapshotE = activeRoutine;
+                var stepSnapshotE = activeRoutineStepIndex;
+                var ctE = routineCts?.Token ?? System.Threading.CancellationToken.None;
+                Task.Run(async () =>
+                {
+                    try
+                    {
+                        await Task.Delay(1500, ctE);
+                        if (ctE.IsCancellationRequested ||
+                            activeRoutine != routineSnapshotE || activeRoutineStepIndex != stepSnapshotE) return;
+                        await Framework.RunOnFrameworkThread(() =>
+                        {
+                            isAdvancingRoutine = true;
+                            try { ExecutePreset(presetSnapshot, modifierSnapshot, forceBypass: true); }
+                            finally { isAdvancingRoutine = false; }
+                        });
+                    }
+                    catch (TaskCanceledException) { /* normal */ }
+                    catch (Exception ex) { Log.Debug($"[Routine] Same-emote transition error: {ex.Message}"); }
+                });
+            }
+            else
+            {
+                isAdvancingRoutine = true;
+                try { ExecutePreset(preset!, stepModifier, forceBypass: requiresBypass); }
+                finally { isAdvancingRoutine = false; }
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(step.LayeredEmote))
+        {
+            var expression = step.LayeredEmote.StartsWith("/") ? step.LayeredEmote : "/" + step.LayeredEmote;
+            var hold = step.HoldExpression;
+            // 1.5s minimum hold delay so dance establishes before expression fires
+            var initialDelay = hold ? Math.Max(step.LayerDelaySeconds, 1.5f) : Math.Max(0f, step.LayerDelaySeconds);
+            var presetEmote = preset?.EmoteCommand ?? "";
+            var routineSnapshot = activeRoutine;
+            var stepSnapshot = activeRoutineStepIndex;
+            var ct = routineCts?.Token ?? System.Threading.CancellationToken.None;
+            const float HoldRefireIntervalSeconds = 4f;
+            const int RestoreDelayMs = 200;
+            Task.Run(async () =>
+            {
+                try
+                {
+                    if (initialDelay > 0)
+                        await Task.Delay(TimeSpan.FromSeconds(initialDelay), ct);
+                    if (ct.IsCancellationRequested ||
+                        activeRoutine != routineSnapshot || activeRoutineStepIndex != stepSnapshot)
+                        return;
+
+                    await Framework.RunOnFrameworkThread(() => ExecuteEmote(expression));
+
+                    if (!hold) return;
+
+                    if (!string.IsNullOrWhiteSpace(presetEmote))
+                    {
+                        await Task.Delay(RestoreDelayMs, ct);
+                        if (ct.IsCancellationRequested ||
+                            activeRoutine != routineSnapshot || activeRoutineStepIndex != stepSnapshot)
+                            return;
+                        await Framework.RunOnFrameworkThread(() => ExecuteEmote(presetEmote));
+                    }
+
+                    while (!ct.IsCancellationRequested &&
+                           activeRoutine == routineSnapshot && activeRoutineStepIndex == stepSnapshot)
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(HoldRefireIntervalSeconds), ct);
+                        if (ct.IsCancellationRequested ||
+                            activeRoutine != routineSnapshot || activeRoutineStepIndex != stepSnapshot) break;
+                        Log.Debug($"[Routine] hold re-fire: expression={expression}");
+                        await Framework.RunOnFrameworkThread(() => ExecuteEmote(expression));
+
+                        if (!string.IsNullOrWhiteSpace(presetEmote))
+                        {
+                            await Task.Delay(RestoreDelayMs, ct);
+                            if (ct.IsCancellationRequested ||
+                                activeRoutine != routineSnapshot || activeRoutineStepIndex != stepSnapshot) break;
+                            await Framework.RunOnFrameworkThread(() => ExecuteEmote(presetEmote));
+                        }
+                    }
+                    Log.Debug($"[Routine] hold loop exited: ct.cancelled={ct.IsCancellationRequested} routineMatch={activeRoutine == routineSnapshot} stepMatch={activeRoutineStepIndex == stepSnapshot}");
+                }
+                catch (TaskCanceledException) { /* normal: routine cancelled */ }
+                catch (Exception ex)
+                {
+                    Log.Debug($"[Routine] Expression schedule error: {ex.Message}");
+                }
+            });
+        }
+    }
+
+    // /wait N pauses for N seconds; sets routineMacroCompleted=true on natural finish
+    private async Task RunMacroAsync(string macroText, Routine routineSnapshot, int stepSnapshot,
+                                     System.Threading.CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(macroText))
+        {
+            // Empty macro = "instantly done" so Until-macro-ends still advances
+            routineMacroCompleted = true;
+            return;
+        }
+
+        var lines = macroText.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+        foreach (var rawLine in lines)
+        {
+            if (ct.IsCancellationRequested) return;
+            if (activeRoutine != routineSnapshot || activeRoutineStepIndex != stepSnapshot) return;
+
+            var line = rawLine.Trim();
+            if (line.Length == 0) continue;
+
+            if (line.StartsWith("/wait", StringComparison.OrdinalIgnoreCase))
+            {
+                var parts = line.Split(new[] { ' ', '\t' }, 2, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length >= 2 &&
+                    float.TryParse(parts[1], System.Globalization.NumberStyles.Float,
+                                   System.Globalization.CultureInfo.InvariantCulture, out var waitSecs) &&
+                    waitSecs > 0)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(waitSecs), ct);
+                }
+                continue;
+            }
+
+            await Framework.RunOnFrameworkThread(() => ExecuteEmote(line));
+            await Task.Delay(50, ct);
+        }
+
+        // Natural completion - only signal if we're still on this step (don't fire after a transition)
+        if (activeRoutine == routineSnapshot && activeRoutineStepIndex == stepSnapshot)
+        {
+            routineMacroCompletedAt = DateTime.UtcNow;
+            routineMacroCompleted = true;
+        }
+    }
+
+    public string? ActiveRoutineName => activeRoutine?.Name;
+    public bool IsRoutineActive(string routineId) => activeRoutine?.Id == routineId;
+    /// <summary>0-based step index currently executing, or -1 when no active routine.</summary>
+    public int ActiveRoutineStepIndex => activeRoutine != null ? activeRoutineStepIndex : -1;
+    /// <summary>Total steps in the active routine, or 0 when none.</summary>
+    public int ActiveRoutineStepCount => activeRoutine?.Steps.Count ?? 0;
+
+    public void CancelRoutine(string reason = "", bool announce = true)
+    {
+        if (activeRoutine == null) return;
+        var name = activeRoutine.Name;
+        // If any step had a layered expression, clear the face on stop with /straightface
+        var hadExpression = activeRoutine.Steps.Any(s => !string.IsNullOrWhiteSpace(s.LayeredEmote));
+
+        activeRoutine = null;
+        activeRoutineStepIndex = 0;
+        routineStepEmoteId = 0;
+        routineWaitingForEmoteStart = false;
+        routineMovementBaselineSet = false;
+        // Cancel any pending expression-hold loops immediately
+        try { routineCts?.Cancel(); routineCts?.Dispose(); } catch (Exception ex) { Log.Debug($"[Routine] CTS cancel error: {ex.Message}"); }
+        routineCts = null;
+
+        if (announce)
+        {
+            var suffix = string.IsNullOrEmpty(reason) ? "" : $" ({reason})";
+            Log.Information($"[Routine] Stopped: {name}{suffix}");
+        }
+
+        // ORDER: /straightface (150ms) before jump (500ms); reversed, jump interrupts /straightface mid-apply
+        if (reason != "moved")
+        {
+            Task.Run(async () =>
+            {
+                try
+                {
+                    // Let any in-flight hold-loop re-fire settle
+                    await Task.Delay(150);
+                    if (hadExpression)
+                        await Framework.RunOnFrameworkThread(() => ExecuteEmoteDirect("/straightface"));
+                    // Give the face expression time to register before the jump cancels the body
+                    await Task.Delay(350);
+                    await Framework.RunOnFrameworkThread(() => StopActiveEmoteAnimation());
+                }
+                catch (Exception ex) { Log.Debug($"[Routine] Cancel cleanup error: {ex.Message}"); }
+            });
+        }
+        else if (hadExpression)
+        {
+            // Moved-to-stop: body already interrupted by movement, just clear the face.
+            Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(150);
+                    await Framework.RunOnFrameworkThread(() => ExecuteEmoteDirect("/straightface"));
+                }
+                catch (Exception ex) { Log.Debug($"[Routine] /straightface clear error: {ex.Message}"); }
+            });
+        }
+    }
+
+    // mirrors CancelRoutine: does NOT restore mod priorities (use /encorereset) and does NOT chat-message
+    public void StopActivePreset()
+    {
+        if (string.IsNullOrEmpty(Configuration.ActivePresetId)) return;
+        loopingEmoteCommand = null;
+        Configuration.ActivePresetId = null;
+        Configuration.ActivePresetCollectionId = null;
+        Configuration.Save();
+        SimpleHeelsService?.ClearOffset();
+        Task.Run(async () =>
+        {
+            try
+            {
+                await Framework.RunOnFrameworkThread(() => StopActiveEmoteAnimation());
+            }
+            catch (Exception ex) { Log.Debug($"[Preset] Stop error: {ex.Message}"); }
+        });
+    }
+
+    // ActionManager.UseAction(GeneralAction, 2) = jump; cleanly cancels looping emote/dance
+    private unsafe void StopActiveEmoteAnimation()
+    {
+        try
+        {
+            var actionManager = FFXIVClientStructs.FFXIV.Client.Game.ActionManager.Instance();
+            if (actionManager == null) return;
+            // GeneralAction 2 = Jump
+            actionManager->UseAction(FFXIVClientStructs.FFXIV.Client.Game.ActionType.GeneralAction, 2);
+            Log.Debug("[Routine] Triggered jump to interrupt emote");
+        }
+        catch (Exception ex)
+        {
+            Log.Debug($"[Routine] StopActiveEmoteAnimation error: {ex.Message}");
+        }
+    }
+
+    private void UpdateActiveRoutine(Dalamud.Game.ClientState.Objects.SubKinds.IPlayerCharacter localPlayer)
+    {
+        if (activeRoutine == null) return;
+        if (activeRoutineStepIndex < 0 || activeRoutineStepIndex >= activeRoutine.Steps.Count) return;
+
+        var step = activeRoutine.Steps[activeRoutineStepIndex];
+
+        // Movement detection - sensitive to any real player movement (single key tap).
+        // routinePrevPosition is the BASELINE captured at routine start, NOT the previous frame.
+        // Real movement displaces the character significantly faster than emote animation drift.
+        if (!routineMovementBaselineSet)
+        {
+            routinePrevPosition = localPlayer.Position;
+            routineMovementBaselineSet = true;
+        }
+        else
+        {
+            var dx = localPlayer.Position.X - routinePrevPosition.X;
+            var dz = localPlayer.Position.Z - routinePrevPosition.Z;
+            // Squared-distance threshold of 0.04 ~ 0.2 unit displacement from baseline.
+            // Emote animations drift well below this; even a single movement key press exceeds it.
+            if (dx * dx + dz * dz > 0.04f)
+            {
+                CancelRoutine(reason: "moved");
+                return;
+            }
+        }
+
+        // Advance based on the step's duration kind
+        switch (step.DurationKind)
+        {
+            case RoutineStepDuration.Forever:
+                // Never advance
+                break;
+
+            case RoutineStepDuration.Fixed:
+                {
+                    var elapsed = (DateTime.UtcNow - activeRoutineStepStartedUtc).TotalSeconds;
+                    if (elapsed >= step.DurationSeconds)
+                        BeginRoutineStep();
+                }
+                break;
+
+            case RoutineStepDuration.UntilLoopEnds:
+                {
+                    // For macro steps, this means "until macro completes + optional trailing seconds".
+                    // step.DurationSeconds here is the post-macro buffer (0 = advance immediately).
+                    if (step.IsMacroStep)
+                    {
+                        if (routineMacroCompleted)
+                        {
+                            var trailing = Math.Max(0f, step.DurationSeconds);
+                            var elapsedSinceFinish = (DateTime.UtcNow - routineMacroCompletedAt).TotalSeconds;
+                            if (elapsedSinceFinish >= trailing)
+                                BeginRoutineStep();
+                        }
+                        break;
+                    }
+
+                    // "Until emote ends" - works for one-shot emotes (bow, cheer, psych, etc).
+                    // For looping emotes (dances), the emote plays forever - use Fixed time instead.
+                    var currentEmoteId = ReadCurrentEmoteId();
+                    var currentTimeline = ReadBaseTimeline();
+                    var stepElapsed = (DateTime.UtcNow - activeRoutineStepStartedUtc).TotalSeconds;
+
+                    // Capture the first non-zero emote as this step's reference
+                    if (routineWaitingForEmoteStart && currentEmoteId != 0)
+                    {
+                        routineStepEmoteId = currentEmoteId;
+                        routineStepTimeline = currentTimeline;
+                        routineWaitingForEmoteStart = false;
+                    }
+                    // Settling window (1.5s): some emotes split intro/loop into different emote IDs
+                    // (e.g., /golddance 108->119). Keep rebaselining so the settled reference is the loop.
+                    else if (routineStepEmoteId != 0 && stepElapsed < 1.5 && currentEmoteId != 0 &&
+                             currentEmoteId != routineStepEmoteId)
+                    {
+                        routineStepEmoteId = currentEmoteId;
+                        routineStepTimeline = currentTimeline;
+                    }
+
+                    // Safety net - if no emote has started by 3s (pose/movement step), advance anyway
+                    if (routineStepEmoteId == 0 && stepElapsed >= 3.0)
+                    {
+                        BeginRoutineStep();
+                        break;
+                    }
+
+                    // End detection runs after the settling window
+                    if (routineStepEmoteId != 0 && stepElapsed >= 1.5)
+                    {
+                        // Timeline still inside this emote's row-ID set -> it's still playing (loop, intro, etc.)
+                        bool timelineInsideEmote = false;
+                        if (currentEmoteId == routineStepEmoteId &&
+                            emoteIdToTimelineRowIds != null &&
+                            emoteIdToTimelineRowIds.TryGetValue(routineStepEmoteId, out var validIds))
+                        {
+                            timelineInsideEmote = validIds.Contains(currentTimeline);
+                        }
+
+                        // Emote has truly ended when: id reverts to 0, OR shifts to a different emote entirely
+                        bool emoteFinished =
+                            currentEmoteId == 0 ||
+                            (currentEmoteId != routineStepEmoteId && !timelineInsideEmote);
+
+                        if (emoteFinished)
+                        {
+                            BeginRoutineStep();
+                            break;
+                        }
+                    }
+
+                    routinePrevEmoteId = currentEmoteId;
+                    routinePrevTimeline = currentTimeline;
+                }
+                break;
+        }
+    }
+
+    public void UpdateRoutineCommands()
+    {
+        foreach (var cmd in registeredRoutineCommands)
+        {
+            try { CommandManager.RemoveHandler($"/{cmd}"); }
+            catch (Exception ex) { Log.Debug($"Failed to remove routine command /{cmd}: {ex.Message}"); }
+        }
+        registeredRoutineCommands.Clear();
+
+        foreach (var routine in Configuration.Routines)
+        {
+            if (!routine.Enabled || string.IsNullOrWhiteSpace(routine.ChatCommand))
+                continue;
+
+            var cmd = routine.ChatCommand.TrimStart('/').ToLower();
+            if (cmd == "encore" || cmd == "encorereset")
+                continue;
+
+            if (registeredPresetCommands.Contains(cmd) || registeredRoutineCommands.Contains(cmd))
+                continue;
+
+            try
+            {
+                var routineId = routine.Id;
+                CommandManager.AddHandler($"/{cmd}", new CommandInfo((c, a) =>
+                {
+                    var r = Configuration.Routines.Find(x => x.Id == routineId);
+                    if (r != null) ExecuteRoutine(r);
+                })
+                {
+                    HelpMessage = $"Encore routine: {routine.Name}",
+                    ShowInHelp = false
+                });
+                registeredRoutineCommands.Add(cmd);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning($"Failed to register routine command /{cmd}: {ex.Message}");
+            }
+        }
     }
 
     private async Task RestorePreviousChanges(Guid collectionId,
@@ -1262,7 +2485,7 @@ public sealed class Plugin : IDalamudPlugin
                 continue;
             }
 
-            // Remove temp settings → auto-reverts to permanent/inherited state
+            // Remove temp settings -> auto-reverts to permanent/inherited state
             if (PenumbraService!.RemoveTemporaryModSettings(storedCollectionId, modDirectory, modName))
             {
                 restored++;
@@ -1319,13 +2542,49 @@ public sealed class Plugin : IDalamudPlugin
         var presetEmotes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var presetEmoteCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        // Add emotes from mod analysis if available
+        // Build exclusion sets from the preset's ConflictExclusions list.
+        // Each entry is an emote command (e.g., "/beesknees", "/cpose"). Normalized to no slash, lowercase.
+        var excludedCommands = new HashSet<string>(
+            preset.ConflictExclusions.Select(c => c.TrimStart('/').ToLowerInvariant()),
+            StringComparer.OrdinalIgnoreCase);
+        // Derive the matching emote names by reverse-looking-up EmoteToCommand, so we can also filter AffectedEmotes.
+        var excludedEmotes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (name, cmd) in EmoteDetectionService.EmoteToCommand)
+        {
+            if (excludedCommands.Contains(cmd.TrimStart('/').ToLowerInvariant()))
+                excludedEmotes.Add(name);
+        }
+        // Pose-type commands map to AffectedEmotes tags.
+        foreach (var cmd in excludedCommands)
+        {
+            var tag = cmd switch
+            {
+                "cpose" => "idle",
+                "sit" => "sit",
+                "groundsit" => "groundsit",
+                "doze" => "doze",
+                _ => null
+            };
+            if (tag != null)
+                excludedEmotes.Add(tag);
+        }
+
+        // Add emotes from mod analysis if available (filtered by exclusions)
         if (presetModInfo != null && presetModInfo.AffectedEmotes.Count > 0)
         {
             foreach (var emote in presetModInfo.AffectedEmotes)
+            {
+                if (excludedEmotes.Contains(emote))
+                    continue;
                 presetEmotes.Add(emote);
+            }
             foreach (var cmd in presetModInfo.EmoteCommands)
-                presetEmoteCommands.Add(cmd.TrimStart('/').ToLowerInvariant());
+            {
+                var normalized = cmd.TrimStart('/').ToLowerInvariant();
+                if (excludedCommands.Contains(normalized))
+                    continue;
+                presetEmoteCommands.Add(normalized);
+            }
         }
 
         // Fallback: use the preset's configured emote command if we don't have emotes from analysis
@@ -1387,11 +2646,15 @@ public sealed class Plugin : IDalamudPlugin
             var sharedDescription = string.Join(", ",
                 sharedEmotes.Concat(sharedCommands.Select(c => $"/{c}")).Distinct());
 
-            // Check permanent state — GetCurrentModSettings ignores temp overrides
+            // Check permanent state - GetCurrentModSettings ignores temp overrides
             var (gotSettings, isEnabled, _, _) = PenumbraService!.GetCurrentModSettings(collectionId, mod.ModDirectory, mod.ModName);
+            // Also consider mods currently temp-enabled by a previous preset - they're active now
+            // even if permanently disabled, and still compete with this preset for the same emote.
+            var modKey = $"{collectionId}|{mod.ModDirectory}|{mod.ModName}";
+            var hasTempSettings = Configuration.ModsWithTempSettings.Contains(modKey);
 
-            // Not in collection or permanently disabled — nothing to do
-            if (!gotSettings || !isEnabled)
+            // Not in collection, permanently disabled, AND not temp-enabled -> nothing to do
+            if ((!gotSettings || !isEnabled) && !hasTempSettings)
                 continue;
 
             // Don't disable pinned mods
@@ -1401,9 +2664,7 @@ public sealed class Plugin : IDalamudPlugin
                 continue;
             }
 
-            var modKey = $"{collectionId}|{mod.ModDirectory}|{mod.ModName}";
-
-            // Temp-disable the conflicting mod
+            // Temp-disable the conflicting mod (modKey already built above for temp-settings check)
             var result = PenumbraService.SetTemporaryModSettings(collectionId, mod.ModDirectory,
                 enabled: false, priority: 0, options: new Dictionary<string, List<string>>(),
                 modName: mod.ModName);
@@ -1430,10 +2691,46 @@ public sealed class Plugin : IDalamudPlugin
         return disabledMods;
     }
 
+    // Apply the effective Simple Heels offset for a preset, honoring an optional routine-step override.
+    // Silently no-ops when SimpleHeels isn't installed. Null/zero offsets clear any existing override
+    // so the previous preset's heels don't leak into the next one.
+    private void ApplyPresetHeels(DancePreset preset, HeelsOffset? routineOverride = null)
+    {
+        if (SimpleHeelsService == null || !SimpleHeelsService.IsAvailable) return;
+        var heels = routineOverride ?? preset.HeelsOffset;
+        if (heels != null && !heels.IsZero())
+            SimpleHeelsService.ApplyOffset(heels.X, heels.Y, heels.Z, heels.Rotation, heels.Pitch, heels.Roll);
+        else
+            SimpleHeelsService.ClearOffset();
+    }
+
+    // Restore Simple Heels to whatever the currently active preset expects. Used by the editor
+    // when the user closes the window or collapses the heels section - any preview offset we were
+    // showing should roll back to the real active state.
+    public void RefreshActivePresetHeels()
+    {
+        if (SimpleHeelsService == null || !SimpleHeelsService.IsAvailable) return;
+        if (Configuration.ActivePresetId == null)
+        {
+            SimpleHeelsService.ClearOffset();
+            return;
+        }
+        var active = Configuration.Presets.Find(p => p.Id == Configuration.ActivePresetId);
+        if (active == null)
+        {
+            SimpleHeelsService.ClearOffset();
+            return;
+        }
+        ApplyPresetHeels(active);
+    }
+
     public void ResetAllPriorities()
     {
         loopingEmoteCommand = null;
         ClearEmoteSwap();
+        SimpleHeelsService?.ClearOffset();
+        BgmTrackerService?.ClearModScd();
+        if (activeRoutine != null) CancelRoutine(reason: "reset", announce: false);
 
         if (PenumbraService == null || !PenumbraService.IsAvailable)
         {
@@ -1459,7 +2756,7 @@ public sealed class Plugin : IDalamudPlugin
             {
                 int restored = 0;
 
-                // Remove all temp settings → auto-reverts each mod to permanent/inherited state
+                // Remove all temp settings -> auto-reverts each mod to permanent/inherited state
                 foreach (var key in Configuration.ModsWithTempSettings.ToList())
                 {
                     var parts = key.Split('|');
@@ -1506,7 +2803,7 @@ public sealed class Plugin : IDalamudPlugin
         var (gotSettings, _, permPriority, permOptions) = PenumbraService!.GetCurrentModSettings(
             collectionId, preset.ModDirectory, preset.ModName);
 
-        // Merge: permanent options → preset options → modifier overrides
+        // Merge: permanent options -> preset options -> modifier overrides
         var mergedOptions = gotSettings ? new Dictionary<string, List<string>>(permOptions)
                                         : new Dictionary<string, List<string>>();
         foreach (var (g, o) in preset.ModOptions)
@@ -1528,7 +2825,7 @@ public sealed class Plugin : IDalamudPlugin
         var modKey = $"{collectionId}|{preset.ModDirectory}|{preset.ModName}";
         Configuration.ModsWithTempSettings.Add(modKey);
 
-        Log.Information($"Applied temp settings for '{preset.ModName}': enabled, priority {basePriority}→{basePriority + boostAmount} (+{boostAmount}), {mergedOptions.Count} option groups");
+        Log.Information($"Applied temp settings for '{preset.ModName}': enabled, priority {basePriority}->{basePriority + boostAmount} (+{boostAmount}), {mergedOptions.Count} option groups");
     }
 
     /// <summary>
@@ -1702,7 +2999,6 @@ public sealed class Plugin : IDalamudPlugin
             player->GameObject.SetPosition(pos.X, pos.Y, pos.Z);
     }
 
-    /// <summary>Maps an emote command to its animation type (int). Used by modifier execution.</summary>
     private static int GetAnimationTypeForCommand(string? command)
     {
         return command?.ToLowerInvariant() switch
@@ -1715,14 +3011,12 @@ public sealed class Plugin : IDalamudPlugin
         };
     }
 
-    /// <summary>
-    /// Execute an emote command directly via ProcessChatBoxEntry, without clearing swaps.
-    /// Used by the unlock bypass to execute the carrier command while a swap is active.
-    /// </summary>
+    // direct ProcessChatBoxEntry; isExecutingBypassCarrier flag tells the hook not to clear the swap
     private unsafe void ExecuteEmoteDirect(string command)
     {
         if (string.IsNullOrWhiteSpace(command)) return;
         if (!command.StartsWith("/")) command = "/" + command;
+        isExecutingBypassCarrier = true;
         try
         {
             var uiModule = UIModule.Instance();
@@ -1736,6 +3030,10 @@ public sealed class Plugin : IDalamudPlugin
         catch (Exception ex)
         {
             Log.Error($"Failed to execute emote '{command}': {ex.Message}");
+        }
+        finally
+        {
+            isExecutingBypassCarrier = false;
         }
     }
 
@@ -1772,10 +3070,7 @@ public sealed class Plugin : IDalamudPlugin
         }
     }
 
-    /// <summary>
-    /// Check if an emote is unlocked for the current player via UIState.
-    /// Returns true if unlocked (or if check fails — assume unlocked to avoid blocking normal execution).
-    /// </summary>
+    // returns true if check fails (avoid blocking normal execution)
     private static unsafe bool IsEmoteUnlocked(ushort emoteId)
     {
         try
@@ -1793,83 +3088,89 @@ public sealed class Plugin : IDalamudPlugin
         "c1301", "c1401", "c1501", "c1601", "c1701", "c1801"
     };
 
+    // race fallback by body-type affinity (skeleton sharing): standard f / tall f / standard m / etc.
+    private static readonly Dictionary<string, string[]> RaceAnimationAffinity = new()
+    {
+        // Male - standard body
+        ["c0101"] = new[] { "c0701", "c1301", "c1701", "c0301", "c0501" },           // Hyur Mid M
+        ["c0301"] = new[] { "c0101", "c0901", "c0501", "c0701", "c1301", "c1701" },  // Hyur High M
+        ["c0501"] = new[] { "c0101", "c0701", "c1301", "c1701", "c0301" },           // Elezen M
+        ["c0701"] = new[] { "c0101", "c1301", "c1701", "c0301", "c0501" },           // Miqo M
+        ["c0901"] = new[] { "c0301", "c0101", "c1501", "c0501" },                    // Roe M
+        ["c1101"] = new[] { "c1201" },                                                // Lala M
+        ["c1301"] = new[] { "c0101", "c0701", "c1701", "c0301", "c0501" },           // Au Ra M
+        ["c1501"] = new[] { "c0901", "c0301", "c0101" },                             // Hrothgar M
+        ["c1701"] = new[] { "c0101", "c0701", "c1301", "c0301", "c0501" },           // Viera M
+        // Female - standard body
+        ["c0201"] = new[] { "c0801", "c1401", "c1801", "c0401", "c0601" },           // Hyur Mid F
+        ["c0401"] = new[] { "c0201", "c0801", "c1401", "c1801", "c0601" },           // Hyur High F
+        ["c0601"] = new[] { "c1001", "c0401", "c0201", "c0801" },                    // Elezen F
+        ["c0801"] = new[] { "c0201", "c1401", "c1801", "c0401", "c0601" },           // Miqo F
+        ["c1001"] = new[] { "c0601", "c0401", "c0201", "c0801" },                    // Roe F
+        ["c1201"] = new[] { "c1101" },                                                // Lala F
+        ["c1401"] = new[] { "c0801", "c0201", "c1801", "c0401", "c0601" },           // Au Ra F
+        ["c1601"] = new[] { "c1001", "c0601", "c0401", "c0201", "c0801" },           // Hrothgar F
+        ["c1801"] = new[] { "c0801", "c0201", "c1401", "c0401", "c0601" },           // Viera F
+    };
+
     // Subfolders to check for animation files
     // Full set of subfolders for resolving TARGET PAP paths (ResolveEmotePaths).
     // Includes job-specific subfolders so PickBestPath can find the player's job-specific animation.
     private static readonly string[] AnimSubfolders = {
         "", "bt_common/", "resident/", "nonresident/",
         // Job-specific battle animation subfolders (for emotes like Zantetsuken under bt_swd_sld)
-        "bt_swd_sld/",  // PLD/GLA — sword + shield
-        "bt_2ax_emp/",  // WAR/MRD — greataxe
-        "bt_2sw_emp/",  // DRK — greatsword
-        "bt_2gb_emp/",  // GNB — gunblade
-        "bt_2sp_emp/",  // DRG/LNC — spear
-        "bt_2km_emp/",  // RPR — scythe
-        "bt_clw_clw/",  // MNK/PGL — claws/fists
-        "bt_dgr_dgr/",  // NIN/ROG — daggers
-        "bt_nin_nin/",  // NIN — alternate
-        "bt_2kt_emp/",  // SAM — katana
-        "bt_bld_bld/",  // VPR — twinfangs
-        "bt_2bw_emp/",  // BRD/ARC — bow
-        "bt_2gn_emp/",  // MCH — gun
-        "bt_chk_chk/",  // DNC — chakrams
-        "bt_stf_sld/",  // WHM/CNJ/BLM — staff + shield
-        "bt_jst_sld/",  // BLM/THM — scepter + shield
-        "bt_2bk_emp/",  // SCH/SMN/ACN — book
-        "bt_2gl_emp/",  // AST — globe
-        "bt_2ff_emp/",  // SGE — nouliths
-        "bt_rod_emp/",  // BLU — rod
-        "bt_2rp_emp/",  // RDM — rapier
-        "bt_brs_plt/",  // PCT — brush + palette
+        "bt_swd_sld/",  // PLD/GLA - sword + shield
+        "bt_2ax_emp/",  // WAR/MRD - greataxe
+        "bt_2sw_emp/",  // DRK - greatsword
+        "bt_2gb_emp/",  // GNB - gunblade
+        "bt_2sp_emp/",  // DRG/LNC - spear
+        "bt_2km_emp/",  // RPR - scythe
+        "bt_clw_clw/",  // MNK/PGL - claws/fists
+        "bt_dgr_dgr/",  // NIN/ROG - daggers
+        "bt_nin_nin/",  // NIN - alternate
+        "bt_2kt_emp/",  // SAM - katana
+        "bt_bld_bld/",  // VPR - twinfangs
+        "bt_2bw_emp/",  // BRD/ARC - bow
+        "bt_2gn_emp/",  // MCH - gun
+        "bt_chk_chk/",  // DNC - chakrams
+        "bt_stf_sld/",  // WHM/CNJ/BLM - staff + shield
+        "bt_jst_sld/",  // BLM/THM - scepter + shield
+        "bt_2bk_emp/",  // SCH/SMN/ACN - book
+        "bt_2gl_emp/",  // AST - globe
+        "bt_2ff_emp/",  // SGE - nouliths
+        "bt_rod_emp/",  // BLU - rod
+        "bt_2rp_emp/",  // RDM - rapier
+        "bt_brs_plt/",  // PCT - brush + palette
     };
 
-    // Minimal set of subfolders for CARRIER path generation (GenerateAllPossiblePaths).
-    // Only base subfolders — do NOT include job-specific bt_ folders here because mapping
-    // those paths creates phantom Penumbra redirects at paths that don't normally exist.
-    // The game's normal fallback (job-specific → bt_common) handles job resolution;
-    // our redirect at bt_common intercepts correctly.
+    // base subfolders only; job-specific bt_ folders create phantom redirects
     private static readonly string[] CarrierPathSubfolders = {
         "", "bt_common/", "resident/", "nonresident/"
     };
 
-    // Temp directory for modified PAP files
     private string EmoteSwapDir => Path.Combine(PluginInterface.GetPluginConfigDirectory(), "emoteswap");
 
     private static readonly HashSet<string> NoCarrierCommands = new(StringComparer.OrdinalIgnoreCase)
         { "/sit", "/groundsit", "/doze", "/changepose", "/cpose", "/hug", "/pet", "/handover", "/embrace", "/dote",
           "/showleft", "/showright", "/savortea", "/hildy", "/songbird" };
 
-    /// <summary>
-    /// Preferred one-shot carriers (common starter emotes, always unlocked).
-    /// Looping carriers can't use a static list — they're uncommon (emote_sp/ with _loop keys)
-    /// and vary by account. We scan all unlocked emotes for looping carriers dynamically.
-    /// </summary>
+    // looping carriers are scanned dynamically per-account (vary, often emote_sp/_loop keys)
     private static readonly string[] PreferredOneShotCarriers = { "/no", "/me", "/bow", "/clap", "/yes", "/wave", "/cheer", "/dance", "/laugh" };
 
-    /// <summary>
-    /// Find a suitable carrier emote. Returns the carrier's info or null if none available.
-    /// Matches loop type (looping target needs looping carrier because ActionTimeline controls
-    /// whether the game loops the animation). Prefers carriers with slot 1 (intro/start animation)
-    /// when the target has one. Falls back to mismatched loop type if needed.
-    /// The surgical TMB rewriter eliminates C009 size constraints, so any carrier works.
-    /// </summary>
-    /// <param name="needsLoop">Whether the target emote loops (looping carriers preferred).</param>
-    /// <param name="preferSlot1">Whether to prefer carriers with slot 1 (intro animation).</param>
-    /// <param name="maxNameLen">Max carrier PAP name length (must be &lt;= target name length to fit C009.Path). 0 = no limit.</param>
-    /// <param name="maxSlot1NameLen">Max carrier slot 1 PAP name length. 0 = no limit. Only checked when preferSlot1=true.</param>
-    private (ushort id, string command, string key, string papName, bool isLoop, string? slot1Key, string? slot1PapName)? FindCarrier(bool needsLoop, bool preferSlot1 = false, int maxNameLen = 0, int maxSlot1NameLen = 0, byte? requiredConditionMode = null)
+    // matches loop type; prefers slot 1 carriers when target has intro animation
+    private (ushort id, string command, string key, string papName, bool isLoop, string? slot1Key, string? slot1PapName)? FindCarrier(bool needsLoop, bool preferSlot1 = false, int maxNameLen = 0, int maxSlot1NameLen = 0, byte? requiredConditionMode = null, HashSet<ushort>? excludeCarrierIds = null)
     {
         if (emoteCommandToId == null || emoteIdToTimelineKeys == null) return null;
 
-        // Collect emote IDs to exclude (NoCarrierCommands)
         var excludedIds = new HashSet<ushort>();
         foreach (var (cmd, id) in emoteCommandToId)
         {
             if (NoCarrierCommands.Contains(cmd))
                 excludedIds.Add(id);
         }
+        if (excludeCarrierIds != null)
+            excludedIds.UnionWith(excludeCarrierIds);
 
-        // Helper: check if carrier name fits the length constraint
         bool FitsNameConstraint((ushort id, string command, string key, string papName, bool isLoop, string? slot1Key, string? slot1PapName)? result)
         {
             if (result == null) return false;
@@ -2005,14 +3306,7 @@ public sealed class Plugin : IDalamudPlugin
         return (slot1.key, slot1PapName);
     }
 
-    /// <summary>
-    /// Try to set up an emote bypass for the given command. Returns the carrier command
-    /// to execute instead, or null if bypass not applicable/failed.
-    /// Picks a carrier whose PAP name fits the target's C009.Path field (name length constraint).
-    /// If no fitting carrier found, falls back to any carrier (partial rewrite — may not animate).
-    /// </summary>
-    /// <param name="forPreset">When true (EmoteLocked preset), skips unlock check, skips carrier sticking
-    /// (mod options may have changed), and reads target PAP from mod files instead of game data.</param>
+    // forPreset (EmoteLocked): skips unlock check + carrier sticking, reads target PAP from mod files
     private (string? carrierCommand, ushort carrierId, bool targetIsLoop) TrySetupEmoteBypass(
         string command, bool forPreset = false)
     {
@@ -2028,8 +3322,7 @@ public sealed class Plugin : IDalamudPlugin
             return (null, 0, false);
         }
 
-        // Skip bypass for emotes the player already has unlocked (unless forPreset — preset explicitly marked as locked).
-        // Zantetsuken reports as unlocked via UIState even when not owned (Mogstation bug).
+        // skip if already unlocked (unless forPreset). Zantetsuken misreports as unlocked (Mogstation bug)
         if (!forPreset && IsEmoteUnlocked(targetEmoteId) && cmdLower != "zantetsuken" && cmdLower != "ztk")
         {
             Log.Debug($"[UnlockBypass] Emote '{cmdLower}' (id={targetEmoteId}) is unlocked, skipping bypass");
@@ -2042,23 +3335,23 @@ public sealed class Plugin : IDalamudPlugin
             return (null, 0, false);
         }
 
-        // Read race early — needed for both sticking check and PAP selection
+        // Read race early - needed for both sticking check and PAP selection
         var playerRaceCode = GetPlayerRaceCode();
 
         // Carrier sticking: if same emote as last time and swap is still active, reuse the same carrier.
-        // Skip for preset bypass — mod options may have changed (modifier switch), must always re-read PAP.
-        // Also skip if race changed (character switch via Glamourer/Character Select+) — PAP data is race-specific.
+        // Skip for preset bypass - mod options may have changed (modifier switch), must always re-read PAP.
+        // Also skip if race changed (character switch via Glamourer/Character Select+) - PAP data is race-specific.
         if (!forPreset && emoteSwapActive && lastBypassEmoteCommand == cmdLower && lastBypassCarrierCommand != null)
         {
             if (lastBypassRaceCode != playerRaceCode)
             {
-                Log.Information($"[UnlockBypass] Race changed ({lastBypassRaceCode} → {playerRaceCode}), re-running swap setup for '{cmdLower}'");
+                Log.Information($"[UnlockBypass] Race changed ({lastBypassRaceCode} -> {playerRaceCode}), re-running swap setup for '{cmdLower}'");
             }
             else
             {
                 // If swap was soft-disabled by one-shot cleanup (carrier returned to normal after emote ended),
                 // re-enable the mod. SetTemporaryModSettings increments Penumbra's ChangeCounter, which changes
-                // the resolved path encoding — giving the game's resource cache a fresh path to load from.
+                // the resolved path encoding - giving the game's resource cache a fresh path to load from.
                 if (emoteSwapSoftDisabled)
                 {
                     try
@@ -2081,7 +3374,7 @@ public sealed class Plugin : IDalamudPlugin
                 if (emoteSwapActive) // May have been cleared by re-enable failure above
                 {
                     var stickIsLoop = targetKeys.FirstOrDefault(k => k.slot == 0).isLoop;
-                    Log.Information($"[UnlockBypass] Reusing carrier '{lastBypassCarrierCommand}' (id={lastBypassCarrierId}) for '{cmdLower}' — swap still active (race={playerRaceCode})");
+                    Log.Information($"[UnlockBypass] Reusing carrier '{lastBypassCarrierCommand}' (id={lastBypassCarrierId}) for '{cmdLower}' - swap still active (race={playerRaceCode})");
                     return (lastBypassCarrierCommand, lastBypassCarrierId, stickIsLoop);
                 }
             }
@@ -2090,6 +3383,17 @@ public sealed class Plugin : IDalamudPlugin
         Log.Debug($"[UnlockBypass] Target emote '{cmdLower}' (id={targetEmoteId}) has {targetKeys.Count} timeline(s): {string.Join(", ", targetKeys.Select(t => $"[{t.slot}]={t.key}{(t.isLoop ? " (loop)" : "")}{(t.loadType == 0 ? " (facial)" : t.loadType == 1 ? " (perjob)" : "")}"))}");
 
         var targetSlot0 = targetKeys.FirstOrDefault(k => k.slot == 0);
+        // Some emotes store their main animation in slot 4 instead of slot 0 (e.g., Water Float, Water Flip).
+        // Fall back to slot 4 if slot 0 has no key.
+        if (string.IsNullOrEmpty(targetSlot0.key))
+        {
+            var targetSlot4 = targetKeys.FirstOrDefault(k => k.slot == 4);
+            if (!string.IsNullOrEmpty(targetSlot4.key))
+            {
+                targetSlot0 = targetSlot4;
+                Log.Debug($"[UnlockBypass] Slot 0 empty, using slot 4: [{targetSlot4.slot}]={targetSlot4.key}");
+            }
+        }
         var targetIsLoop = targetSlot0.isLoop;
 
         // Check if target has a slot 1 (intro/start animation)
@@ -2099,7 +3403,7 @@ public sealed class Plugin : IDalamudPlugin
             Log.Debug($"[UnlockBypass] Target has intro animation: [{targetSlot1.slot}]={targetSlot1.key}");
 
         // Read target PAP names to determine max carrier name length.
-        // The C009.Path in TMB has limited padded space — carrier name must fit.
+        // The C009.Path in TMB has limited padded space - carrier name must fit.
         // Use the player's race+job-specific PAP when available for correct skeleton/expression data.
         int maxSlot0NameLen = 0;
         int maxSlot1NameLen = 0;
@@ -2138,7 +3442,8 @@ public sealed class Plugin : IDalamudPlugin
         Log.Debug($"[UnlockBypass] Target PAP name constraints: slot0 max={maxSlot0NameLen}, slot1 max={maxSlot1NameLen}");
 
         // Check player state for sitting-aware carrier selection.
-        // When sitting/groundsitting/dozing, only carriers with ConditionMode 0 (any-state) will work.
+        // Only InPositionLoop (sit/doze) actually rejects standing-only emote commands -
+        // EmoteLoop (mid-dance) accepts any emote (new one cancels the current), so no filter needed there.
         byte? requiredConditionMode = null;
         var localPlayer = ObjectTable.LocalPlayer;
         if (localPlayer != null && localPlayer.Address != nint.Zero)
@@ -2146,7 +3451,7 @@ public sealed class Plugin : IDalamudPlugin
             unsafe
             {
                 var ch = (Character*)localPlayer.Address;
-                if (ch->Mode != CharacterModes.Normal)
+                if (ch->Mode == CharacterModes.InPositionLoop)
                 {
                     requiredConditionMode = 0;
                     Log.Debug($"[UnlockBypass] Player mode={ch->Mode}, requiring ConditionMode 0 carriers");
@@ -2154,35 +3459,64 @@ public sealed class Plugin : IDalamudPlugin
             }
         }
 
-        // Find a carrier whose PAP name fits the target's C009.Path field.
-        // Prefer carriers with slot 1 only when target has an intro animation AND its PAP actually exists.
-        // Target may have a slot 1 timeline entry but no PAP file on disk (e.g., emote_sp/sp67_start).
+        // game caches PAP per-animation-key; rotate carriers (Penumbra ChangeCounter only busts TMBs)
         var targetSlot1PapExists = maxSlot1NameLen > 0;
-        var carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, maxNameLen: maxSlot0NameLen, maxSlot1NameLen: maxSlot1NameLen, requiredConditionMode: requiredConditionMode);
+        // forPreset keeps the same carrier across invocations (sync plugins see consistent carrier)
+        HashSet<ushort>? excludeCarrierIds = (!forPreset && usedCarrierIds.Count > 0) ? usedCarrierIds : null;
+        if (excludeCarrierIds != null)
+            Log.Debug($"[UnlockBypass] Excluding {excludeCarrierIds.Count} previously used carrier(s) for PAP cache busting");
+        var carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, maxNameLen: maxSlot0NameLen, maxSlot1NameLen: maxSlot1NameLen, requiredConditionMode: requiredConditionMode, excludeCarrierIds: excludeCarrierIds);
 
         // If no carrier fits with slot 1 preference, try without slot 1 requirement
         if (carrier == null && targetHasSlot1 && targetSlot1PapExists)
         {
             Log.Debug($"[UnlockBypass] No carrier with slot 1 fits, trying without slot 1");
-            carrier = FindCarrier(targetIsLoop, preferSlot1: false, maxNameLen: maxSlot0NameLen, requiredConditionMode: requiredConditionMode);
+            carrier = FindCarrier(targetIsLoop, preferSlot1: false, maxNameLen: maxSlot0NameLen, requiredConditionMode: requiredConditionMode, excludeCarrierIds: excludeCarrierIds);
         }
 
-        // If still no carrier fits the name constraint, try without name constraint (partial rewrite — may not animate but better than nothing)
+        // If still no carrier fits the name constraint, try without name constraint (partial rewrite - may not animate but better than nothing)
         if (carrier == null && maxSlot0NameLen > 0)
         {
             Log.Warning($"[UnlockBypass] No carrier with name length <= {maxSlot0NameLen} found, trying without length constraint");
-            carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, requiredConditionMode: requiredConditionMode);
+            carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, requiredConditionMode: requiredConditionMode, excludeCarrierIds: excludeCarrierIds);
         }
 
         // If ConditionMode constraint prevented finding a carrier, fall back to any carrier (better to try than fail silently)
         if (carrier == null && requiredConditionMode.HasValue)
         {
             Log.Warning($"[UnlockBypass] No ConditionMode {requiredConditionMode.Value} carriers found, trying without ConditionMode constraint");
-            carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, maxNameLen: maxSlot0NameLen, maxSlot1NameLen: maxSlot1NameLen);
+            carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, maxNameLen: maxSlot0NameLen, maxSlot1NameLen: maxSlot1NameLen, excludeCarrierIds: excludeCarrierIds);
             if (carrier == null && targetHasSlot1 && targetSlot1PapExists)
-                carrier = FindCarrier(targetIsLoop, preferSlot1: false, maxNameLen: maxSlot0NameLen);
+                carrier = FindCarrier(targetIsLoop, preferSlot1: false, maxNameLen: maxSlot0NameLen, excludeCarrierIds: excludeCarrierIds);
             if (carrier == null && maxSlot0NameLen > 0)
-                carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists);
+                carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, excludeCarrierIds: excludeCarrierIds);
+        }
+
+        // Pool exhaustion: all carriers used this session. Clear and retry - game's LRU cache
+        // may have evicted old entries. Better to try a reused carrier than fail entirely.
+        if (carrier == null && usedCarrierIds.Count > 0)
+        {
+            Log.Information($"[UnlockBypass] All carriers exhausted ({usedCarrierIds.Count} used), clearing pool and retrying");
+            usedCarrierIds.Clear();
+            Configuration.UsedBypassCarrierIds.Clear();
+            Configuration.Save();
+            excludeCarrierIds = null;
+            carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, maxNameLen: maxSlot0NameLen, maxSlot1NameLen: maxSlot1NameLen, requiredConditionMode: requiredConditionMode);
+        }
+
+        // Loop-target mismatch rescue: if target wants a loop but FindCarrier fell back to a
+        // non-loop carrier AND we had any exclusions, clear the used pool and retry for a loop.
+        // A non-loop carrier for a looping target will stop after one play - unacceptable for loops.
+        if (targetIsLoop && carrier != null && !carrier.Value.isLoop && usedCarrierIds.Count > 0)
+        {
+            Log.Information($"[UnlockBypass] Got non-loop carrier for loop target while {usedCarrierIds.Count} carriers were excluded - resetting pool to find a real loop carrier");
+            usedCarrierIds.Clear();
+            Configuration.UsedBypassCarrierIds.Clear();
+            Configuration.Save();
+            excludeCarrierIds = null;
+            var retry = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, maxNameLen: maxSlot0NameLen, maxSlot1NameLen: maxSlot1NameLen, requiredConditionMode: requiredConditionMode);
+            if (retry != null && retry.Value.isLoop)
+                carrier = retry;
         }
 
         if (carrier == null)
@@ -2208,22 +3542,27 @@ public sealed class Plugin : IDalamudPlugin
 
         if (targetHasSlot1 && targetSlot1PapExists && carrierSlot1Key != null)
         {
+            // Both target and carrier have usable slot 1 - redirect to target's intro
             keyPairs.Add((carrierSlot1Key, targetSlot1.key));
-            Log.Debug($"[UnlockBypass] Including slot 1 pair: carrier='{carrierSlot1Key}' → target='{targetSlot1.key}'");
+            Log.Debug($"[UnlockBypass] Including slot 1 pair: carrier='{carrierSlot1Key}' -> target='{targetSlot1.key}'");
         }
-        else if (targetHasSlot1 && !targetSlot1PapExists)
+        else if (carrierSlot1Key != null && !string.IsNullOrEmpty(targetSlot0.key))
         {
-            Log.Debug($"[UnlockBypass] Target slot 1 PAP doesn't exist — skipping intro swap");
+            // Carrier has an intro but target doesn't (or target's intro PAP doesn't exist).
+            // Redirect carrier's slot 1 to target's slot 0 so the target animation plays during
+            // the intro phase instead of the carrier's own intro animation bleeding through.
+            keyPairs.Add((carrierSlot1Key, targetSlot0.key));
+            Log.Debug($"[UnlockBypass] Suppressing carrier intro: redirecting slot 1 '{carrierSlot1Key}' -> target slot 0 '{targetSlot0.key}'");
         }
         else if (targetHasSlot1 && carrierSlot1Key == null)
         {
-            Log.Debug($"[UnlockBypass] Carrier '{carrierCommand}' has no slot 1 — intro will be skipped");
+            Log.Debug($"[UnlockBypass] Carrier '{carrierCommand}' has no slot 1 - intro will be skipped");
         }
 
         // Add key pairs for ALL remaining target slots (facial, upper body/head targeting, etc.)
         // Match by slot index: for each target entry not already paired (slot 0/1), find the carrier's entry at the same slot.
         var pairedSlots = new HashSet<int> { 0 }; // slot 0 always paired above
-        if (targetHasSlot1 && targetSlot1PapExists && carrier.Value.slot1Key != null)
+        if (carrierSlot1Key != null) // slot 1 is paired (either normal redirect or intro suppression)
             pairedSlots.Add(1);
 
         if (emoteIdToTimelineKeys!.TryGetValue(carrierId, out var carrierKeys2))
@@ -2239,7 +3578,7 @@ public sealed class Plugin : IDalamudPlugin
                     keyPairs.Add((carrierEntry.key, targetEntry.key));
                     pairedSlots.Add(targetEntry.slot);
                     var typeLabel = targetEntry.loadType == 0 ? "facial" : targetEntry.loadType == 1 ? "perjob" : "extra";
-                    Log.Debug($"[UnlockBypass] Including {typeLabel} pair [{targetEntry.slot}]: carrier='{carrierEntry.key}' → target='{targetEntry.key}'");
+                    Log.Debug($"[UnlockBypass] Including {typeLabel} pair [{targetEntry.slot}]: carrier='{carrierEntry.key}' -> target='{targetEntry.key}'");
                 }
                 else
                 {
@@ -2262,7 +3601,16 @@ public sealed class Plugin : IDalamudPlugin
             lastBypassCarrierCommand = carrierCommand;
             lastBypassCarrierId = carrierId;
             lastBypassRaceCode = playerRaceCode;
-            Log.Information($"[UnlockBypass] Swap active for '{cmdLower}', executing {carrierCommand} ({keyPairs.Count} slot(s), fromMod={forPreset})");
+            // For preset-driven bypass, don't pollute the used-carrier pool - we WANT to
+            // pick the same carrier on subsequent invocations (same preset / routine loop).
+            // Skipping the add keeps /pray (or whatever preferred) available forever.
+            if (!forPreset)
+            {
+                usedCarrierIds.Add(carrierId); // Track for PAP cache busting
+                Configuration.UsedBypassCarrierIds.Add(carrierId);
+                Configuration.Save();
+            }
+            Log.Information($"[UnlockBypass] Swap active for '{cmdLower}', executing {carrierCommand} ({keyPairs.Count} slot(s), fromMod={forPreset}, usedCarriers={usedCarrierIds.Count})");
             return (carrierCommand, carrierId, targetIsLoop);
         }
 
@@ -2294,12 +3642,7 @@ public sealed class Plugin : IDalamudPlugin
         return paths;
     }
 
-    /// <summary>
-    /// Generate ALL possible game file paths for a timeline key across all races/layers/subfolders.
-    /// Unlike ResolveEmotePaths, does NOT check DataManager.FileExists — generates every possible
-    /// path so Penumbra can redirect ANY race's request to our file. This is critical because
-    /// only mapping paths that exist in base game data would miss the player's specific race.
-    /// </summary>
+    // unlike ResolveEmotePaths, does NOT check FileExists; needed so Penumbra can redirect ANY race
     private List<string> GenerateAllPossiblePaths(string timelineKey)
     {
         var paths = new List<string>();
@@ -2313,14 +3656,10 @@ public sealed class Plugin : IDalamudPlugin
         return paths;
     }
 
-    /// <summary>Get the player's character model race code (e.g., "c0101" for Hyur Midlander Male).</summary>
-    /// <remarks>
-    /// Tries Glamourer IPC first to get the visual race (reflects character switches via CS+/Glamourer).
-    /// Falls back to ObjectTable customize bytes (server data, doesn't reflect Glamourer meta manipulations).
-    /// </remarks>
+    // race code (e.g., "c0101"). Tries Glamourer IPC first; falls back to ObjectTable customize bytes
     private string? GetPlayerRaceCode()
     {
-        // Try Glamourer first — ObjectTable[0].Customize doesn't reflect visual race changes
+        // Try Glamourer first - ObjectTable[0].Customize doesn't reflect visual race changes
         // from Glamourer/Penumbra meta manipulations (e.g., Character Select+ character switches)
         try
         {
@@ -2331,24 +3670,38 @@ public sealed class Plugin : IDalamudPlugin
                 var customize = state["Customize"];
                 if (customize != null)
                 {
-                    var glamRace = customize["Race"]?["Value"]?.Value<byte>();
-                    var glamGender = customize["Gender"]?["Value"]?.Value<byte>();
-                    var glamTribe = customize["Clan"]?["Value"]?.Value<byte>();
+                    // Try nested {"Value": byte} format first, then direct value
+                    var glamRace = customize["Race"]?["Value"]?.Value<byte>() ?? customize["Race"]?.Value<byte>();
+                    var glamGender = customize["Gender"]?["Value"]?.Value<byte>() ?? customize["Gender"]?.Value<byte>();
+                    var glamTribe = customize["Clan"]?["Value"]?.Value<byte>() ?? customize["Clan"]?.Value<byte>();
                     if (glamRace.HasValue && glamGender.HasValue && glamTribe.HasValue)
                     {
                         var glamCode = RaceToModelCode(glamRace.Value, glamGender.Value, glamTribe.Value);
                         if (glamCode != null)
                         {
-                            Log.Verbose($"[RaceCode] Glamourer: race={glamRace}, gender={glamGender}, tribe={glamTribe} → {glamCode}");
+                            Log.Information($"[RaceCode] Glamourer: race={glamRace}, gender={glamGender}, tribe={glamTribe} -> {glamCode}");
                             return glamCode;
                         }
+                        Log.Warning($"[RaceCode] Glamourer: RaceToModelCode returned null for race={glamRace}, gender={glamGender}, tribe={glamTribe}");
+                    }
+                    else
+                    {
+                        Log.Warning($"[RaceCode] Glamourer: Failed to parse Customize - Race={customize["Race"]}, Gender={customize["Gender"]}, Clan={customize["Clan"]}");
                     }
                 }
+                else
+                {
+                    Log.Warning($"[RaceCode] Glamourer: state has no 'Customize' key. Keys: {string.Join(", ", state.Properties().Select(p => p.Name))}");
+                }
+            }
+            else
+            {
+                Log.Warning($"[RaceCode] Glamourer: GetState returned ec={ec}, state={state != null}");
             }
         }
-        catch
+        catch (Exception glamEx)
         {
-            // Glamourer not available — fall through to ObjectTable
+            Log.Warning($"[RaceCode] Glamourer IPC failed: {glamEx.Message}");
         }
 
         // Fallback: ObjectTable customize bytes (server data, may not reflect visual changes)
@@ -2362,7 +3715,7 @@ public sealed class Plugin : IDalamudPlugin
         byte tribe = custBytes[4];   // CustomizeIndex.Tribe (1-16)
 
         var code = RaceToModelCode(race, gender, tribe);
-        Log.Verbose($"[RaceCode] ObjectTable: race={race}, gender={gender}, tribe={tribe} → {code}");
+        Log.Information($"[RaceCode] ObjectTable fallback: race={race}, gender={gender}, tribe={tribe} -> {code}");
         return code;
     }
 
@@ -2436,8 +3789,17 @@ public sealed class Plugin : IDalamudPlugin
             var match = paths.FirstOrDefault(p => p.Contains($"/{raceCode}/"));
             if (match != null) return match;
         }
-        // Gender-aware fallback: prefer a path with the same gender as the player.
-        // Model codes: odd base number (c01, c03, ...) = male, even (c02, c04, ...) = female.
+        // Body-type affinity fallback: prefer races with similar skeleton/proportions.
+        // e.g., Au Ra F (c1401) -> Miqo F (c0801), NOT Elezen F (c0601)
+        if (raceCode != null && RaceAnimationAffinity.TryGetValue(raceCode, out var affinityChain))
+        {
+            foreach (var fallbackRace in affinityChain)
+            {
+                var match = paths.FirstOrDefault(p => p.Contains($"/{fallbackRace}/"));
+                if (match != null) return match;
+            }
+        }
+        // Last resort gender fallback: any path with the same gender parity.
         if (raceCode != null && int.TryParse(raceCode.Substring(1, 2), out int playerModelNum))
         {
             bool playerIsMale = playerModelNum % 2 != 0;
@@ -2452,6 +3814,249 @@ public sealed class Plugin : IDalamudPlugin
             }
         }
         return paths[0];
+    }
+
+    // walks default_mod.json -> group_*.json picks; substitutes race for single-race mods
+    private byte[]? ReadPresetModFile(DancePreset preset, string gamePath, PresetModifier? modifier = null)
+    {
+        if (PenumbraService == null) return null;
+        var penumbraModDir = PenumbraService.GetModDirectory();
+        if (string.IsNullOrEmpty(penumbraModDir)) return null;
+        var modRoot = Path.Combine(penumbraModDir, preset.ModDirectory);
+        if (!Directory.Exists(modRoot)) return null;
+
+        var candidates = new List<string> { gamePath };
+        var currentRace = ExtractRaceCodeFromPath(gamePath);
+        if (currentRace != null)
+        {
+            foreach (var altRace in RaceIds.Where(r => r != currentRace))
+                candidates.Add(gamePath.Replace($"/{currentRace}/", $"/{altRace}/"));
+        }
+
+        // Highest-priority match wins. Groups override default when the preset selects their options.
+        string? chosenRel = null;
+        int chosenPriority = int.MinValue;
+
+        foreach (var groupFile in Directory.GetFiles(modRoot, "group_*.json"))
+        {
+            try
+            {
+                var groupJson = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(groupFile));
+                var groupName = groupJson["Name"]?.Value<string>() ?? "";
+                var groupPri = groupJson["Priority"]?.Value<int>() ?? 0;
+                var options = groupJson["Options"] as Newtonsoft.Json.Linq.JArray;
+                if (options == null) continue;
+
+                // Effective options = preset options overlaid with modifier option overrides.
+                var effectiveOptions = new Dictionary<string, List<string>>(preset.ModOptions);
+                if (modifier != null)
+                    foreach (var (g, v) in modifier.OptionOverrides)
+                        effectiveOptions[g] = v;
+
+                // If the preset/modifier explicitly selected options for this group, only those apply.
+                // Otherwise skip this group - we can't guess which option would be active.
+                if (!effectiveOptions.TryGetValue(groupName, out var selected) || selected == null || selected.Count == 0)
+                    continue;
+
+                foreach (var opt in options)
+                {
+                    var optName = opt["Name"]?.Value<string>() ?? "";
+                    if (!selected.Any(s => s.Equals(optName, StringComparison.OrdinalIgnoreCase))) continue;
+                    var files = opt["Files"] as Newtonsoft.Json.Linq.JObject;
+                    if (files == null) continue;
+                    foreach (var cand in candidates)
+                    {
+                        if (files.TryGetValue(cand, out var tok))
+                        {
+                            var rel = tok?.Value<string>();
+                            if (!string.IsNullOrEmpty(rel) && groupPri >= chosenPriority)
+                            {
+                                chosenPriority = groupPri;
+                                chosenRel = rel;
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { Log.Debug($"[Duration] group file parse skipped: {ex.Message}"); }
+        }
+
+        // Default file - lowest priority, used if no group option covered this path.
+        if (chosenRel == null)
+        {
+            var defaultJsonPath = Path.Combine(modRoot, "default_mod.json");
+            if (File.Exists(defaultJsonPath))
+            {
+                try
+                {
+                    var defaultJson = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(defaultJsonPath));
+                    var files = defaultJson["Files"] as Newtonsoft.Json.Linq.JObject;
+                    if (files != null)
+                    {
+                        foreach (var cand in candidates)
+                        {
+                            if (files.TryGetValue(cand, out var tok))
+                            {
+                                chosenRel = tok?.Value<string>();
+                                if (!string.IsNullOrEmpty(chosenRel)) break;
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex) { Log.Debug($"[Duration] default_mod.json parse skipped: {ex.Message}"); }
+            }
+        }
+
+        if (!string.IsNullOrEmpty(chosenRel))
+        {
+            var full = Path.Combine(modRoot, chosenRel.Replace('/', Path.DirectorySeparatorChar));
+            if (File.Exists(full))
+            {
+                try { return File.ReadAllBytes(full); }
+                catch (Exception ex) { Log.Debug($"[Duration] read failed '{full}': {ex.Message}"); }
+            }
+        }
+
+        // Some mods ship files mirrored at the game path with no JSON mapping. Last-resort probe.
+        foreach (var cand in candidates)
+        {
+            var mirrored = Path.Combine(modRoot, cand.Replace('/', Path.DirectorySeparatorChar));
+            if (File.Exists(mirrored))
+            {
+                try { return File.ReadAllBytes(mirrored); }
+                catch { }
+            }
+        }
+
+        return null;
+    }
+
+    // Cache of loop durations keyed by "{modDirectory}|{emoteCommand}" (lowercase). Null = attempted and failed;
+    // missing key = never tried. Session-scoped - rebuilt on plugin reload.
+    private readonly Dictionary<string, float?> presetDurationCache = new();
+    private readonly HashSet<string> presetDurationInFlight = new();
+
+    // Status of a preset's loop-duration compute.
+    public enum LoopDurationState { NotApplicable, Measuring, Unavailable, Available }
+
+    // Tri-state lookup. State distinguishes still-computing from permanently-failed so the UI
+    // can show "measuring..." once and stop afterward. Duration is only valid when State == Available.
+    public (LoopDurationState state, float duration) GetPresetLoopDurationState(DancePreset preset, PresetModifier? modifier = null)
+    {
+        if (preset == null || string.IsNullOrWhiteSpace(preset.ModDirectory))
+            return (LoopDurationState.NotApplicable, 0f);
+        if (emoteCommandToId == null || emoteIdToTimelineKeys == null)
+            return (LoopDurationState.NotApplicable, 0f);
+
+        var effectiveCommand = modifier?.EmoteCommandOverride ?? preset.EmoteCommand;
+        if (string.IsNullOrWhiteSpace(effectiveCommand))
+            return (LoopDurationState.NotApplicable, 0f);
+        var effectiveAnimType = modifier?.EmoteCommandOverride != null
+            ? (int)GetAnimationTypeForCommand(modifier.EmoteCommandOverride)
+            : preset.AnimationType;
+        if (effectiveAnimType != 1)
+            return (LoopDurationState.NotApplicable, 0f);
+
+        var key = $"{preset.ModDirectory}|{effectiveCommand.ToLowerInvariant()}|{modifier?.Name ?? ""}";
+        if (presetDurationCache.TryGetValue(key, out var cached))
+            return cached.HasValue
+                ? (LoopDurationState.Available, cached.Value)
+                : (LoopDurationState.Unavailable, 0f);
+        if (presetDurationInFlight.Contains(key))
+            return (LoopDurationState.Measuring, 0f);
+
+        presetDurationInFlight.Add(key);
+        _ = Task.Run(() => ComputePresetDurationAsync(preset, modifier, effectiveCommand, key));
+        return (LoopDurationState.Measuring, 0f);
+    }
+
+    // Backwards-compat shim - returns the duration when available, null otherwise. Callers that
+    // need to distinguish measuring from failed should use GetPresetLoopDurationState.
+    public float? GetPresetLoopDuration(DancePreset preset, PresetModifier? modifier = null)
+    {
+        var (state, dur) = GetPresetLoopDurationState(preset, modifier);
+        return state == LoopDurationState.Available ? dur : null;
+    }
+
+    private async Task ComputePresetDurationAsync(DancePreset preset, PresetModifier? modifier, string effectiveCommand, string key)
+    {
+        try
+        {
+            Log.Information($"[Duration] Computing for '{preset.Name}' cmd='{effectiveCommand}' mod='{modifier?.Name ?? "-"}'");
+            if (!emoteCommandToId!.TryGetValue(effectiveCommand.TrimStart('/'), out var emoteId) &&
+                !emoteCommandToId!.TryGetValue(effectiveCommand, out emoteId) &&
+                !emoteCommandToId!.TryGetValue("/" + effectiveCommand.TrimStart('/'), out emoteId))
+            {
+                Log.Warning($"[Duration] No emote ID for command '{effectiveCommand}' - giving up");
+                presetDurationCache[key] = null;
+                return;
+            }
+            if (!emoteIdToTimelineKeys!.TryGetValue(emoteId, out var timelineKeys) || timelineKeys.Count == 0)
+            {
+                Log.Warning($"[Duration] No timeline keys for emote ID {emoteId} ('{effectiveCommand}')");
+                presetDurationCache[key] = null;
+                return;
+            }
+
+            // Prefer slot 0 (main/loop). Fall back to slot 1 if slot 0 is missing.
+            var main = timelineKeys.FirstOrDefault(t => t.slot == 0);
+            if (string.IsNullOrEmpty(main.key))
+                main = timelineKeys.First();
+            Log.Debug($"[Duration] Timeline key: '{main.key}' (slot {main.slot}, loop={main.isLoop})");
+
+            // read mod file directly: ResolvePlayerPath returns the priority winner, often vanilla
+            string? chosenGamePath = null;
+            await Framework.RunOnFrameworkThread(() =>
+            {
+                var paths = ResolveEmotePaths(main.key);
+                if (paths.Count == 0) return;
+                var raceCode = GetPlayerRaceCode();
+                var jobSub = GetPlayerJobSubfolder();
+                chosenGamePath = PickBestPath(paths, raceCode, jobSub);
+            });
+            if (chosenGamePath == null)
+            {
+                Log.Warning($"[Duration] Couldn't resolve a game path for timeline key '{main.key}'");
+                presetDurationCache[key] = null;
+                return;
+            }
+            Log.Debug($"[Duration] Game path: {chosenGamePath}");
+
+            var modBytes = ReadPresetModFile(preset, chosenGamePath, modifier);
+            var fromMod = modBytes != null;
+            var papBytes = modBytes
+                           ?? await Framework.RunOnFrameworkThread(() => DataManager.GetFile(chosenGamePath)?.Data?.ToArray());
+            if (papBytes == null || papBytes.Length == 0)
+            {
+                Log.Warning($"[Duration] Neither mod nor game data returned bytes for '{chosenGamePath}'");
+                presetDurationCache[key] = null;
+                return;
+            }
+            Log.Debug($"[Duration] Read {papBytes.Length} bytes from {(fromMod ? "mod" : "game data")}");
+
+            // Havok runtime is not thread-safe - parse on the framework thread.
+            float? duration = null;
+            await Framework.RunOnFrameworkThread(() =>
+            {
+                duration = PapDurationReader.ReadFromPapBytes(papBytes);
+            });
+
+            if (duration.HasValue)
+                Log.Information($"[Duration] '{preset.Name}' = {duration.Value:F3}s (from {(fromMod ? "mod" : "vanilla")})");
+            else
+                Log.Warning($"[Duration] Havok parse returned null for '{preset.Name}' (pap={papBytes.Length}b)");
+
+            presetDurationCache[key] = duration;
+        }
+        catch (Exception ex)
+        {
+            Log.Debug($"[Duration] Failed for '{preset.Name}': {ex.Message}");
+            presetDurationCache[key] = null;
+        }
+        finally
+        {
+            presetDurationInFlight.Remove(key);
+        }
     }
 
     /// <summary>Read the first internal animation name from a PAP file's binary data.</summary>
@@ -2483,14 +4088,7 @@ public sealed class Plugin : IDalamudPlugin
         return Encoding.ASCII.GetString(papData, nameStart, nameEnd - nameStart);
     }
 
-    /// <summary>
-    /// Rewrite all occurrences of a target animation name in PAP binary data to a carrier name.
-    /// Simple in-place replacement — carrier name must fit within the available padded space at
-    /// each occurrence. PapAnimation.Name (32 bytes padded) always fits. The C009.Path in the TMB
-    /// string table has limited space — carrier names longer than the target will fail there.
-    /// Use FindCarrier's maxNameLen constraint to ensure the carrier name fits.
-    /// Returns (modifiedData, replacedCount, foundCount).
-    /// </summary>
+    // C009.Path string table is fixed-size; carrier name must fit (use FindCarrier maxNameLen)
     private (byte[]? data, int replaced, int found) RewritePapAnimationNames(byte[] data, string targetName, string carrierName)
     {
         var result = (byte[])data.Clone();
@@ -2521,12 +4119,12 @@ public sealed class Plugin : IDalamudPlugin
 
             if (carrierBytes.Length + 1 <= available)
             {
-                // Fits — replace in place
+                // Fits - replace in place
                 Array.Copy(carrierBytes, 0, result, i, carrierBytes.Length);
                 for (int j = carrierBytes.Length; j < available; j++)
                     result[i + j] = 0;
                 replaced++;
-                Log.Verbose($"[EmoteSwap] Replaced in-place at offset {i}: '{targetName}' → '{carrierName}' ({carrierBytes.Length}/{available}b)");
+                Log.Verbose($"[EmoteSwap] Replaced in-place at offset {i}: '{targetName}' -> '{carrierName}' ({carrierBytes.Length}/{available}b)");
             }
             else
             {
@@ -2540,45 +4138,89 @@ public sealed class Plugin : IDalamudPlugin
             return (null, 0, 0);
         }
 
-        Log.Debug($"[EmoteSwap] Rewrote {replaced}/{found} occurrence(s) of '{targetName}' → '{carrierName}'");
+        Log.Debug($"[EmoteSwap] Rewrote {replaced}/{found} occurrence(s) of '{targetName}' -> '{carrierName}'");
         return (result, replaced, found);
     }
 
-    /// <summary>
-    /// Read a target animation file — from the mod (via ResolvePlayerPath) or from game data.
-    /// When readFromMod is true, resolves the game path through Penumbra to get the mod's file on disk.
-    /// Falls back to game data if the mod doesn't provide this specific file.
-    /// </summary>
     private byte[]? ReadTargetFile(string gamePath, bool readFromMod)
     {
         if (readFromMod && PenumbraService?.IsAvailable == true)
         {
+            // First: try the exact requested path
             var resolvedPath = PenumbraService.ResolvePlayerPath(gamePath);
+            Log.Information($"[ReadTargetFile] ResolvePlayerPath: {gamePath} -> {resolvedPath ?? "<null>"}");
             if (resolvedPath != null && resolvedPath != gamePath && File.Exists(resolvedPath))
             {
                 try
                 {
-                    return File.ReadAllBytes(resolvedPath);
+                    var data = File.ReadAllBytes(resolvedPath);
+                    // Compare size against the vanilla file - if they match, Penumbra resolved
+                    // to a mod file that is identical to vanilla (the mod's actual change happens
+                    // via meta/option redirection that ResolvePlayerPath doesn't evaluate).
+                    var vanillaFile = DataManager.GetFile(gamePath);
+                    if (vanillaFile != null && vanillaFile.Data.Length == data.Length)
+                        Log.Warning($"[ReadTargetFile] Resolved path '{resolvedPath}' matches vanilla size ({data.Length} bytes) - mod may use meta/option redirection that bypass can't capture");
+                    else
+                        Log.Debug($"[ReadTargetFile] Read mod file: {data.Length} bytes (vanilla would be {vanillaFile?.Data.Length ?? 0})");
+                    return data;
                 }
-                catch (Exception ex)
+                catch (Exception ex) { Log.Warning($"[ReadTargetFile] Failed to read mod file '{resolvedPath}': {ex.Message}"); }
+            }
+
+            // ResolvePlayerPath doesn't walk race affinity; do it manually then fall back to all races
+            var currentRace = ExtractRaceCodeFromPath(gamePath);
+            if (currentRace != null)
+            {
+                var triedRaces = new HashSet<string> { currentRace };
+                var candidateRaces = new List<string>();
+                if (RaceAnimationAffinity.TryGetValue(currentRace, out var affinity))
+                    candidateRaces.AddRange(affinity);
+                // Then all other races (gender-parity first for better skeleton match)
+                var isMaleRace = currentRace.Length >= 5 && currentRace[4] == '1';  // c##01 odd trailing = male
+                candidateRaces.AddRange(RaceIds.Where(r =>
+                    r.Length >= 5 && (r[4] == '1') == isMaleRace));
+                candidateRaces.AddRange(RaceIds.Where(r => r.Length >= 5 && (r[4] == '1') != isMaleRace));
+
+                foreach (var altRace in candidateRaces)
                 {
-                    Log.Warning($"[ReadTargetFile] Failed to read mod file '{resolvedPath}': {ex.Message}");
+                    if (!triedRaces.Add(altRace)) continue;
+                    var altPath = gamePath.Replace($"/{currentRace}/", $"/{altRace}/");
+                    if (altPath == gamePath) continue;
+                    var altResolved = PenumbraService.ResolvePlayerPath(altPath);
+                    if (altResolved != null && altResolved != altPath && File.Exists(altResolved))
+                    {
+                        try
+                        {
+                            Log.Debug($"[ReadTargetFile] Race fallback: {currentRace} -> {altRace} (mod file found)");
+                            return File.ReadAllBytes(altResolved);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Warning($"[ReadTargetFile] Failed to read fallback mod file '{altResolved}': {ex.Message}");
+                        }
+                    }
                 }
+                Log.Debug($"[ReadTargetFile] No mod file found for any race - falling back to vanilla ({gamePath})");
             }
         }
         var file = DataManager.GetFile(gamePath);
         return file?.Data;
     }
 
-    /// <summary>
-    /// Set up Penumbra file redirects for the emote swap.
-    /// Creates a real Penumbra mod on disk (Dancy-style) with default_mod.json file mappings,
-    /// then AddMod/ReloadMod + enable via SetTemporaryModSettings.
-    /// Carrier should be pre-selected with a name length constraint to ensure the PAP name fits
-    /// the target's C009.Path field. Partial rewrites are logged but slot 0 must succeed.
-    /// When readTargetFromMod is true, reads target PAP/TMB from the mod's files (via ResolvePlayerPath)
-    /// instead of game data — used for EmoteLocked presets where the mod provides custom animation.
-    /// </summary>
+    /// <summary>Extracts the cXX01 race code from a chara/human/cXX01/... path, or null if not present.</summary>
+    private static string? ExtractRaceCodeFromPath(string path)
+    {
+        const string prefix = "chara/human/";
+        var idx = path.IndexOf(prefix, StringComparison.OrdinalIgnoreCase);
+        if (idx < 0) return null;
+        var start = idx + prefix.Length;
+        if (start + 5 > path.Length) return null;
+        if (path[start] != 'c') return null;
+        return path.Substring(start, 5);
+    }
+
+    // creates a real on-disk Penumbra mod, AddMod -> ReloadMod -> SetTemporaryModSettings.
+    // readTargetFromMod=true for EmoteLocked presets (target PAP/TMB come from mod, not game data)
     private bool SetupEmoteSwap(List<(string carrierKey, string targetKey)> keyPairs, bool readTargetFromMod = false)
     {
         if (PenumbraService == null) return false;
@@ -2594,7 +4236,7 @@ public sealed class Plugin : IDalamudPlugin
             var configSwapDir = EmoteSwapDir;
             Directory.CreateDirectory(configSwapDir);
 
-            var allMappings = new Dictionary<string, string>(); // game path → absolute file path
+            var allMappings = new Dictionary<string, string>(); // game path -> absolute file path
             int successfulPairs = 0;
 
             // Use race+job-specific PAP for correct skeleton data
@@ -2606,7 +4248,7 @@ public sealed class Plugin : IDalamudPlugin
                 var (carrierKey, targetKey) = keyPairs[i];
                 Log.Debug($"[EmoteSwap] Pair {i}: carrier='{carrierKey}', target='{targetKey}'");
 
-                // Load target PAP — from mod (EmoteLocked preset) or game data
+                // Load target PAP - from mod (EmoteLocked preset) or game data
                 var targetPaths = ResolveEmotePaths(targetKey);
                 if (targetPaths.Count == 0) { Log.Warning($"[EmoteSwap] Pair {i}: No target paths found"); continue; }
 
@@ -2620,7 +4262,7 @@ public sealed class Plugin : IDalamudPlugin
                         var raceTag = tp.Contains("/c") ? tp.Substring(tp.IndexOf("/c") + 1, 5) : "global";
                         pathSummary.Append($"  {raceTag}: {f?.Data.Length ?? -1}b\n");
                     }
-                    Log.Information($"[EmoteSwap] Target '{targetKey}' — {targetPaths.Count} resolved paths:\n{pathSummary}");
+                    Log.Information($"[EmoteSwap] Target '{targetKey}' - {targetPaths.Count} resolved paths:\n{pathSummary}");
                 }
 
                 var selectedTargetPath = PickBestPath(targetPaths, playerRaceCode, playerJobSub);
@@ -2628,7 +4270,7 @@ public sealed class Plugin : IDalamudPlugin
                 var targetData = readTargetFromMod ? ReadTargetFile(selectedTargetPath, true) : DataManager.GetFile(selectedTargetPath)?.Data;
                 if (targetData == null) { Log.Warning($"[EmoteSwap] Pair {i}: Can't read target PAP from {selectedTargetPath}"); continue; }
 
-                // Load carrier PAP to read its actual internal animation name — prefer the player's race+job-specific file
+                // Load carrier PAP to read its actual internal animation name - prefer the player's race+job-specific file
                 var carrierExistingPaths = ResolveEmotePaths(carrierKey);
                 if (carrierExistingPaths.Count == 0) { Log.Warning($"[EmoteSwap] Pair {i}: No carrier paths for name lookup"); continue; }
                 var selectedCarrierPath = PickBestPath(carrierExistingPaths, playerRaceCode, playerJobSub);
@@ -2645,7 +4287,7 @@ public sealed class Plugin : IDalamudPlugin
                     continue;
                 }
 
-                Log.Debug($"[EmoteSwap] Pair {i}: rewriting '{targetName}' → '{carrierName}' ({targetData.Length} bytes)");
+                Log.Debug($"[EmoteSwap] Pair {i}: rewriting '{targetName}' -> '{carrierName}' ({targetData.Length} bytes)");
 
                 // Rewrite target PAP: replace animation name to match carrier's expected name.
                 // The surgical TMB-aware rewriter extends the string table when needed,
@@ -2653,14 +4295,14 @@ public sealed class Plugin : IDalamudPlugin
                 var (modifiedData, replaced, found) = RewritePapAnimationNames(targetData, targetName, carrierName);
                 if (modifiedData == null)
                 {
-                    Log.Warning($"[EmoteSwap] Pair {i}: Name rewrite failed — no occurrences found");
+                    Log.Warning($"[EmoteSwap] Pair {i}: Name rewrite failed - no occurrences found");
                     continue;
                 }
 
                 if (replaced < found)
                 {
-                    Log.Warning($"[EmoteSwap] Pair {i}: Incomplete rewrite ({replaced}/{found}) — some occurrences could not be updated");
-                    if (i == 0) { Log.Warning($"[EmoteSwap] Slot 0 incomplete — swap may not work correctly"); }
+                    Log.Warning($"[EmoteSwap] Pair {i}: Incomplete rewrite ({replaced}/{found}) - some occurrences could not be updated");
+                    if (i == 0) { Log.Warning($"[EmoteSwap] Slot 0 incomplete - swap may not work correctly"); }
                     else { continue; } // Skip non-critical slots
                 }
 
@@ -2669,19 +4311,14 @@ public sealed class Plugin : IDalamudPlugin
                 var configPath = Path.Combine(configSwapDir, fileName);
                 File.WriteAllBytes(configPath, modifiedData);
 
-                // Generate ALL possible carrier paths (every race × layer × subfolder).
+                // Generate ALL possible carrier paths (every race x layer x subfolder).
                 var carrierAllPaths = GenerateAllPossiblePaths(carrierKey);
                 foreach (var cp in carrierAllPaths)
                 {
                     allMappings[cp] = configPath;
                 }
 
-                // Also redirect the carrier's TMB (separate timeline file) to the target's TMB.
-                // The TMB controls timing, events, and may trigger facial expression loading.
-                // This allows target-specific events (including additive facial layers) to fire.
-                // Also redirect the carrier's TMB (separate timeline file) to the target's TMB.
-                // The TMB controls timing, events, and may trigger facial expression loading.
-                // Rewrite animation name references in the TMB to match the carrier name.
+                // redirect carrier TMB -> target TMB (timing/events/facial expression triggers)
                 var carrierTmbPath = $"chara/action/{carrierKey}.tmb";
                 var targetTmbPath = $"chara/action/{targetKey}.tmb";
                 var targetTmbData = readTargetFromMod ? ReadTargetFile(targetTmbPath, true) : DataManager.GetFile(targetTmbPath)?.Data;
@@ -2695,21 +4332,21 @@ public sealed class Plugin : IDalamudPlugin
                         if (rewrittenTmb != null && tmbReplaced > 0)
                         {
                             tmbData = rewrittenTmb;
-                            Log.Debug($"[EmoteSwap] Pair {i}: TMB name rewrite {tmbReplaced}/{tmbFound} '{targetName}' → '{carrierName}'");
+                            Log.Debug($"[EmoteSwap] Pair {i}: TMB name rewrite {tmbReplaced}/{tmbFound} '{targetName}' -> '{carrierName}'");
                         }
                     }
                     var tmbFileName = $"swap_tmb_{i}_{swapId}.tmb";
                     var tmbConfigPath = Path.Combine(configSwapDir, tmbFileName);
                     File.WriteAllBytes(tmbConfigPath, tmbData);
                     allMappings[carrierTmbPath] = tmbConfigPath;
-                    Log.Debug($"[EmoteSwap] Pair {i}: TMB redirect {carrierTmbPath} → {tmbFileName} ({tmbData.Length} bytes)");
+                    Log.Debug($"[EmoteSwap] Pair {i}: TMB redirect {carrierTmbPath} -> {tmbFileName} ({tmbData.Length} bytes)");
                 }
                 else
                 {
                     Log.Debug($"[EmoteSwap] Pair {i}: No target TMB at {targetTmbPath}");
                 }
 
-                Log.Debug($"[EmoteSwap] Pair {i}: {replaced}/{found} rewrites OK, {carrierAllPaths.Count} carrier paths → {fileName}");
+                Log.Debug($"[EmoteSwap] Pair {i}: {replaced}/{found} rewrites OK, {carrierAllPaths.Count} carrier paths -> {fileName}");
                 successfulPairs++;
             }
 
@@ -2735,7 +4372,7 @@ public sealed class Plugin : IDalamudPlugin
                     Directory.CreateDirectory(realModDir);
 
                     // Copy swap PAP files to the real mod directory and build relative mappings
-                    var relMappings = new Dictionary<string, string>(); // game path → local filename
+                    var relMappings = new Dictionary<string, string>(); // game path -> local filename
                     foreach (var (gamePath, absPath) in allMappings)
                     {
                         var fileName = Path.GetFileName(absPath);
@@ -2762,10 +4399,7 @@ public sealed class Plugin : IDalamudPlugin
                     // Register or reload the mod
                     if (!encoreSwapModRegistered)
                     {
-                        // First time: AddMod registers the mod in Penumbra's mod list.
-                        // AddMod triggers async file compaction which may hold locks briefly.
-                        // After AddMod, we must also call ReloadMod to fully activate the file
-                        // redirects in the collection cache — AddMod alone doesn't do this.
+                        // AddMod triggers async file compaction; ReloadMod is required to activate redirects
                         var addOk = PenumbraService.AddMod(EncoreSwapModName);
                         if (addOk)
                         {
@@ -2778,7 +4412,7 @@ public sealed class Plugin : IDalamudPlugin
                         }
                         else
                         {
-                            Log.Warning("[EmoteSwap] AddMod failed — falling back to AddTemporaryMod only");
+                            Log.Warning("[EmoteSwap] AddMod failed - falling back to AddTemporaryMod only");
                         }
                     }
                     else
@@ -2807,13 +4441,13 @@ public sealed class Plugin : IDalamudPlugin
                 }
                 catch (Exception ex)
                 {
-                    Log.Warning($"[EmoteSwap] Real mod setup failed: {ex.Message} — using AddTemporaryMod only");
+                    Log.Warning($"[EmoteSwap] Real mod setup failed: {ex.Message} - using AddTemporaryMod only");
                 }
             }
 
             if (!encoreSwapModRegistered)
             {
-                Log.Warning("[EmoteSwap] Real mod failed to register — unlock bypass unavailable");
+                Log.Warning("[EmoteSwap] Real mod failed to register - unlock bypass unavailable");
                 return false;
             }
 
@@ -2827,36 +4461,6 @@ public sealed class Plugin : IDalamudPlugin
         }
     }
 
-    /// <summary>
-    /// Soft-disable the emote swap: remove Penumbra temp settings so the carrier emote returns to normal,
-    /// but keep swap files on disk and sticking state intact. The next /vanilla call for the same emote
-    /// can re-enable the mod via SetTemporaryModSettings (incrementing ChangeCounter for cache invalidation)
-    /// without rebuilding all swap files. Full teardown happens via ClearEmoteSwap on preset/reset/dispose.
-    /// </summary>
-    private void SoftDisableEmoteSwap()
-    {
-        if (PenumbraService?.IsAvailable == true && encoreSwapModRegistered)
-        {
-            try
-            {
-                if (emoteSwapCollectionId != Guid.Empty)
-                    PenumbraService.RemoveTemporaryModSettings(emoteSwapCollectionId, EncoreSwapModName);
-
-                var (ok, currentCollId, _) = PenumbraService.GetCurrentCollection();
-                if (ok && currentCollId != Guid.Empty && currentCollId != emoteSwapCollectionId)
-                    PenumbraService.RemoveTemporaryModSettings(currentCollId, EncoreSwapModName);
-            }
-            catch { }
-        }
-
-        emoteSwapSoftDisabled = true;
-        emoteSwapIsOneShot = false;
-        emoteSwapCarrierId = 0;
-        emoteSwapWaitingForStart = false;
-        Log.Debug("[EmoteSwap] Soft-disabled (carrier returns to normal, swap preserved for sticking)");
-    }
-
-    /// <summary>Remove the emote swap (both real Penumbra mod and temporary mod) and clean up temp files.</summary>
     private void ClearEmoteSwap()
     {
         var wasActive = emoteSwapActive;
@@ -2916,12 +4520,11 @@ public sealed class Plugin : IDalamudPlugin
         lastBypassCarrierCommand = null;
         lastBypassCarrierId = 0;
         lastBypassRaceCode = null;
-        emoteSwapIsOneShot = false;
-        emoteSwapCarrierId = 0;
-        emoteSwapWaitingForStart = false;
         emoteSwapSoftDisabled = false;
+        // forces AddMod + 50ms + ReloadMod on next setup; bare ReloadMod doesn't reactivate redirects
+        encoreSwapModRegistered = false;
 
-        // Clean up config-dir swap files
+
         try
         {
             var swapDir = EmoteSwapDir;
@@ -2969,11 +4572,137 @@ public sealed class Plugin : IDalamudPlugin
         }
     }
 
+    // ExecuteCommandInner hook: locked emote -> route through bypass; carrier typed during swap -> clear swap
+    private unsafe void DetourExecuteCommandInner(ShellCommandModule* commandModule, Utf8String* rawMessage, UIModule* uiModule)
+    {
+        try
+        {
+            var msgSpan = rawMessage != null
+                ? new ReadOnlySpan<byte>(rawMessage->StringPtr, (int)rawMessage->Length)
+                : ReadOnlySpan<byte>.Empty;
+            var message = Encoding.UTF8.GetString(msgSpan).Trim();
+
+            if (!string.IsNullOrEmpty(message) && message.StartsWith('/'))
+            {
+                var commandPart = message.Split(' ')[0].ToLowerInvariant();
+
+                // user typing the carrier command is the explicit "off switch"; skip our own bypass calls
+                if (emoteSwapActive && !isExecutingBypassCarrier && lastBypassCarrierCommand != null &&
+                    string.Equals(commandPart, lastBypassCarrierCommand, StringComparison.OrdinalIgnoreCase))
+                {
+                    Log.Information($"[CommandHook] Carrier '{commandPart}' typed while swap active - clearing swap so real emote plays");
+                    ClearEmoteSwap();
+                    // Fall through to Original - game plays the real carrier emote
+                }
+                // Locked emote bypass: intercept locked emote commands and route through our bypass
+                else if (Configuration.AllowUnlockedEmotes && emoteCommandToId != null &&
+                    emoteCommandToId.TryGetValue(commandPart, out var emoteId) &&
+                    !IsEmoteUnlocked(emoteId))
+                {
+                    Log.Information($"[CommandHook] Intercepted locked emote '{commandPart}' (id={emoteId}), routing to bypass");
+
+                    // Resolve alias to canonical command for mod matching
+                    var emoteCmd = commandPart;
+                    var lookupKey = emoteCmd.TrimStart('/');
+                    if (Services.EmoteDetectionService.EmoteToCommand.TryGetValue(lookupKey, out var canonical))
+                        emoteCmd = canonical;
+
+                    // Fire off the bypass async (same flow as /vanilla)
+                    var capturedCmd = emoteCmd;
+                    Task.Run(() =>
+                    {
+                        Framework.RunOnFrameworkThread(() => ExecuteVanilla(capturedCmd));
+                    });
+
+                    // DON'T call Original - suppress the game's "not learned" message
+                    return;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"[CommandHook] Error in detour: {ex.Message}");
+        }
+
+        // Normal path: let the game handle it
+        executeCommandInnerHook!.Original(commandModule, rawMessage, uiModule);
+    }
+
+    /// <summary>
+    /// ConditionFlag change handler - cancels /loop when player starts casting, mounts, crafts, etc.
+    /// </summary>
+    private void OnConditionChanged(ConditionFlag flag, bool value)
+    {
+        if (!value || loopingEmoteCommand == null) return;
+
+        if (flag is ConditionFlag.Casting
+            or ConditionFlag.Casting87
+            or ConditionFlag.Mounted
+            or ConditionFlag.OccupiedInEvent
+            or ConditionFlag.OccupiedInQuestEvent
+            or ConditionFlag.Crafting
+            or ConditionFlag.ExecutingCraftingAction
+            or ConditionFlag.PreparingToCraft
+            or ConditionFlag.Gathering
+            or ConditionFlag.ExecutingGatheringAction
+            or ConditionFlag.OccupiedInCutSceneEvent
+            or ConditionFlag.WatchingCutscene
+            or ConditionFlag.WatchingCutscene78)
+        {
+            Log.Debug($"[EmoteLoop] Cancelled by condition flag: {flag}");
+            ClearEmoteLoop();
+        }
+    }
+
+    // skipped if no target, target is self, or player is sitting/dozing
+    private unsafe void FaceTarget()
+    {
+        var localPlayer = ObjectTable.LocalPlayer;
+        if (localPlayer == null || localPlayer.Address == nint.Zero) return;
+
+        var target = TargetManager.Target ?? TargetManager.SoftTarget;
+        if (target == null || target.Address == localPlayer.Address) return;
+
+        var player = (Character*)localPlayer.Address;
+        if (player == null) return;
+
+        // Don't rotate if sitting, dozing, mounted, etc.
+        if (player->Mode != CharacterModes.Normal) return;
+
+        var rot = MathF.Atan2(
+            target.Position.X - localPlayer.Position.X,
+            target.Position.Z - localPlayer.Position.Z);
+
+        player->GameObject.SetRotation(rot);
+    }
+
     private void OnFrameworkUpdate(IFramework fw)
     {
+        try
+        {
+            // BGM tracker polls regardless of preset state so it's ready when one starts
+            BgmTrackerService?.Update();
+
+            var localPlayer = ObjectTable.LocalPlayer;
+            if (localPlayer == null) return;
+
+            // Routine advancement / cancellation
+            if (activeRoutine != null)
+                UpdateActiveRoutine(localPlayer);
+        }
+        catch (Exception ex)
+        {
+            Log.Debug($"[Routine] update error: {ex.Message}");
+        }
+
+        // Active-emote-preset lifetime tracking - run independently so a routine exception
+        // can't suppress it. Clears Configuration.ActivePresetId when the emote ends or the
+        // player moves so the main window's "Running: ..." indicator disappears.
+        try { UpdateActivePresetTracking(); }
+        catch (Exception ex) { Log.Debug($"[ActivePreset] tracking error: {ex.Message}"); }
+
         var hasLoopActive = loopingEmoteCommand != null;
-        var hasSwapCleanup = emoteSwapActive && emoteSwapIsOneShot;
-        if (!hasLoopActive && !hasSwapCleanup) return;
+        if (!hasLoopActive) return;
 
         try
         {
@@ -2982,40 +4711,26 @@ public sealed class Plugin : IDalamudPlugin
 
             var currentEmoteId = ReadCurrentEmoteId();
 
-            // One-shot emote swap auto-cleanup: detect when the carrier emote finishes playing.
-            // Uses soft-disable instead of full teardown — removes Penumbra temp settings (carrier returns
-            // to normal animation) but keeps swap files and sticking state intact. On the next /vanilla call
-            // for the same emote, sticking re-enables the mod without rebuilding swap files.
-            // Skip one-shot cleanup if we're looping a locked emote — swap must stay active
-            if (hasSwapCleanup && emoteSwapCarrierId != 0 && loopCarrierCommand == null)
-            {
-                if (emoteSwapWaitingForStart)
-                {
-                    // Wait for carrier emote to start playing
-                    if (currentEmoteId == emoteSwapCarrierId)
-                        emoteSwapWaitingForStart = false;
-                }
-                else
-                {
-                    // Carrier was playing, detect when it stops
-                    if (currentEmoteId != emoteSwapCarrierId)
-                    {
-                        Log.Debug($"[EmoteSwap] One-shot carrier finished (emoteId changed from {emoteSwapCarrierId} to {currentEmoteId}), soft-disabling swap");
-                        SoftDisableEmoteSwap();
-                    }
-                }
-            }
-
-            if (!hasLoopActive) return;
-
             var currentTimeline = ReadBaseTimeline();
+
+            // weapon check must precede emote re-execution; otherwise IsWeaponDrawn can't transition
+            var isWeaponDrawn = ReadIsWeaponDrawn();
+            if (isWeaponDrawn != loopPreviousWeaponDrawn)
+            {
+                Log.Debug($"[EmoteLoop] Cancelled by weapon state change (drawn={isWeaponDrawn})");
+                ClearEmoteLoop();
+                loopPreviousWeaponDrawn = isWeaponDrawn;
+                previousEmoteId = currentEmoteId;
+                previousTimeline = currentTimeline;
+                return;
+            }
 
             // Capture the emote's ID and timeline when it first starts playing
             if (loopWaitingForStart && currentEmoteId != previousEmoteId && currentEmoteId != 0)
             {
                 if (loopingEmoteId == 0)
                 {
-                    // First execution — learn the emote's ID and timeline
+                    // First execution - learn the emote's ID and timeline
                     loopingEmoteId = currentEmoteId;
                     emoteTimeline = currentTimeline;
                     loopWaitingForStart = false;
@@ -3023,14 +4738,14 @@ public sealed class Plugin : IDalamudPlugin
                 }
                 else if (currentEmoteId == loopingEmoteId)
                 {
-                    // Re-execution — same emote started again
+                    // Re-execution - same emote started again
                     emoteTimeline = currentTimeline;
                     loopWaitingForStart = false;
                     previousPosition = localPlayer.Position;
                 }
                 else
                 {
-                    // A different emote started — user did something else, cancel loop
+                    // A different emote started - user did something else, cancel loop
                     ClearEmoteLoop();
                     previousEmoteId = currentEmoteId;
                     previousTimeline = currentTimeline;
@@ -3092,6 +4807,74 @@ public sealed class Plugin : IDalamudPlugin
         return player->EmoteController.EmoteId;
     }
 
+    // pose/movement presets are persistent (no-op via emoteSeen=true + emoteId=0)
+    private void UpdateActivePresetTracking()
+    {
+        if (Configuration.ActivePresetId == null) return;
+        if (activePresetEmoteSeen && activePresetEmoteId == 0) return;
+
+        var preset = Configuration.Presets.Find(p => p.Id == Configuration.ActivePresetId);
+        if (preset == null || preset.AnimationType != 1) return;
+
+        ushort currentEmoteId;
+        try { currentEmoteId = ReadCurrentEmoteId(); }
+        catch { return; }
+
+        if (!activePresetEmoteSeen)
+        {
+            // first frame: snapshot trailing emote to avoid latching onto previous preset
+            if (!activePresetIgnoreSnapshotted)
+            {
+                activePresetEmoteIgnoreId = currentEmoteId;
+                activePresetIgnoreSnapshotted = true;
+                return;
+            }
+
+            if (currentEmoteId != 0)
+            {
+                bool graceExpired = Environment.TickCount64 >= activePresetIgnoreExpiryTicks;
+                if (currentEmoteId != activePresetEmoteIgnoreId || graceExpired)
+                {
+                    activePresetEmoteId = currentEmoteId;
+                    activePresetEmoteTimeline = ReadBaseTimeline();
+                    activePresetEmoteSeen = true;
+                    activePresetEndCandidateFrames = 0;
+                    // re-apply heels now that Character.Mode is EmoteLoop/InPositionLoop (SH render path clears stale offsets)
+                    if (preset.HeelsOffset != null && !preset.HeelsOffset.IsZero())
+                        ApplyPresetHeels(preset);
+                }
+            }
+            return;
+        }
+
+        // OR-evidence end detection with 15-frame debounce (~250ms at 60fps)
+        ushort currentTimeline = ReadBaseTimeline();
+        bool emoteIdStillOurs = currentEmoteId != 0 && currentEmoteId == activePresetEmoteId;
+        bool timelineStillOurs = activePresetEmoteTimeline != 0
+                                 && currentTimeline == activePresetEmoteTimeline;
+
+        if (emoteIdStillOurs || timelineStillOurs)
+        {
+            activePresetEndCandidateFrames = 0;
+        }
+        else
+        {
+            activePresetEndCandidateFrames++;
+            if (activePresetEndCandidateFrames >= 15)
+            {
+                Configuration.ActivePresetId = null;
+                activePresetEmoteId = 0;
+                activePresetEmoteTimeline = 0;
+                activePresetEmoteSeen = false;
+                activePresetEndCandidateFrames = 0;
+                // Preset's heels offset was active - clear it now that the
+                // emote has ended, or the character stays "floating" at the
+                // preset's Y/rotation after the animation finishes.
+                SimpleHeelsService?.ClearOffset();
+            }
+        }
+    }
+
     private unsafe ushort ReadBaseTimeline()
     {
         var localPlayer = ObjectTable.LocalPlayer;
@@ -3101,6 +4884,18 @@ public sealed class Plugin : IDalamudPlugin
         if (player == null) return 0;
 
         return player->Timeline.TimelineSequencer.GetSlotTimeline(0);
+    }
+
+
+    private unsafe bool ReadIsWeaponDrawn()
+    {
+        var localPlayer = ObjectTable.LocalPlayer;
+        if (localPlayer == null || localPlayer.Address == nint.Zero) return false;
+
+        var player = (Character*)localPlayer.Address;
+        if (player == null) return false;
+
+        return player->IsWeaponDrawn;
     }
 
     public void ClearEmoteLoop()
@@ -3126,5 +4921,54 @@ public sealed class Plugin : IDalamudPlugin
             Message = seString,
             Type = type
         });
+    }
+
+    private void CheckForUpdates()
+    {
+        updateHttpClient.DefaultRequestHeaders.UserAgent.TryParseAdd("Encore-FFXIV-Plugin");
+        // Initial check after 8s, then every 30 minutes
+        updateCheckTimer = new System.Threading.Timer(_ => DoUpdateCheck(), null, 8000, UpdateCheckIntervalMs);
+    }
+
+    private async void DoUpdateCheck()
+    {
+        if (updateNotified || !Configuration.ShowUpdateNotification)
+            return;
+
+        try
+        {
+            var response = await updateHttpClient.GetStringAsync(UpdateCheckUrl);
+            var json = JArray.Parse(response);
+            var remoteVersionStr = json[0]?["AssemblyVersion"]?.ToString();
+
+            if (string.IsNullOrEmpty(remoteVersionStr))
+                return;
+
+            var remoteVersion = new Version(remoteVersionStr);
+            var localVersion = typeof(Plugin).Assembly.GetName().Version;
+
+            if (localVersion == null || remoteVersion <= localVersion)
+                return;
+
+            updateNotified = true;
+            updateCheckTimer?.Change(System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
+
+            var seString = new SeStringBuilder()
+                .AddUiForeground("[Encore] ", 35)
+                .AddText("A new version is available: ")
+                .AddUiForeground($"v{remoteVersion.ToString(3)}", 45)
+                .AddText($" (current: v{localVersion.ToString(3)})")
+                .Build();
+
+            ChatGui.Print(new XivChatEntry
+            {
+                Message = seString,
+                Type = XivChatType.Echo
+            });
+        }
+        catch (Exception ex)
+        {
+            Log.Debug($"Update check failed: {ex.Message}");
+        }
     }
 }
