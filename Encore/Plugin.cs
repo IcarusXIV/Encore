@@ -1,4 +1,6 @@
 using Dalamud.Game.ClientState.Conditions;
+using Dalamud.Game.ClientState.Objects.SubKinds;
+using Dalamud.Game.ClientState.Objects.Types;
 using Dalamud.Game.Command;
 using Dalamud.Game.Text.SeStringHandling;
 using Dalamud.Hooking;
@@ -58,7 +60,7 @@ public sealed class Plugin : IDalamudPlugin
     private const string MainCommand = "/encore";
 
     // Patch notes version - bump when patch notes content changes (not every build)
-    public const string PatchNotesVersion = "1.0.0.6";
+    public const string PatchNotesVersion = "1.0.1.0";
 
     // Update check: fetches repo.json from GitHub to compare versions
     private const string UpdateCheckUrl = "https://raw.githubusercontent.com/IcarusXIV/Encore/master/Encore/repo.json";
@@ -185,6 +187,10 @@ public sealed class Plugin : IDalamudPlugin
     // EmoteId already playing when preset started; skipped to avoid latching onto previous preset's tail
     private ushort activePresetEmoteIgnoreId = 0;
     private bool activePresetIgnoreSnapshotted = false;
+
+    // Pose preset (3/4/5) stand-up: arm on non-Normal mode so the pre-pose gap isn't read as a stop.
+    private string? posePresetTrackedId = null;
+    private bool posePresetArmed = false;
     private long activePresetIgnoreExpiryTicks = 0;
 
     // resolves the active SCD via option-group selections; falls back to game BGM if no mod music
@@ -330,6 +336,7 @@ public sealed class Plugin : IDalamudPlugin
             PoseService = new PoseService(GameInteropProvider, ObjectTable, Framework, Log);
             MovementService = new MovementService(GameInteropProvider, ObjectTable, GameConfig, Log);
             SimpleHeelsService = new SimpleHeelsService(PluginInterface, ObjectTable, Log);
+            targetPlayer = new EncoreTimelinePlayer();
 
             try
             {
@@ -345,11 +352,8 @@ public sealed class Plugin : IDalamudPlugin
                 BgmTrackerService = null;
             }
 
-            // Initialize emote mod cache in background (like CS+)
             if (PenumbraService.IsAvailable)
             {
-                EmoteDetectionService.InitializeCacheAsync();
-
                 // Subscribe to Penumbra mod events for cache invalidation
                 SubscribeToPenumbraEvents();
 
@@ -494,6 +498,18 @@ public sealed class Plugin : IDalamudPlugin
                 {
                     Log.Warning($"Failed to populate SpToEmote: {spEx.Message}");
                 }
+
+                // Populate loop_emot##/act_emot## -> command map from Lumina.
+                try
+                {
+                    var internalAdded = Services.EmoteDetectionService.PopulateInternalEmoteAnims(emoteIdToTimelineKeys, emoteCommandToId);
+                    if (internalAdded > 0)
+                        Log.Information($"Populated internal emote anim map with {internalAdded} entries from Lumina");
+                }
+                catch (Exception iEx)
+                {
+                    Log.Warning($"Failed to populate internal emote anim map: {iEx.Message}");
+                }
             }
         }
         catch (Exception ex)
@@ -502,6 +518,10 @@ public sealed class Plugin : IDalamudPlugin
             emoteCommandToId = null;
             emoteIdToTimelineKeys = null;
         }
+
+        // Cache scan must run after Lumina dictionaries are populated.
+        if (PenumbraService?.IsAvailable == true)
+            EmoteDetectionService?.InitializeCacheAsync();
 
         // Create windows
         MainWindow = new MainWindow();
@@ -564,6 +584,12 @@ public sealed class Plugin : IDalamudPlugin
         CommandManager.AddHandler("/vanilla", new CommandInfo(OnVanillaCommand)
         {
             HelpMessage = "Play an emote with vanilla animation, or use a modded animation you don't have the emote for (e.g., /vanilla beesknees)"
+        });
+
+        // Register do command (apply a preset to your target, e.g. /do wiggle; /do stop to end)
+        CommandManager.AddHandler("/do", new CommandInfo(OnDoCommand)
+        {
+            HelpMessage = "Make your target play a preset (e.g., /do wiggle). Use /do stop to end it."
         });
 
         // Register preset commands
@@ -741,7 +767,7 @@ public sealed class Plugin : IDalamudPlugin
 
         // Hook UI drawing
         PluginInterface.UiBuilder.Draw += WindowSystem.Draw;
-        PluginInterface.UiBuilder.OpenConfigUi += ToggleMainUi;
+        PluginInterface.UiBuilder.OpenConfigUi += ToggleSettingsUi;
         PluginInterface.UiBuilder.OpenMainUi += ToggleMainUi;
         Framework.Update += OnFrameworkUpdate;
 
@@ -798,7 +824,7 @@ public sealed class Plugin : IDalamudPlugin
         // Unhook UI and framework
         Framework.Update -= OnFrameworkUpdate;
         PluginInterface.UiBuilder.Draw -= WindowSystem.Draw;
-        PluginInterface.UiBuilder.OpenConfigUi -= ToggleMainUi;
+        PluginInterface.UiBuilder.OpenConfigUi -= ToggleSettingsUi;
         PluginInterface.UiBuilder.OpenMainUi -= ToggleMainUi;
 
         HeaderFont?.Dispose();
@@ -835,6 +861,11 @@ public sealed class Plugin : IDalamudPlugin
         CommandManager.RemoveHandler("/align");
         CommandManager.RemoveHandler("/loop");
         CommandManager.RemoveHandler("/vanilla");
+        CommandManager.RemoveHandler("/do");
+
+        // Clear any presets applied to targets (stop animation + remove their temp mod settings)
+        StopAllTargetPresets();
+        targetPlayer?.Dispose();
 
         foreach (var cmd in registeredPresetCommands)
         {
@@ -1076,8 +1107,8 @@ public sealed class Plugin : IDalamudPlugin
         if (emoteCommandToId != null && emoteCommandToId.TryGetValue(cmdLookup, out var emoteId)
             && !IsEmoteUnlocked(emoteId) && Configuration.AllowUnlockedEmotes)
         {
-            // Set up bypass and loop the carrier
-            var (carrierCmd, carrierId, _) = TrySetupEmoteBypass(emote);
+            // Set up bypass and loop the carrier.
+            var (carrierCmd, carrierId, _) = TrySetupEmoteBypass(emote, readFromMod: true);
             if (carrierCmd != null)
             {
                 loopingEmoteCommand = emote;
@@ -1138,7 +1169,7 @@ public sealed class Plugin : IDalamudPlugin
         ExecuteVanilla(emote);
     }
 
-    private void ExecuteVanilla(string emoteCommand)
+    private void ExecuteVanilla(string emoteCommand, bool disableConflictingMods = true)
     {
         if (PenumbraService == null || !PenumbraService.IsAvailable)
         {
@@ -1159,7 +1190,7 @@ public sealed class Plugin : IDalamudPlugin
             return;
         }
 
-        Log.Information($"Executing vanilla emote '{emoteCommand}' in collection '{collectionName}'");
+        Log.Information($"Executing emote '{emoteCommand}' in collection '{collectionName}' (disableMods={disableConflictingMods})");
 
         // Snapshot which mods have active temp settings (from previous preset)
         var previousModsWithTemp = new HashSet<string>(Configuration.ModsWithTempSettings);
@@ -1176,28 +1207,34 @@ public sealed class Plugin : IDalamudPlugin
         {
             try
             {
-                // Disable mods affecting this emote
-                var newModsWithTemp = await DisableModsForVanillaEmote(emoteCommand, collectionId);
+                HashSet<string> newModsWithTemp;
+                if (disableConflictingMods)
+                {
+                    newModsWithTemp = await DisableModsForVanillaEmote(emoteCommand, collectionId);
+                    Configuration.ActivePresetId = null;
+                    Configuration.ActivePresetCollectionId = collectionId.ToString();
+                }
+                else
+                {
+                    // Bypass-only: preserve active preset and mod state.
+                    newModsWithTemp = new HashSet<string>();
+                }
 
-                // Clear active preset (vanilla has no preset)
-                Configuration.ActivePresetId = null;
-                Configuration.ActivePresetCollectionId = collectionId.ToString();
-
-                // Execute the emote - set up bypass first if needed, then execute carrier
-                var emoteCmd = emoteCommand; // Capture for closure
+                var emoteCmd = emoteCommand; // capture for closure
                 string? bypassCommand = null;
                 ushort bypassCarrierId = 0;
                 bool bypassTargetIsLoop = false;
 
-                // Phase 1: Clear state, set up bypass
+                // Set up bypass.
                 await Framework.RunOnFrameworkThread(() =>
                 {
-                    loopingEmoteCommand = null; // Clear any active loop
+                    loopingEmoteCommand = null;
 
                     if (wasMovementPreset)
                         ExecuteRedraw();
 
-                    var (cmd, cId, tIsLoop) = TrySetupEmoteBypass(emoteCmd);
+                    // Keeping mods enabled implies the modded animation, not vanilla.
+                    var (cmd, cId, tIsLoop) = TrySetupEmoteBypass(emoteCmd, readFromMod: !disableConflictingMods);
                     bypassCommand = cmd;
                     bypassCarrierId = cId;
                     bypassTargetIsLoop = tIsLoop;
@@ -1224,13 +1261,13 @@ public sealed class Plugin : IDalamudPlugin
                     }
                 });
 
-                // delay during bypass: RemoveTemporaryModSettings disrupts in-flight TMB/PAP loads
-                if (bypassCommand != null && previousModsWithTemp.Count > 0)
-                    await Task.Delay(500);
-
-                // Restore previous preset's temp settings (empty modDirectory = nothing skipped)
-                if (previousModsWithTemp.Count > 0)
+                if (disableConflictingMods && previousModsWithTemp.Count > 0)
                 {
+                    // delay during bypass: RemoveTemporaryModSettings disrupts in-flight TMB/PAP loads
+                    if (bypassCommand != null)
+                        await Task.Delay(500);
+
+                    // Restore previous preset's temp settings (empty modDirectory = nothing skipped)
                     await RestorePreviousChanges(collectionId, previousModsWithTemp, "", newModsWithTemp);
                 }
 
@@ -1317,6 +1354,11 @@ public sealed class Plugin : IDalamudPlugin
         MainWindow.Toggle();
     }
 
+    public void ToggleSettingsUi()
+    {
+        SettingsWindow.Toggle();
+    }
+
     public void UpdatePresetCommands()
     {
         // Remove old commands
@@ -1374,6 +1416,222 @@ public sealed class Plugin : IDalamudPlugin
 
         // routines registered after presets for conflict skipping
         UpdateRoutineCommands();
+    }
+
+    // Target-preset state for /do: object index -> (collection, temp mod keys, preset id).
+    private EncoreTimelinePlayer? targetPlayer;
+    private readonly Dictionary<int, (Guid Collection, HashSet<string> TempKeys, string PresetId)> targetPresets = new();
+
+    // /do <preset> [modifier]  - make your target play a preset; /do stop ends it.
+    private void OnDoCommand(string command, string args)
+    {
+        var tokens = args.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var first = tokens.Length > 0 ? tokens[0].ToLowerInvariant() : "";
+
+        if (first.Length == 0)
+        {
+            PrintChat("Usage: /do <preset> [modifier]  |  /do stop");
+            return;
+        }
+        if (first is "stop" or "off")
+        {
+            StopTargetPreset();
+            return;
+        }
+
+        var preset = Configuration.Presets.Find(p =>
+            !string.IsNullOrEmpty(p.ChatCommand) && string.Equals(p.ChatCommand, first, StringComparison.OrdinalIgnoreCase));
+        if (preset == null)
+        {
+            PrintChat($"No preset for '/do {first}'.", XivChatType.ErrorMessage);
+            return;
+        }
+
+        PresetModifier? modifier = null;
+        if (tokens.Length > 1)
+        {
+            modifier = preset.Modifiers.Find(m => string.Equals(m.Name, tokens[1], StringComparison.OrdinalIgnoreCase));
+            if (modifier == null)
+            {
+                PrintChat($"Unknown modifier '{tokens[1]}' for '/do {first}'.");
+                return;
+            }
+        }
+
+        ApplyPresetToTarget(preset, modifier);
+    }
+
+    private void ApplyPresetToTarget(DancePreset preset, PresetModifier? modifier)
+    {
+        if (PenumbraService == null || !PenumbraService.IsAvailable)
+        {
+            PrintChat("Penumbra is not available!", XivChatType.ErrorMessage);
+            return;
+        }
+        if (targetPlayer == null)
+            return;
+
+        var targetObj = ResolveDoTarget();
+        if (targetObj is not ICharacter)
+        {
+            PrintChat("No target.", XivChatType.ErrorMessage);
+            return;
+        }
+        // NPCs and plugin-spawned actors (index >= 200) only.
+        if (targetObj is not INpc && targetObj is not IBattleNpc && targetObj.ObjectIndex < 200)
+        {
+            PrintChat("That target isn't an NPC.", XivChatType.ErrorMessage);
+            return;
+        }
+
+        var emoteCommand = preset.EmoteCommand;
+        var animType = preset.AnimationType;
+        var poseIndex = preset.PoseIndex;
+        if (modifier?.EmoteCommandOverride != null)
+        {
+            emoteCommand = modifier.EmoteCommandOverride;
+            animType = GetAnimationTypeForCommand(modifier.EmoteCommandOverride);
+            poseIndex = modifier.PoseIndexOverride ?? -1;
+        }
+        else if (modifier?.PoseIndexOverride != null)
+        {
+            poseIndex = modifier.PoseIndexOverride.Value;
+        }
+
+        if (animType == 6)
+        {
+            PrintChat("Movement presets can't be applied to a target.", XivChatType.ErrorMessage);
+            return;
+        }
+
+        if (!TryResolvePresetTimelines(emoteCommand, animType, poseIndex, out var loop, out var intro))
+        {
+            PrintChat($"Couldn't resolve an animation for preset '{preset.Name}'.", XivChatType.ErrorMessage);
+            return;
+        }
+
+        var collection = PenumbraService.GetCollectionForObject(targetObj.ObjectIndex);
+        if (!collection.success)
+        {
+            PrintChat("Couldn't determine the target's Penumbra collection.", XivChatType.ErrorMessage);
+            return;
+        }
+
+        var targetIndex = (int)targetObj.ObjectIndex;
+        var collectionId = collection.collectionId;
+
+        Task.Run(async () =>
+        {
+            try
+            {
+                var tempKeys = await ApplyPresetPriorities(preset, collectionId, modifier);
+
+                if (preset.Dependencies.Any(d => d.RedrawOnEnable))
+                {
+                    await Task.Delay(300);
+                    await Framework.RunOnFrameworkThread(() => ExecuteRedrawForTarget(targetIndex));
+                    await Task.Delay(500);
+                }
+
+                Framework.RunOnFrameworkThread(() =>
+                {
+                    var current = targetIndex >= 0 && targetIndex < ObjectTable.Length ? ObjectTable[targetIndex] : null;
+                    if (current is ICharacter live && loop != 0)
+                        targetPlayer.PlayLoop(live, loop, intro);
+                    targetPresets[targetIndex] = (collectionId, tempKeys, preset.Id);
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"[/do] Failed to apply preset to target: {ex}");
+            }
+        });
+    }
+
+    private Dalamud.Game.ClientState.Objects.Types.IGameObject? ResolveDoTarget()
+        => ClientState.IsGPosing
+            ? TargetManager.GPoseTarget ?? TargetManager.Target ?? TargetManager.SoftTarget
+            : TargetManager.Target ?? TargetManager.SoftTarget;
+
+    private void StopTargetPreset()
+    {
+        var targetObj = ResolveDoTarget();
+        if (targetObj != null && targetPresets.ContainsKey((int)targetObj.ObjectIndex))
+        {
+            ClearTargetPreset((int)targetObj.ObjectIndex, targetObj as ICharacter);
+            return;
+        }
+        // Nothing valid targeted: clear everything we're tracking (safety net for a stray actor).
+        StopAllTargetPresets();
+    }
+
+    private void StopAllTargetPresets()
+    {
+        foreach (var idx in targetPresets.Keys.ToList())
+        {
+            var obj = idx >= 0 && idx < ObjectTable.Length ? ObjectTable[idx] : null;
+            ClearTargetPreset(idx, obj as ICharacter);
+        }
+    }
+
+    private void ClearTargetPreset(int targetIndex, ICharacter? character)
+    {
+        if (!targetPresets.TryGetValue(targetIndex, out var state))
+            return;
+
+        if (character != null)
+            targetPlayer?.Stop(character);
+
+        if (PenumbraService?.IsAvailable == true)
+        {
+            foreach (var key in state.TempKeys)
+            {
+                var parts = key.Split('|');
+                if (parts.Length >= 2 && Guid.TryParse(parts[0], out var collId))
+                    PenumbraService.RemoveTemporaryModSettings(collId, parts[1], parts.Length >= 3 ? parts[2] : "");
+            }
+        }
+
+        targetPresets.Remove(targetIndex);
+    }
+
+    // Resolve a preset's emote/pose to its loop (+ intro) action timelines for playback on a target.
+    private bool TryResolvePresetTimelines(string emoteCommand, int animType, int poseIndex, out ushort loop, out ushort intro)
+    {
+        loop = 0;
+        intro = 0;
+
+        ushort emoteRowId = animType == 1
+            ? (!string.IsNullOrEmpty(emoteCommand) && emoteCommandToId.TryGetValue(emoteCommand.ToLowerInvariant(), out var id) ? id : (ushort)0)
+            : ResolvePoseEmoteId(animType, poseIndex);
+
+        if (emoteRowId == 0)
+            return false;
+
+        var sheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Emote>();
+        var row = sheet?.GetRowOrDefault(emoteRowId);
+        if (row == null)
+            return false;
+
+        loop = (ushort)row.Value.ActionTimeline[0].RowId;
+        intro = (ushort)row.Value.ActionTimeline[1].RowId;
+        return loop != 0;
+    }
+
+    // Maps a pose type + index to the cpose emote id whose timeline is that pose.
+    private static ushort ResolvePoseEmoteId(int animType, int poseIndex)
+    {
+        ushort[] ids = animType switch
+        {
+            2 => new ushort[] { 0, 91, 92, 107, 108, 218, 219 }, // standing idle (0 = default)
+            3 => new ushort[] { 50, 95, 96, 254, 255 },          // chair sit
+            4 => new ushort[] { 52, 97, 98, 117 },               // ground sit
+            5 => new ushort[] { 88, 99, 100 },                   // doze
+            _ => Array.Empty<ushort>()
+        };
+        if (poseIndex < 0 || poseIndex >= ids.Length)
+            return 0;
+        return ids[poseIndex];
     }
 
     private void OnPresetCommand(string presetId, string args)
@@ -1484,6 +1742,8 @@ public sealed class Plugin : IDalamudPlugin
                     {
                         ApplyTempSettingsForPresetMod(collectionId, preset, modifier);
                     }
+                    if (PenumbraService != null)
+                        ApplyDependencyMods(preset, collectionId, new HashSet<string>());
                     TryWireModMusicForBpm(preset, modifier);
                 }
                 else
@@ -1499,6 +1759,14 @@ public sealed class Plugin : IDalamudPlugin
                     // mod-bundled music: BPM tracker locks to that track
                     // instead of the ambient game BGM.
                     TryWireModMusicForBpm(preset, modifier);
+                }
+
+                // Skeleton dependencies must be loaded via redraw before the emote plays
+                if (!isAlreadyActive && preset.Dependencies.Any(d => d.RedrawOnEnable))
+                {
+                    await Task.Delay(300);
+                    await Framework.RunOnFrameworkThread(ExecuteRedraw);
+                    await Task.Delay(500);
                 }
 
                         Framework.RunOnFrameworkThread(() => ApplyPresetHeels(preset));
@@ -1542,8 +1810,17 @@ public sealed class Plugin : IDalamudPlugin
                     var presetHasModifiers = preset.Modifiers.Count > 0;
                     var baseEmoteCmd = preset.EmoteCommand;
 
-                    // forceBypass: same-base-emote routine transitions reuse this pipeline
-                    if ((preset.EmoteLocked || forceBypass) && animType == 1 && !preset.IsVanilla)
+                    bool emoteIsLocked = false;
+                    if (Configuration.AllowUnlockedEmotes && emoteCommandToId != null && !string.IsNullOrEmpty(emoteCmd))
+                    {
+                        var lockKey = emoteCmd.ToLowerInvariant();
+                        // Zantetsuken misreports as unlocked (Mogstation), so force it.
+                        if (emoteCommandToId.TryGetValue(lockKey, out var presetEmoteId))
+                            emoteIsLocked = !IsEmoteUnlocked(presetEmoteId) || lockKey.TrimStart('/') is "zantetsuken" or "ztk";
+                    }
+
+                    // forceBypass: same-base-emote routine transitions reuse this pipeline.
+                    if ((preset.EmoteLocked || emoteIsLocked || forceBypass) && animType == 1 && !preset.IsVanilla)
                     {
                         string? bypassCommand = null;
                         ushort bypassCarrierId = 0;
@@ -2504,6 +2781,8 @@ public sealed class Plugin : IDalamudPlugin
 
         var newModsWithTemp = new HashSet<string>();
 
+        ApplyDependencyMods(preset, collectionId, newModsWithTemp);
+
         // Vanilla preset - skip mod enable/priority, just disable conflicts
         if (preset.IsVanilla)
         {
@@ -2525,6 +2804,36 @@ public sealed class Plugin : IDalamudPlugin
             newModsWithTemp.Add(key);
 
         return newModsWithTemp;
+    }
+
+    private void ApplyDependencyMods(DancePreset preset, Guid collectionId, HashSet<string> newModsWithTemp)
+    {
+        foreach (var dep in preset.Dependencies)
+        {
+            if (string.IsNullOrEmpty(dep.ModDirectory))
+                continue;
+
+            var (gotDep, _, depPriority, depOptions) = PenumbraService!.GetCurrentModSettings(
+                collectionId, dep.ModDirectory, dep.ModName);
+            var mergedOptions = gotDep ? new Dictionary<string, List<string>>(depOptions)
+                                       : new Dictionary<string, List<string>>();
+            foreach (var (g, o) in dep.ModOptions)
+                mergedOptions[g] = o;
+            var result = PenumbraService.SetTemporaryModSettings(collectionId, dep.ModDirectory,
+                enabled: true, priority: (gotDep ? depPriority : 0) + dep.PriorityBoost,
+                options: mergedOptions,
+                modName: dep.ModName);
+            if (!result)
+            {
+                Log.Warning($"Failed to enable dependency mod '{dep.ModName}' for preset '{preset.Name}'");
+                continue;
+            }
+
+            var depKey = $"{collectionId}|{dep.ModDirectory}|{dep.ModName}";
+            Configuration.ModsWithTempSettings.Add(depKey);
+            newModsWithTemp.Add(depKey);
+            Log.Information($"Enabled dependency '{dep.ModName}' at priority +{dep.PriorityBoost}");
+        }
     }
 
     // Returns set of mod keys that were temp-disabled by this call
@@ -2612,6 +2921,10 @@ public sealed class Plugin : IDalamudPlugin
         {
             // Skip the preset's own mod (unless vanilla preset which has no mod)
             if (!preset.IsVanilla && string.Equals(mod.ModDirectory, preset.ModDirectory, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            // Never disable the preset's own dependencies
+            if (preset.Dependencies.Any(d => string.Equals(d.ModDirectory, mod.ModDirectory, StringComparison.OrdinalIgnoreCase)))
                 continue;
 
             // Check if this mod affects any of the same emotes (by name or command)
@@ -3011,11 +3324,14 @@ public sealed class Plugin : IDalamudPlugin
         };
     }
 
-    // direct ProcessChatBoxEntry; isExecutingBypassCarrier flag tells the hook not to clear the swap
+    // isExecutingBypassCarrier stops the command hook clearing the swap
     private unsafe void ExecuteEmoteDirect(string command)
     {
         if (string.IsNullOrWhiteSpace(command)) return;
         if (!command.StartsWith("/")) command = "/" + command;
+
+        if (TryExecuteEmoteById(command)) return;
+
         isExecutingBypassCarrier = true;
         try
         {
@@ -3024,7 +3340,7 @@ public sealed class Plugin : IDalamudPlugin
             {
                 using var str = new Utf8String(command);
                 uiModule->ProcessChatBoxEntry(&str);
-                Log.Debug($"Executed emote (direct): {command}");
+                Log.Debug($"Executed emote (chat): {command}");
             }
         }
         catch (Exception ex)
@@ -3034,6 +3350,32 @@ public sealed class Plugin : IDalamudPlugin
         finally
         {
             isExecutingBypassCarrier = false;
+        }
+    }
+
+    private unsafe bool TryExecuteEmoteById(string command)
+    {
+        if (emoteCommandToId == null) return false;
+        if (!emoteCommandToId.TryGetValue(command, out var emoteId)) return false;
+
+        try
+        {
+            var manager = EmoteManager.Instance();
+            if (manager == null) return false;
+
+            if (!manager->ExecuteEmote(emoteId))
+            {
+                Log.Debug($"EmoteManager refused '{command}' (id={emoteId})");
+                return false;
+            }
+
+            Log.Debug($"Executed emote (direct): {command} (id={emoteId})");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log.Debug($"Direct execute failed for '{command}': {ex.Message}");
+            return false;
         }
     }
 
@@ -3079,6 +3421,18 @@ public sealed class Plugin : IDalamudPlugin
             return uiState != null && uiState->IsEmoteUnlocked(emoteId);
         }
         catch { return true; }
+    }
+
+    // True if this preset's emote isn't owned and would route through the unlock bypass.
+    public bool IsPresetEmoteBypassed(DancePreset preset)
+    {
+        if (preset.IsVanilla || preset.AnimationType != 1) return false;
+        if (preset.EmoteLocked) return true;
+        if (!Configuration.AllowUnlockedEmotes || emoteCommandToId == null || string.IsNullOrEmpty(preset.EmoteCommand))
+            return false;
+        var key = preset.EmoteCommand.ToLowerInvariant();
+        if (!emoteCommandToId.TryGetValue(key, out var id)) return false;
+        return !IsEmoteUnlocked(id) || key.TrimStart('/') is "zantetsuken" or "ztk";
     }
 
     // All 18 race/gender IDs in FFXIV
@@ -3154,11 +3508,11 @@ public sealed class Plugin : IDalamudPlugin
         { "/sit", "/groundsit", "/doze", "/changepose", "/cpose", "/hug", "/pet", "/handover", "/embrace", "/dote",
           "/showleft", "/showright", "/savortea", "/hildy", "/songbird" };
 
-    // looping carriers are scanned dynamically per-account (vary, often emote_sp/_loop keys)
+    // looping carriers are scanned dynamically per-account
     private static readonly string[] PreferredOneShotCarriers = { "/no", "/me", "/bow", "/clap", "/yes", "/wave", "/cheer", "/dance", "/laugh" };
 
     // matches loop type; prefers slot 1 carriers when target has intro animation
-    private (ushort id, string command, string key, string papName, bool isLoop, string? slot1Key, string? slot1PapName)? FindCarrier(bool needsLoop, bool preferSlot1 = false, int maxNameLen = 0, int maxSlot1NameLen = 0, byte? requiredConditionMode = null, HashSet<ushort>? excludeCarrierIds = null)
+    private (ushort id, string command, string key, string papName, bool isLoop, string? slot1Key, string? slot1PapName)? FindCarrier(bool needsLoop, bool preferSlot1 = false, int maxNameLen = 0, int maxSlot1NameLen = 0, byte? requiredConditionMode = null, HashSet<ushort>? excludeCarrierIds = null, bool rejectTmbOnlyIntro = false)
     {
         if (emoteCommandToId == null || emoteIdToTimelineKeys == null) return null;
 
@@ -3184,37 +3538,38 @@ public sealed class Plugin : IDalamudPlugin
         {
             foreach (var cmd in PreferredOneShotCarriers)
             {
-                var result = TryGetCarrierInfo(cmd, excludedIds, requireLoop: false, requiredConditionMode: requiredConditionMode);
+                var result = TryGetCarrierInfo(cmd, excludedIds, requireLoop: false, requiredConditionMode: requiredConditionMode, rejectTmbOnlyIntro: rejectTmbOnlyIntro);
                 if (result != null && (!preferSlot1 || result.Value.slot1Key != null) && FitsNameConstraint(result)) return result;
             }
         }
 
         // Scan all unlocked emotes for a carrier matching the requested loop type
-        // When preferSlot1, first pass requires slot 1, second pass accepts any
+        // preferSlot1: first pass requires slot 1
         if (preferSlot1)
         {
-            var withSlot1 = ScanForCarrier(excludedIds, needsLoop, requireSlot1: true, maxNameLen, maxSlot1NameLen, requiredConditionMode: requiredConditionMode);
+            var withSlot1 = ScanForCarrier(excludedIds, needsLoop, requireSlot1: true, maxNameLen, maxSlot1NameLen, requiredConditionMode: requiredConditionMode, rejectTmbOnlyIntro: rejectTmbOnlyIntro);
             if (withSlot1 != null) return withSlot1;
+            Log.Debug($"[UnlockBypass] No carrier with a usable intro fits, falling back to one without");
         }
-        var matchingCarrier = ScanForCarrier(excludedIds, needsLoop, requireSlot1: false, maxNameLen, requiredConditionMode: requiredConditionMode);
+        var matchingCarrier = ScanForCarrier(excludedIds, needsLoop, requireSlot1: false, maxNameLen, requiredConditionMode: requiredConditionMode, rejectTmbOnlyIntro: rejectTmbOnlyIntro);
         if (matchingCarrier != null) return matchingCarrier;
 
-        // Fallback: accept any carrier regardless of loop type (mismatched is better than nothing)
+        // Fallback: any carrier regardless of loop type
         Log.Debug($"[UnlockBypass] No {(needsLoop ? "looping" : "one-shot")} carriers found with name length <= {maxNameLen}, trying any carrier");
         if (needsLoop)
         {
-            // For looping targets that couldn't find a looping carrier, try preferred one-shot
+            // looping target, no looping carrier: try preferred one-shot
             foreach (var cmd in PreferredOneShotCarriers)
             {
-                var result = TryGetCarrierInfo(cmd, excludedIds, requireLoop: null, requiredConditionMode: requiredConditionMode);
+                var result = TryGetCarrierInfo(cmd, excludedIds, requireLoop: null, requiredConditionMode: requiredConditionMode, rejectTmbOnlyIntro: rejectTmbOnlyIntro);
                 if (FitsNameConstraint(result)) return result;
             }
         }
-        return ScanForCarrier(excludedIds, loopType: null, requireSlot1: false, maxNameLen, requiredConditionMode: requiredConditionMode);
+        return ScanForCarrier(excludedIds, loopType: null, requireSlot1: false, maxNameLen, requiredConditionMode: requiredConditionMode, rejectTmbOnlyIntro: rejectTmbOnlyIntro);
     }
 
-    /// <summary>Scan all unlocked emotes for a carrier. loopType=null means accept any. maxNameLen=0 means no limit.</summary>
-    private (ushort id, string command, string key, string papName, bool isLoop, string? slot1Key, string? slot1PapName)? ScanForCarrier(HashSet<ushort> excludedIds, bool? loopType, bool requireSlot1, int maxNameLen = 0, int maxSlot1NameLen = 0, byte? requiredConditionMode = null)
+    // null loopType / 0 maxNameLen = no constraint
+    private (ushort id, string command, string key, string papName, bool isLoop, string? slot1Key, string? slot1PapName)? ScanForCarrier(HashSet<ushort> excludedIds, bool? loopType, bool requireSlot1, int maxNameLen = 0, int maxSlot1NameLen = 0, byte? requiredConditionMode = null, bool rejectTmbOnlyIntro = false)
     {
         foreach (var (id, keys) in emoteIdToTimelineKeys!)
         {
@@ -3227,8 +3582,9 @@ public sealed class Plugin : IDalamudPlugin
             if (string.IsNullOrEmpty(slot0.key)) continue;
             if (loopType.HasValue && slot0.isLoop != loopType.Value) continue;
 
-            var (slot1Key, slot1PapName) = GetCarrierSlot1Info(keys);
+            var (slot1Key, slot1PapName, intro) = GetCarrierSlot1Info(keys);
             if (requireSlot1 && slot1Key == null) continue;
+            if (rejectTmbOnlyIntro && intro == CarrierIntro.TmbOnly) continue;
 
             var papName = GetCarrierPapName(id, slot0.key);
             if (papName == null) continue;
@@ -3253,9 +3609,7 @@ public sealed class Plugin : IDalamudPlugin
         return null;
     }
 
-    /// <summary>Try to resolve a preferred carrier command into full carrier info.</summary>
-    /// <param name="requireLoop">If set, only return carriers matching this loop type. Null = accept any.</param>
-    private (ushort id, string command, string key, string papName, bool isLoop, string? slot1Key, string? slot1PapName)? TryGetCarrierInfo(string command, HashSet<ushort> excludedIds, bool? requireLoop, byte? requiredConditionMode = null)
+    private (ushort id, string command, string key, string papName, bool isLoop, string? slot1Key, string? slot1PapName)? TryGetCarrierInfo(string command, HashSet<ushort> excludedIds, bool? requireLoop, byte? requiredConditionMode = null, bool rejectTmbOnlyIntro = false)
     {
         var cmdLookup = command.TrimStart('/').ToLowerInvariant();
         if (!emoteCommandToId!.TryGetValue(cmdLookup, out var id)) return null;
@@ -3273,7 +3627,8 @@ public sealed class Plugin : IDalamudPlugin
         var papName = GetCarrierPapName(id, slot0.key);
         if (papName == null) return null;
 
-        var (slot1Key, slot1PapName) = GetCarrierSlot1Info(keys);
+        var (slot1Key, slot1PapName, intro) = GetCarrierSlot1Info(keys);
+        if (rejectTmbOnlyIntro && intro == CarrierIntro.TmbOnly) return null;
         return (id, command, slot0.key, papName, slot0.isLoop, slot1Key, slot1PapName);
     }
 
@@ -3292,23 +3647,27 @@ public sealed class Plugin : IDalamudPlugin
         return papName;
     }
 
-    /// <summary>Get slot 1 (intro/start) info for a carrier if available.</summary>
-    private (string? slot1Key, string? slot1PapName) GetCarrierSlot1Info(List<(int slot, string key, bool isLoop, byte loadType)> keys)
+    // TmbOnly: slot 1 with no pap, carrier's own windup plays
+    private enum CarrierIntro { None, TmbOnly, Pap }
+
+    // slot 1 (intro/start) info for a carrier
+    private (string? slot1Key, string? slot1PapName, CarrierIntro intro) GetCarrierSlot1Info(List<(int slot, string key, bool isLoop, byte loadType)> keys)
     {
         var slot1 = keys.FirstOrDefault(k => k.slot == 1);
-        if (string.IsNullOrEmpty(slot1.key)) return (null, null);
+        if (string.IsNullOrEmpty(slot1.key)) return (null, null, CarrierIntro.None);
         var slot1Paths = ResolveEmotePaths(slot1.key);
-        if (slot1Paths.Count == 0) return (null, null);
+        if (slot1Paths.Count == 0) return (null, null, CarrierIntro.TmbOnly);
         var slot1File = DataManager.GetFile(slot1Paths[0]);
-        if (slot1File == null) return (null, null);
+        if (slot1File == null) return (null, null, CarrierIntro.TmbOnly);
         var slot1PapName = ReadPapAnimationName(slot1File.Data);
-        if (slot1PapName == null) return (null, null);
-        return (slot1.key, slot1PapName);
+        if (slot1PapName == null) return (null, null, CarrierIntro.TmbOnly);
+        return (slot1.key, slot1PapName, CarrierIntro.Pap);
     }
 
-    // forPreset (EmoteLocked): skips unlock check + carrier sticking, reads target PAP from mod files
+    // forPreset (EmoteLocked): skips unlock check + carrier sticking, reads target PAP from mod files.
+    // readFromMod: bake the player's modded PAP into the swap instead of vanilla game data (forPreset implies this).
     private (string? carrierCommand, ushort carrierId, bool targetIsLoop) TrySetupEmoteBypass(
-        string command, bool forPreset = false)
+        string command, bool forPreset = false, bool readFromMod = false)
     {
         if (!Configuration.AllowUnlockedEmotes || PenumbraService?.IsAvailable != true)
             return (null, 0, false);
@@ -3461,35 +3820,36 @@ public sealed class Plugin : IDalamudPlugin
 
         // game caches PAP per-animation-key; rotate carriers (Penumbra ChangeCounter only busts TMBs)
         var targetSlot1PapExists = maxSlot1NameLen > 0;
+        var rejectTmbOnly = targetHasSlot1 && targetSlot1PapExists;
         // forPreset keeps the same carrier across invocations (sync plugins see consistent carrier)
         HashSet<ushort>? excludeCarrierIds = (!forPreset && usedCarrierIds.Count > 0) ? usedCarrierIds : null;
         if (excludeCarrierIds != null)
             Log.Debug($"[UnlockBypass] Excluding {excludeCarrierIds.Count} previously used carrier(s) for PAP cache busting");
-        var carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, maxNameLen: maxSlot0NameLen, maxSlot1NameLen: maxSlot1NameLen, requiredConditionMode: requiredConditionMode, excludeCarrierIds: excludeCarrierIds);
+        var carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, maxNameLen: maxSlot0NameLen, maxSlot1NameLen: maxSlot1NameLen, requiredConditionMode: requiredConditionMode, excludeCarrierIds: excludeCarrierIds, rejectTmbOnlyIntro: rejectTmbOnly);
 
         // If no carrier fits with slot 1 preference, try without slot 1 requirement
         if (carrier == null && targetHasSlot1 && targetSlot1PapExists)
         {
             Log.Debug($"[UnlockBypass] No carrier with slot 1 fits, trying without slot 1");
-            carrier = FindCarrier(targetIsLoop, preferSlot1: false, maxNameLen: maxSlot0NameLen, requiredConditionMode: requiredConditionMode, excludeCarrierIds: excludeCarrierIds);
+            carrier = FindCarrier(targetIsLoop, preferSlot1: false, maxNameLen: maxSlot0NameLen, requiredConditionMode: requiredConditionMode, excludeCarrierIds: excludeCarrierIds, rejectTmbOnlyIntro: rejectTmbOnly);
         }
 
         // If still no carrier fits the name constraint, try without name constraint (partial rewrite - may not animate but better than nothing)
         if (carrier == null && maxSlot0NameLen > 0)
         {
             Log.Warning($"[UnlockBypass] No carrier with name length <= {maxSlot0NameLen} found, trying without length constraint");
-            carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, requiredConditionMode: requiredConditionMode, excludeCarrierIds: excludeCarrierIds);
+            carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, requiredConditionMode: requiredConditionMode, excludeCarrierIds: excludeCarrierIds, rejectTmbOnlyIntro: rejectTmbOnly);
         }
 
         // If ConditionMode constraint prevented finding a carrier, fall back to any carrier (better to try than fail silently)
         if (carrier == null && requiredConditionMode.HasValue)
         {
             Log.Warning($"[UnlockBypass] No ConditionMode {requiredConditionMode.Value} carriers found, trying without ConditionMode constraint");
-            carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, maxNameLen: maxSlot0NameLen, maxSlot1NameLen: maxSlot1NameLen, excludeCarrierIds: excludeCarrierIds);
+            carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, maxNameLen: maxSlot0NameLen, maxSlot1NameLen: maxSlot1NameLen, excludeCarrierIds: excludeCarrierIds, rejectTmbOnlyIntro: rejectTmbOnly);
             if (carrier == null && targetHasSlot1 && targetSlot1PapExists)
-                carrier = FindCarrier(targetIsLoop, preferSlot1: false, maxNameLen: maxSlot0NameLen, excludeCarrierIds: excludeCarrierIds);
+                carrier = FindCarrier(targetIsLoop, preferSlot1: false, maxNameLen: maxSlot0NameLen, excludeCarrierIds: excludeCarrierIds, rejectTmbOnlyIntro: rejectTmbOnly);
             if (carrier == null && maxSlot0NameLen > 0)
-                carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, excludeCarrierIds: excludeCarrierIds);
+                carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, excludeCarrierIds: excludeCarrierIds, rejectTmbOnlyIntro: rejectTmbOnly);
         }
 
         // Pool exhaustion: all carriers used this session. Clear and retry - game's LRU cache
@@ -3501,7 +3861,7 @@ public sealed class Plugin : IDalamudPlugin
             Configuration.UsedBypassCarrierIds.Clear();
             Configuration.Save();
             excludeCarrierIds = null;
-            carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, maxNameLen: maxSlot0NameLen, maxSlot1NameLen: maxSlot1NameLen, requiredConditionMode: requiredConditionMode);
+            carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, maxNameLen: maxSlot0NameLen, maxSlot1NameLen: maxSlot1NameLen, requiredConditionMode: requiredConditionMode, rejectTmbOnlyIntro: rejectTmbOnly);
         }
 
         // Loop-target mismatch rescue: if target wants a loop but FindCarrier fell back to a
@@ -3514,9 +3874,15 @@ public sealed class Plugin : IDalamudPlugin
             Configuration.UsedBypassCarrierIds.Clear();
             Configuration.Save();
             excludeCarrierIds = null;
-            var retry = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, maxNameLen: maxSlot0NameLen, maxSlot1NameLen: maxSlot1NameLen, requiredConditionMode: requiredConditionMode);
+            var retry = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, maxNameLen: maxSlot0NameLen, maxSlot1NameLen: maxSlot1NameLen, requiredConditionMode: requiredConditionMode, rejectTmbOnlyIntro: rejectTmbOnly);
             if (retry != null && retry.Value.isLoop)
                 carrier = retry;
+        }
+
+        if (carrier == null && rejectTmbOnly)
+        {
+            Log.Warning($"[UnlockBypass] No carriers with a clean intro for '{cmdLower}', accepting one that may show its own windup");
+            carrier = FindCarrier(targetIsLoop, preferSlot1: false, maxNameLen: maxSlot0NameLen, excludeCarrierIds: excludeCarrierIds);
         }
 
         if (carrier == null)
@@ -3559,10 +3925,10 @@ public sealed class Plugin : IDalamudPlugin
             Log.Debug($"[UnlockBypass] Carrier '{carrierCommand}' has no slot 1 - intro will be skipped");
         }
 
-        // Add key pairs for ALL remaining target slots (facial, upper body/head targeting, etc.)
-        // Match by slot index: for each target entry not already paired (slot 0/1), find the carrier's entry at the same slot.
+        // remaining target slots (facial, head targeting, etc.)
+        // carrier's entry at the same slot
         var pairedSlots = new HashSet<int> { 0 }; // slot 0 always paired above
-        if (carrierSlot1Key != null) // slot 1 is paired (either normal redirect or intro suppression)
+        if (carrierSlot1Key != null || targetHasSlot1) // paired above, or deliberately skipped
             pairedSlots.Add(1);
 
         if (emoteIdToTimelineKeys!.TryGetValue(carrierId, out var carrierKeys2))
@@ -3594,7 +3960,7 @@ public sealed class Plugin : IDalamudPlugin
             return (null, 0, false);
         }
 
-        if (SetupEmoteSwap(keyPairs, readTargetFromMod: forPreset))
+        if (SetupEmoteSwap(keyPairs, readTargetFromMod: forPreset || readFromMod))
         {
             emoteSwapActive = true;
             lastBypassEmoteCommand = cmdLower;
@@ -3833,15 +4199,41 @@ public sealed class Plugin : IDalamudPlugin
                 candidates.Add(gamePath.Replace($"/{currentRace}/", $"/{altRace}/"));
         }
 
+        Newtonsoft.Json.Linq.JObject? v4Meta = null;
+        var presetMetaPath = Path.Combine(modRoot, "meta.json");
+        if (File.Exists(presetMetaPath))
+        {
+            try
+            {
+                var parsedMeta = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(presetMetaPath));
+                if ((parsedMeta["FileVersion"]?.Value<int>() ?? 0) >= 4) v4Meta = parsedMeta;
+            }
+            catch (Exception ex) { Log.Debug($"[Duration] meta.json parse skipped: {ex.Message}"); }
+        }
+
+        var groupJsons = new List<Newtonsoft.Json.Linq.JObject>();
+        if (v4Meta != null)
+        {
+            if (v4Meta["Groups"] is Newtonsoft.Json.Linq.JArray v4Groups)
+                groupJsons.AddRange(v4Groups.OfType<Newtonsoft.Json.Linq.JObject>());
+        }
+        else
+        {
+            foreach (var groupFile in Directory.GetFiles(modRoot, "group_*.json"))
+            {
+                try { groupJsons.Add(Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(groupFile))); }
+                catch (Exception ex) { Log.Debug($"[Duration] group file parse skipped: {ex.Message}"); }
+            }
+        }
+
         // Highest-priority match wins. Groups override default when the preset selects their options.
         string? chosenRel = null;
         int chosenPriority = int.MinValue;
 
-        foreach (var groupFile in Directory.GetFiles(modRoot, "group_*.json"))
+        foreach (var groupJson in groupJsons)
         {
             try
             {
-                var groupJson = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(groupFile));
                 var groupName = groupJson["Name"]?.Value<string>() ?? "";
                 var groupPri = groupJson["Priority"]?.Value<int>() ?? 0;
                 var options = groupJson["Options"] as Newtonsoft.Json.Linq.JArray;
@@ -3884,32 +4276,38 @@ public sealed class Plugin : IDalamudPlugin
         // Default file - lowest priority, used if no group option covered this path.
         if (chosenRel == null)
         {
-            var defaultJsonPath = Path.Combine(modRoot, "default_mod.json");
-            if (File.Exists(defaultJsonPath))
+            try
             {
-                try
+                Newtonsoft.Json.Linq.JObject? files = null;
+                if (v4Meta != null)
                 {
-                    var defaultJson = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(defaultJsonPath));
-                    var files = defaultJson["Files"] as Newtonsoft.Json.Linq.JObject;
-                    if (files != null)
+                    files = v4Meta["DefaultData"]?["Files"] as Newtonsoft.Json.Linq.JObject;
+                }
+                else
+                {
+                    var defaultJsonPath = Path.Combine(modRoot, "default_mod.json");
+                    if (File.Exists(defaultJsonPath))
+                        files = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(defaultJsonPath))["Files"] as Newtonsoft.Json.Linq.JObject;
+                }
+
+                if (files != null)
+                {
+                    foreach (var cand in candidates)
                     {
-                        foreach (var cand in candidates)
+                        if (files.TryGetValue(cand, out var tok))
                         {
-                            if (files.TryGetValue(cand, out var tok))
-                            {
-                                chosenRel = tok?.Value<string>();
-                                if (!string.IsNullOrEmpty(chosenRel)) break;
-                            }
+                            chosenRel = tok?.Value<string>();
+                            if (!string.IsNullOrEmpty(chosenRel)) break;
                         }
                     }
                 }
-                catch (Exception ex) { Log.Debug($"[Duration] default_mod.json parse skipped: {ex.Message}"); }
             }
+            catch (Exception ex) { Log.Debug($"[Duration] default files parse skipped: {ex.Message}"); }
         }
 
         if (!string.IsNullOrEmpty(chosenRel))
         {
-            var full = Path.Combine(modRoot, chosenRel.Replace('/', Path.DirectorySeparatorChar));
+            var full = Path.Combine(modRoot, chosenRel.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar));
             if (File.Exists(full))
             {
                 try { return File.ReadAllBytes(full); }
@@ -3920,7 +4318,7 @@ public sealed class Plugin : IDalamudPlugin
         // Some mods ship files mirrored at the game path with no JSON mapping. Last-resort probe.
         foreach (var cand in candidates)
         {
-            var mirrored = Path.Combine(modRoot, cand.Replace('/', Path.DirectorySeparatorChar));
+            var mirrored = Path.Combine(modRoot, cand.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar));
             if (File.Exists(mirrored))
             {
                 try { return File.ReadAllBytes(mirrored); }
@@ -4382,18 +4780,25 @@ public sealed class Plugin : IDalamudPlugin
                         relMappings[gamePath] = fileName;
                     }
 
-                    // Write default_mod.json with file mappings
-                    var filesJson = string.Join(",\n", relMappings.Select(kv =>
-                        $"    \"{kv.Key.Replace("\\", "/")}\": \"{kv.Value}\""));
-                    var defaultModJson = $"{{\n  \"Name\": \"\",\n  \"Priority\": 0,\n  \"Files\": {{\n{filesJson}\n  }},\n  \"FileSwaps\": {{}},\n  \"Manipulations\": []\n}}";
-                    File.WriteAllText(Path.Combine(realModDir, "default_mod.json"), defaultModJson);
-
-                    // Write meta.json on first registration
                     var metaPath = Path.Combine(realModDir, "meta.json");
-                    if (!File.Exists(metaPath))
+                    if (IsV4MetaFile(metaPath))
                     {
-                        var metaJson = "{\n  \"FileVersion\": 3,\n  \"Name\": \"_EncoreEmoteSwap\",\n  \"Author\": \"Encore\",\n  \"Description\": \"Auto-generated by Encore for emote unlock bypass.\",\n  \"Version\": \"1.0.0\",\n  \"Website\": \"\",\n  \"ModTags\": []\n}";
-                        File.WriteAllText(metaPath, metaJson);
+                        WriteV4SwapDefaultData(realModDir, metaPath, relMappings);
+                    }
+                    else
+                    {
+                        // Write default_mod.json with file mappings
+                        var filesJson = string.Join(",\n", relMappings.Select(kv =>
+                            $"    \"{kv.Key.Replace("\\", "/")}\": \"{kv.Value}\""));
+                        var defaultModJson = $"{{\n  \"Name\": \"\",\n  \"Priority\": 0,\n  \"Files\": {{\n{filesJson}\n  }},\n  \"FileSwaps\": {{}},\n  \"Manipulations\": []\n}}";
+                        File.WriteAllText(Path.Combine(realModDir, "default_mod.json"), defaultModJson);
+
+                        // Write meta.json on first registration
+                        if (!File.Exists(metaPath))
+                        {
+                            var metaJson = "{\n  \"FileVersion\": 3,\n  \"Name\": \"_EncoreEmoteSwap\",\n  \"Author\": \"Encore\",\n  \"Description\": \"Auto-generated by Encore for emote unlock bypass.\",\n  \"Version\": \"1.0.0\",\n  \"Website\": \"\",\n  \"ModTags\": []\n}";
+                            File.WriteAllText(metaPath, metaJson);
+                        }
                     }
 
                     // Register or reload the mod
@@ -4461,6 +4866,38 @@ public sealed class Plugin : IDalamudPlugin
         }
     }
 
+    private static bool IsV4MetaFile(string metaPath)
+    {
+        try
+        {
+            if (!File.Exists(metaPath)) return false;
+            var meta = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(metaPath));
+            return (meta["FileVersion"]?.Value<int>() ?? 0) >= 4;
+        }
+        catch { return false; }
+    }
+
+    private static void WriteV4SwapDefaultData(string realModDir, string metaPath, Dictionary<string, string> relMappings)
+    {
+        var meta = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(metaPath));
+        var files = new Newtonsoft.Json.Linq.JObject();
+        foreach (var kv in relMappings)
+            files[kv.Key.Replace("\\", "/")] = kv.Value;
+        meta["DefaultData"] = new Newtonsoft.Json.Linq.JObject
+        {
+            ["Files"] = files,
+            ["FileSwaps"] = new Newtonsoft.Json.Linq.JObject(),
+            ["Manipulations"] = new Newtonsoft.Json.Linq.JArray(),
+        };
+        File.WriteAllText(metaPath, meta.ToString(Newtonsoft.Json.Formatting.Indented));
+
+        var legacyDefault = Path.Combine(realModDir, "default_mod.json");
+        if (File.Exists(legacyDefault))
+        {
+            try { File.Delete(legacyDefault); } catch { }
+        }
+    }
+
     private void ClearEmoteSwap()
     {
         var wasActive = emoteSwapActive;
@@ -4491,8 +4928,12 @@ public sealed class Plugin : IDalamudPlugin
                         var realModDir = Path.Combine(penumbraModDir, EncoreSwapModName);
                         if (Directory.Exists(realModDir))
                         {
-                            File.WriteAllText(Path.Combine(realModDir, "default_mod.json"),
-                                "{\n  \"Name\": \"\",\n  \"Priority\": 0,\n  \"Files\": {},\n  \"FileSwaps\": {},\n  \"Manipulations\": []\n}");
+                            var clearMetaPath = Path.Combine(realModDir, "meta.json");
+                            if (IsV4MetaFile(clearMetaPath))
+                                WriteV4SwapDefaultData(realModDir, clearMetaPath, new Dictionary<string, string>());
+                            else
+                                File.WriteAllText(Path.Combine(realModDir, "default_mod.json"),
+                                    "{\n  \"Name\": \"\",\n  \"Priority\": 0,\n  \"Files\": {},\n  \"FileSwaps\": {},\n  \"Manipulations\": []\n}");
                             PenumbraService.ReloadMod(EncoreSwapModName);
 
                             // Delete swap PAP and TMB files from real mod dir
@@ -4547,6 +4988,53 @@ public sealed class Plugin : IDalamudPlugin
 
         if (wasActive)
             Log.Debug("[EmoteSwap] Cleared");
+    }
+
+    // Penumbra's redraw ignores plugin-spawned actors; rebuild their draw object directly
+    private unsafe void ExecuteRedrawForTarget(int targetIndex)
+    {
+        if (targetIndex < 200)
+        {
+            ExecuteRedrawTarget();
+            return;
+        }
+
+        try
+        {
+            var obj = targetIndex >= 0 && targetIndex < ObjectTable.Length ? ObjectTable[targetIndex] : null;
+            if (obj == null || obj.Address == IntPtr.Zero)
+            {
+                Log.Warning($"Cannot redraw spawned actor {targetIndex}: object not found");
+                return;
+            }
+
+            var go = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)obj.Address;
+            go->DisableDraw();
+            go->EnableDraw();
+            Log.Debug($"Rebuilt draw object for spawned actor {targetIndex}");
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"Failed to rebuild draw object for actor {targetIndex}: {ex.Message}");
+        }
+    }
+
+    private unsafe void ExecuteRedrawTarget()
+    {
+        try
+        {
+            var uiModule = UIModule.Instance();
+            if (uiModule != null)
+            {
+                using var str = new Utf8String("/penumbra redraw target");
+                uiModule->ProcessChatBoxEntry(&str);
+                Log.Debug("Executed Penumbra redraw for target");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"Failed to execute target redraw: {ex.Message}");
+        }
     }
 
     private unsafe void ExecuteRedraw()
@@ -4607,11 +5095,11 @@ public sealed class Plugin : IDalamudPlugin
                     if (Services.EmoteDetectionService.EmoteToCommand.TryGetValue(lookupKey, out var canonical))
                         emoteCmd = canonical;
 
-                    // Fire off the bypass async (same flow as /vanilla)
+                    // Bypass-only path; conflicting mods stay enabled.
                     var capturedCmd = emoteCmd;
                     Task.Run(() =>
                     {
-                        Framework.RunOnFrameworkThread(() => ExecuteVanilla(capturedCmd));
+                        Framework.RunOnFrameworkThread(() => ExecuteVanilla(capturedCmd, disableConflictingMods: false));
                     });
 
                     // DON'T call Original - suppress the game's "not learned" message
@@ -4700,6 +5188,9 @@ public sealed class Plugin : IDalamudPlugin
         // player moves so the main window's "Running: ..." indicator disappears.
         try { UpdateActivePresetTracking(); }
         catch (Exception ex) { Log.Debug($"[ActivePreset] tracking error: {ex.Message}"); }
+
+        try { UpdatePosePresetStandupDetection(); }
+        catch (Exception ex) { Log.Debug($"[ActivePreset] standup tracking error: {ex.Message}"); }
 
         var hasLoopActive = loopingEmoteCommand != null;
         if (!hasLoopActive) return;
@@ -4872,6 +5363,44 @@ public sealed class Plugin : IDalamudPlugin
                 // preset's Y/rotation after the animation finishes.
                 SimpleHeelsService?.ClearOffset();
             }
+        }
+    }
+
+    private unsafe void UpdatePosePresetStandupDetection()
+    {
+        var activeId = Configuration.ActivePresetId;
+        if (string.IsNullOrEmpty(activeId))
+        {
+            posePresetArmed = false;
+            posePresetTrackedId = null;
+            return;
+        }
+
+        if (posePresetTrackedId != activeId)
+        {
+            posePresetArmed = false;
+            posePresetTrackedId = activeId;
+        }
+
+        var preset = Configuration.Presets.Find(p => p.Id == activeId);
+        if (preset == null) return;
+        // ChairSitting, GroundSitting, LyingDozing
+        if (preset.AnimationType < 3 || preset.AnimationType > 5) return;
+
+        var localPlayer = ObjectTable.LocalPlayer;
+        if (localPlayer == null || localPlayer.Address == nint.Zero) return;
+
+        var character = (Character*)localPlayer.Address;
+        var mode = character->Mode;
+
+        if (mode != CharacterModes.Normal)
+        {
+            posePresetArmed = true;
+        }
+        else if (posePresetArmed)
+        {
+            posePresetArmed = false;
+            StopActivePreset();
         }
     }
 

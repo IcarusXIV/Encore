@@ -21,6 +21,11 @@ public class SimpleHeelsService : IDisposable
     private ICallGateSubscriber<(int, int)>? apiVersionSubscriber;
     private ICallGateSubscriber<int, string, object?>? registerPlayerSubscriber;
     private ICallGateSubscriber<int, object?>? unregisterPlayerSubscriber;
+    private ICallGateSubscriber<object?>? readySubscriber;
+    private ICallGateSubscriber<string>? getLocalPlayerSubscriber;
+
+    private float cachedNaturalOffsetY;
+    private long naturalOffsetFetchedTicks = long.MinValue;
 
     public bool IsAvailable { get; private set; }
 
@@ -29,9 +34,10 @@ public class SimpleHeelsService : IDisposable
     private bool overrideActive;
     private bool lastAppliedViaReflection;
 
-    // resolved lazily on first ApplyOffset
-    private bool reflectionResolved;
+    // resolved lazily, retried on a throttle until it succeeds
+    private long lastReflectionAttemptTicks;
     private bool reflectionWorks;
+    private string lastAppliedPath = "";
     private Array? tempOffsetsArray;
     private Array? tempOffsetEmoteArray;
     private ConstructorInfo? tempOffsetCtor;
@@ -43,39 +49,39 @@ public class SimpleHeelsService : IDisposable
         this.pluginInterface = pluginInterface;
         this.objectTable = objectTable;
         this.log = log;
-        Initialize();
+
+        // SimpleHeels.Ready fires at the end of SH's init and on every reload.
+        readySubscriber = pluginInterface.GetIpcSubscriber<object?>("SimpleHeels.Ready");
+        readySubscriber.Subscribe(TryInitialize);
+        TryInitialize();
     }
 
-    private void Initialize()
+    private void TryInitialize()
     {
         try
         {
-            apiVersionSubscriber = pluginInterface.GetIpcSubscriber<(int, int)>("SimpleHeels.ApiVersion");
+            apiVersionSubscriber ??= pluginInterface.GetIpcSubscriber<(int, int)>("SimpleHeels.ApiVersion");
             var (major, minor) = apiVersionSubscriber.InvokeFunc();
-            IsAvailable = major >= 2;
+            if (major < 2) { IsAvailable = false; return; }
+            if (IsAvailable) return;
 
-            if (IsAvailable)
-            {
-                registerPlayerSubscriber = pluginInterface.GetIpcSubscriber<int, string, object?>("SimpleHeels.RegisterPlayer");
-                unregisterPlayerSubscriber = pluginInterface.GetIpcSubscriber<int, object?>("SimpleHeels.UnregisterPlayer");
-                log.Information($"Simple Heels IPC initialized. Version: {major}.{minor}");
-            }
-            else
-            {
-                log.Warning($"Simple Heels API version {major}.{minor} is not supported. Minimum required: 2.x");
-            }
+            registerPlayerSubscriber = pluginInterface.GetIpcSubscriber<int, string, object?>("SimpleHeels.RegisterPlayer");
+            unregisterPlayerSubscriber = pluginInterface.GetIpcSubscriber<int, object?>("SimpleHeels.UnregisterPlayer");
+            getLocalPlayerSubscriber = pluginInterface.GetIpcSubscriber<string>("SimpleHeels.GetLocalPlayer");
+            IsAvailable = true;
+            log.Information($"Simple Heels IPC initialized. Version: {major}.{minor}");
         }
-        catch (Exception ex)
+        catch
         {
             IsAvailable = false;
-            log.Debug($"Simple Heels is not available: {ex.Message}");
         }
     }
 
     private bool TryResolveReflection()
     {
-        if (reflectionResolved) return reflectionWorks;
-        reflectionResolved = true;
+        if (reflectionWorks) return true;
+        if (Environment.TickCount64 - lastReflectionAttemptTicks < 2000) return false;
+        lastReflectionAttemptTicks = Environment.TickCount64;
 
         try
         {
@@ -83,7 +89,7 @@ public class SimpleHeelsService : IDisposable
                 .FirstOrDefault(a => a.GetName().Name == "SimpleHeels");
             if (shAsm == null)
             {
-                log.Debug("[SimpleHeels] Reflection: assembly not loaded");
+                log.Debug("[SimpleHeels] Reflection: SimpleHeels assembly not loaded yet");
                 return false;
             }
 
@@ -207,20 +213,58 @@ public class SimpleHeelsService : IDisposable
         }
     }
 
+    // Unaffected by temp overrides, so re-applies never compound
+    private float GetNaturalOffsetY()
+    {
+        if (getLocalPlayerSubscriber == null) return 0f;
+        if (Environment.TickCount64 - naturalOffsetFetchedTicks < 500) return cachedNaturalOffsetY;
+        naturalOffsetFetchedTicks = Environment.TickCount64;
+
+        try
+        {
+            var json = getLocalPlayerSubscriber.InvokeFunc();
+            if (!string.IsNullOrEmpty(json))
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(json);
+                if (doc.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object &&
+                    doc.RootElement.TryGetProperty("DefaultOffset", out var offset) &&
+                    offset.ValueKind == System.Text.Json.JsonValueKind.Number)
+                {
+                    cachedNaturalOffsetY = offset.GetSingle();
+                    return cachedNaturalOffsetY;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            log.Debug($"[SimpleHeels] GetLocalPlayer parse failed: {ex.Message}");
+        }
+
+        cachedNaturalOffsetY = 0f;
+        return 0f;
+    }
+
     // x/y/z world units (y vertical), rotation/pitch/roll radians
     public bool ApplyOffset(float x, float y, float z, float rotation, float pitch, float roll)
     {
         if (!IsAvailable) return false;
 
+        y += GetNaturalOffsetY();
+
         if (ApplyOffsetReflected(x, y, z, rotation, pitch, roll))
         {
             overrideActive = true;
             lastAppliedViaReflection = true;
+            LogAppliedPath("reflection (syncs)");
             return true;
         }
 
         // IPC fallback: applies locally only, no sync
-        if (registerPlayerSubscriber == null) return false;
+        if (registerPlayerSubscriber == null)
+        {
+            LogAppliedPath("none (no RegisterPlayer subscriber)");
+            return false;
+        }
         try
         {
             var json = "{\"TempOffset\":" +
@@ -228,6 +272,7 @@ public class SimpleHeelsService : IDisposable
             registerPlayerSubscriber.InvokeAction(LocalPlayerObjectIndex, json);
             overrideActive = true;
             lastAppliedViaReflection = false;
+            LogAppliedPath("IPC RegisterPlayer (local only)");
             return true;
         }
         catch (Exception ex)
@@ -235,6 +280,14 @@ public class SimpleHeelsService : IDisposable
             log.Warning($"Simple Heels ApplyOffset failed: {ex.Message}");
             return false;
         }
+    }
+
+    // Logs only when the path changes; ApplyOffset can run every frame
+    private void LogAppliedPath(string path)
+    {
+        if (path == lastAppliedPath) return;
+        lastAppliedPath = path;
+        log.Information($"[SimpleHeels] ApplyOffset using: {path}");
     }
 
     private static string F(float v) => v.ToString("G", CultureInfo.InvariantCulture);
@@ -268,6 +321,7 @@ public class SimpleHeelsService : IDisposable
 
     public void Dispose()
     {
+        readySubscriber?.Unsubscribe(TryInitialize);
         ClearOffset();
     }
 }

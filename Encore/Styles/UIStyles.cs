@@ -41,6 +41,12 @@ public static class UIStyles
     public static float WindowScale =>
         (Plugin.Instance?.Configuration?.IgnoreGlobalScale ?? false) ? 1f : ImGuiHelpers.GlobalScale;
 
+    public static bool MotionEqualizers => Plugin.Instance?.Configuration?.MotionEqualizers ?? true;
+    public static bool MotionScreenDim => Plugin.Instance?.Configuration?.MotionScreenDim ?? true;
+    public static bool MotionCursorGlow => Plugin.Instance?.Configuration?.MotionCursorGlow ?? true;
+    public static bool MotionButtonBounce => Plugin.Instance?.Configuration?.MotionButtonBounce ?? true;
+    public static bool MotionAmbient => Plugin.Instance?.Configuration?.MotionAmbient ?? true;
+
     public static void PushMainWindowStyle()
     {
         float scale = Scale;
@@ -788,6 +794,7 @@ public static class UIStyles
         Dalamud.Bindings.ImGui.ImDrawListPtr dl,
         Vector2 cardMin, Vector2 cardMax, Vector4 accent, float scale)
     {
+        if (!MotionAmbient) return;
         float p = BeatPhase01();
         float coreA = 0.22f + p * 0.22f;
         dl.AddRectFilled(
@@ -806,6 +813,7 @@ public static class UIStyles
         Dalamud.Bindings.ImGui.ImDrawListPtr dl,
         Vector2 center, Vector4 accent, float baseRadius)
     {
+        if (!MotionAmbient) return;
         float t = (float)ImGui.GetTime();
         for (int i = 0; i < 2; i++)
         {
@@ -931,6 +939,7 @@ public static class UIStyles
         Dalamud.Bindings.ImGui.ImDrawListPtr dl,
         Vector2 iconCenter, float iconHalfSize, Vector4 accent, float scale)
     {
+        if (!MotionAmbient) return;
         float t = (float)ImGui.GetTime();
         float breath = 0.5f + 0.5f * MathF.Sin(t * MathF.Tau / 1.0f);
         for (int i = 0; i < 3; i++)
@@ -949,6 +958,7 @@ public static class UIStyles
         Dalamud.Bindings.ImGui.ImDrawListPtr dl,
         Vector2 cardMin, Vector2 cardMax, float scale)
     {
+        if (!MotionAmbient) return;
         Span<Vector4> palette = stackalloc Vector4[8];
         palette[0] = new Vector4(0.38f, 0.72f, 1.00f, 1f);
         palette[1] = new Vector4(0.72f, 0.52f, 1.00f, 1f);
@@ -1074,6 +1084,7 @@ public static class UIStyles
         Dalamud.Bindings.ImGui.ImDrawListPtr dl,
         Vector2 winMin, Vector2 winMax, Vector4 accent, float scale)
     {
+        if (!MotionEqualizers) return;
         float colThick = 3f * scale;
         float colGap = 3f * scale;
         float maxRowW = 19f * scale;
@@ -1234,6 +1245,7 @@ public static class UIStyles
         Vector2 cardMin, Vector2 cardMax, Vector4 accent, float scale,
         float alphaMul = 1f, Vector2? centerOverride = null)
     {
+        if (!MotionCursorGlow) return;
         if (alphaMul <= 0.01f) return;
         Vector2 center;
         if (centerOverride.HasValue)
@@ -1279,6 +1291,7 @@ public static class UIStyles
         float startX, float endX, float y, Vector4 accent, float scale,
         float alphaMul = 1f)
     {
+        if (!MotionAmbient) return;
         if (alphaMul <= 0.02f) return;
         if (endX - startX < 2f) return;
         uint core = ImGui.ColorConvertFloat4ToU32(
@@ -1297,6 +1310,7 @@ public static class UIStyles
         Vector2 btnMin, Vector2 btnMax, float scale,
         Vector4? tintOverride = null)
     {
+        if (!MotionButtonBounce) return;
         float t = (float)ImGui.GetTime();
         float breath = 0.5f - 0.5f * MathF.Cos(t * MathF.Tau / 3.2f);
         float alpha = 0.28f * breath;
@@ -1320,6 +1334,7 @@ public static class UIStyles
 
     public static float PlayKickScale(float elapsedSec)
     {
+        if (!MotionButtonBounce) return 1f;
         const float dur = 0.9f;
         if (elapsedSec < 0f || elapsedSec > dur) return 1f;
         float c = elapsedSec / dur;
@@ -1369,7 +1384,7 @@ public static class UIStyles
         dl.AddRectFilledMultiColor(rectMin, rectMax, uTop, uTop, uBot, uBot);
         dl.AddRect(rectMin, rectMax, ImGui.ColorConvertFloat4ToU32(border), 0f, 0, 1f);
 
-        if (hovered)
+        if (hovered && MotionButtonBounce)
         {
             float t = (float)ImGui.GetTime();
             const float sheenDur = 2.0f;
@@ -1423,7 +1438,7 @@ public static class UIStyles
                 ImGui.ColorConvertFloat4ToU32(new Vector4(coral.X, coral.Y, coral.Z, 0.12f)));
 
         float t = (float)ImGui.GetTime();
-        float breath = 0.5f + 0.5f * MathF.Sin(t * MathF.Tau / 2.4f);
+        float breath = MotionButtonBounce ? (0.5f + 0.5f * MathF.Sin(t * MathF.Tau / 2.4f)) : 0.5f;
         float borderA = 0.25f + breath * 0.60f;
         dl.AddRect(rectMin, rectMax,
             ImGui.ColorConvertFloat4ToU32(new Vector4(coral.X, coral.Y, coral.Z, borderA)),
@@ -1432,7 +1447,7 @@ public static class UIStyles
         float haloCycle = (t % 1.6f) / 1.6f;
         float haloScale = 1f + haloCycle * 0.35f;
         float haloAlpha = 0.55f * (1f - haloCycle);
-        if (haloAlpha > 0.02f)
+        if (MotionButtonBounce && haloAlpha > 0.02f)
         {
             float cx = (rectMin.X + rectMax.X) * 0.5f;
             float cy = (rectMin.Y + rectMax.Y) * 0.5f;
@@ -1446,14 +1461,14 @@ public static class UIStyles
                 0f, 0, 1f);
         }
 
-        float dotPhase = 0.5f + 0.5f * MathF.Sin(t * MathF.Tau / 1.2f);
+        float dotPhase = MotionButtonBounce ? (0.5f + 0.5f * MathF.Sin(t * MathF.Tau / 1.2f)) : 0.5f;
         float dotR = (2.0f + dotPhase * 1.1f) * scale;
         float dotA = 0.55f + dotPhase * 0.45f;
         var dotPos = new Vector2(rectMin.X + 9f * scale, center.Y);
         dl.AddCircleFilled(dotPos, dotR,
             ImGui.ColorConvertFloat4ToU32(new Vector4(coral.X, coral.Y, coral.Z, dotA)));
 
-        if (hovered)
+        if (hovered && MotionButtonBounce)
         {
             const float sheenDur = 2.0f;
             float cyc = (t % sheenDur) / sheenDur;
@@ -1487,6 +1502,7 @@ public static class UIStyles
         Dalamud.Bindings.ImGui.ImDrawListPtr dl,
         Vector2 clickPos, float elapsedSec, Vector4 accent, float scale)
     {
+        if (!MotionButtonBounce) return;
         const float dur = 1.1f;
         if (elapsedSec < 0f || elapsedSec > dur) return;
         float life = elapsedSec / dur;
@@ -1563,6 +1579,7 @@ public static class UIStyles
     public static void DrawHoverSheenOnLastItem(
         Dalamud.Bindings.ImGui.ImDrawListPtr dl, bool hovered, float alphaPeak = 0.28f)
     {
+        if (!MotionAmbient) return;
         if (!hovered) return;
         var rectMin = ImGui.GetItemRectMin();
         var rectMax = ImGui.GetItemRectMax();
@@ -1592,6 +1609,7 @@ public static class UIStyles
         Vector2 btnCenter, float elapsedSec, float scale,
         Vector4? color = null)
     {
+        if (!MotionButtonBounce) return;
         const float dur = 0.7f;
         if (elapsedSec < 0f || elapsedSec > dur) return;
         float life = elapsedSec / dur;
@@ -1629,6 +1647,7 @@ public static class UIStyles
 
     public static void DrawNameEq(Vector2 topLeft, Vector4 accent, float height, float scale)
     {
+        if (!MotionEqualizers) return;
         var dl = ImGui.GetWindowDrawList();
         float t = (float)ImGui.GetTime();
         float barW = 2f * scale;
@@ -1702,7 +1721,7 @@ public static class UIStyles
             }
             if (disabled) ImGui.TextDisabled(truncated);
             else          ImGui.TextColored(color, truncated);
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip(text);
+            if (ImGui.IsItemHovered()) EncoreTooltip(text);
             return;
         }
 
@@ -1720,7 +1739,7 @@ public static class UIStyles
         dl.AddText(new Vector2(pos.X + offset + cycleWidth, pos.Y), uc, text);
         dl.PopClipRect();
         ImGui.Dummy(new Vector2(maxWidth, full.Y));
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(text);
+        if (ImGui.IsItemHovered()) EncoreTooltip(text);
     }
 
     public static float DrawMarqueeTextAt(
@@ -1782,7 +1801,7 @@ public static class UIStyles
         float maxBarH = MathF.Min(12f * scale, (headerMax.Y - headerMin.Y) - 8f * scale);
         if (maxBarH < 6f * scale) maxBarH = 6f * scale;
 
-        float t = (float)ImGui.GetTime();
+        float t = MotionAmbient ? (float)ImGui.GetTime() : 0f;
         Span<Vector4> palette = stackalloc Vector4[8];
         if (hasPlaying)
         {
@@ -2011,6 +2030,7 @@ public static class UIStyles
     public static void DrawActionbarScan(
         float scanY, float winLeft, float winRight, Vector4 accent, float period = 5f)
     {
+        if (!MotionAmbient) return;
         var dl = ImGui.GetWindowDrawList();
         float ww = winRight - winLeft;
         float t = (float)ImGui.GetTime();

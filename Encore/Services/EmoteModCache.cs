@@ -11,7 +11,7 @@ namespace Encore.Services;
 
 public class EmoteModCacheData
 {
-    public const int CurrentVersion = 14;
+    public const int CurrentVersion = 17;
 
     [JsonPropertyName("version")]
     public int Version { get; set; } = CurrentVersion;

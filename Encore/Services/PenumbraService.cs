@@ -132,6 +132,26 @@ public class PenumbraService : IDisposable
         }
     }
 
+    // Resolve the collection assigned to a specific object (e.g. a target / spawned NPC).
+    public (bool success, Guid collectionId, string collectionName) GetCollectionForObject(int objectIndex)
+    {
+        if (!IsAvailable || getCollectionForObjectSubscriber == null)
+            return (false, Guid.Empty, "");
+
+        try
+        {
+            var (objectValid, _, (id, name)) = getCollectionForObjectSubscriber.InvokeFunc(objectIndex);
+            if (objectValid && id != Guid.Empty)
+                return (true, id, name);
+            return (false, Guid.Empty, "");
+        }
+        catch (Exception ex)
+        {
+            log.Error($"Failed to get collection for object {objectIndex}: {ex.Message}");
+            return (false, Guid.Empty, "");
+        }
+    }
+
     public (bool success, bool enabled, int priority, Dictionary<string, List<string>> options) GetCurrentModSettings(
         Guid collectionId, string modDirectory, string modName = "")
     {

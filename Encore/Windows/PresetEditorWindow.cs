@@ -44,9 +44,6 @@ public class PresetEditorWindow : Window
     // Vanilla preset mode
     private bool isVanillaPreset = false;
 
-    // Emote unlock bypass for locked emotes
-    private bool editEmoteLocked = false;
-
     // Mod options editing
     private Dictionary<string, List<string>> editModOptions = new();
     private IReadOnlyDictionary<string, (string[] options, int groupType)>? availableModSettings;
@@ -77,6 +74,15 @@ public class PresetEditorWindow : Window
     private List<EmoteModInfo> emoteMods = new();
     private int selectedModIndex = -1;
     private string modSearchFilter = "";
+
+    private List<PresetDependency> editDependencies = new();
+    private bool dependenciesOpen = false;
+    private string dependencySearchFilter = "";
+    private List<(string Dir, string Name)>? dependencyModList;
+    private List<(string Dir, string Name)> dependencyFiltered = new();
+    private string? dependencyFilterKey;
+    private readonly HashSet<string> depOptionsExpanded = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, IReadOnlyDictionary<string, (string[] options, int groupType)>?> depAvailableSettings = new(StringComparer.OrdinalIgnoreCase);
     private List<EmoteModInfo> filteredMods = new();
     private bool needsRefresh = true;
     private bool isLoading = false;
@@ -94,11 +100,11 @@ public class PresetEditorWindow : Window
     // Validation error messages
     private string? nameError = null;
     private string? commandError = null;  // Hard block (plugin conflicts, duplicate presets)
-    private string? commandWarning = null;  // Currently unused, kept for future soft warnings
-    private bool gameCommandWarningAcknowledged = false;  // Currently unused, kept for future soft warnings
+    private string? commandWarning = null;  // Unused
+    private bool gameCommandWarningAcknowledged = false;  // Unused
 
-    private readonly bool[] tickerPrevArmed = new bool[7];
-    private readonly double[] tickerPulseStart = { -1, -1, -1, -1, -1, -1, -1 };
+    private readonly bool[] tickerPrevArmed = new bool[8];
+    private readonly double[] tickerPulseStart = { -1, -1, -1, -1, -1, -1, -1, -1 };
 
     // Preview card kick: last edit snapshot + timestamp.
     private string previewLastName = "";
@@ -334,7 +340,6 @@ public class PresetEditorWindow : Window
         commandWarning = null;
         gameCommandWarningAcknowledged = false;
         isVanillaPreset = false;
-        editEmoteLocked = false;
         editModOptions = new();
         availableModSettings = null;
         editModifiers = new();
@@ -351,6 +356,12 @@ public class PresetEditorWindow : Window
         editHeels.X = editHeels.Y = editHeels.Z = 0f;
         editHeels.Rotation = editHeels.Pitch = editHeels.Roll = 0f;
         editConflictExclusions = new(StringComparer.OrdinalIgnoreCase);
+        editDependencies = new();
+        dependenciesOpen = false;
+        dependencySearchFilter = "";
+        dependencyModList = null;
+        depOptionsExpanded.Clear();
+        depAvailableSettings.Clear();
 
         needsRefresh = true;
         IsOpen = true;
@@ -379,7 +390,6 @@ public class PresetEditorWindow : Window
         commandWarning = null;
         gameCommandWarningAcknowledged = false;
         isVanillaPreset = preset.IsVanilla;
-        editEmoteLocked = preset.EmoteLocked;
 
         // Load mod options from preset (deep copy)
         editModOptions = new Dictionary<string, List<string>>();
@@ -409,6 +419,12 @@ public class PresetEditorWindow : Window
         editHeels.Pitch = preset.HeelsOffset?.Pitch ?? 0f;
         editHeels.Roll = preset.HeelsOffset?.Roll ?? 0f;
         editConflictExclusions = new HashSet<string>(preset.ConflictExclusions, StringComparer.OrdinalIgnoreCase);
+        editDependencies = preset.Dependencies.Select(d => d.Clone()).ToList();
+        dependenciesOpen = editDependencies.Count > 0;
+        dependencySearchFilter = "";
+        dependencyModList = null;
+        depOptionsExpanded.Clear();
+        depAvailableSettings.Clear();
 
         // Load available settings from Penumbra
         availableModSettings = null;
@@ -682,9 +698,13 @@ public class PresetEditorWindow : Window
 
                 if (!hasIcon)
                 {
-                    float target = tileHovered ? 1f : 0f;
-                    iconHoverAnim += (target - iconHoverAnim)
-                        * MathF.Min(1f, ImGui.GetIO().DeltaTime * 8f);
+                    if (UIStyles.MotionAmbient)
+                    {
+                        float target = tileHovered ? 1f : 0f;
+                        iconHoverAnim += (target - iconHoverAnim)
+                            * MathF.Min(1f, ImGui.GetIO().DeltaTime * 8f);
+                    }
+                    else iconHoverAnim = 0f;
                     float expand = iconHoverAnim * 2.5f * scale;
                     var hoverBorderCol = new Vector4(
                         Chr_TextGhost.X + (Chr_TextDim.X - Chr_TextGhost.X) * iconHoverAnim,
@@ -816,7 +836,7 @@ public class PresetEditorWindow : Window
                     var prefixMax = new Vector2(rowStart.X + prefixW, rowStart.Y + frameH);
 
                     float focusBgBoost = 0f;
-                    if (commandFocusFlashStart >= 0)
+                    if (UIStyles.MotionAmbient && commandFocusFlashStart >= 0)
                     {
                         float fE = (float)(ImGui.GetTime() - commandFocusFlashStart);
                         const float fDur = 0.35f;
@@ -830,7 +850,7 @@ public class PresetEditorWindow : Window
                         }
                     }
                     float keystrokeBorderBoost = 0f;
-                    if (commandKeystrokeFlashStart >= 0)
+                    if (UIStyles.MotionAmbient && commandKeystrokeFlashStart >= 0)
                     {
                         float kE = (float)(ImGui.GetTime() - commandKeystrokeFlashStart);
                         const float kDur = 0.22f;
@@ -875,11 +895,15 @@ public class PresetEditorWindow : Window
                 }
                 if (commandError != null)
                 {
+                    ImGui.PushTextWrapPos(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X);
                     ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), commandError);
+                    ImGui.PopTextWrapPos();
                 }
                 else if (commandWarning != null)
                 {
+                    ImGui.PushTextWrapPos(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X);
                     ImGui.TextColored(new Vector4(1f, 0.85f, 0.4f, 1f), commandWarning);
+                    ImGui.PopTextWrapPos();
                     ImGui.Checkbox("I understand, use this command anyway", ref gameCommandWarningAcknowledged);
                 }
 
@@ -1151,7 +1175,8 @@ public class PresetEditorWindow : Window
                         // lock-in flair: bar height kick over 250ms + sheen sweep over 400ms
                         float barTopY = rowMin.Y;
                         float barBotY = rowMax.Y;
-                        bool isLockIn = editModDirectory == modListLastSelected
+                        bool isLockIn = UIStyles.MotionButtonBounce
+                                     && editModDirectory == modListLastSelected
                                      && modListLockInStart >= 0;
                         if (isLockIn)
                         {
@@ -1536,19 +1561,7 @@ public class PresetEditorWindow : Window
                     }
                 }
 
-                // Emote bypass checkbox - for emotes not on the character (not pose, not movement)
-                if (!isVanillaPreset)
-                {
-                    ImGui.Spacing();
-                    ImGui.Checkbox("I don't have this emote", ref editEmoteLocked);
-                    if (ImGui.IsItemHovered())
-                        UIStyles.EncoreTooltip("Your mod's animation will play regardless.\nRequires 'Allow All Emotes' in settings.");
-                    if (editEmoteLocked)
-                    {
-                        ImGui.SameLine();
-                        ImGui.TextColored(new Vector4(1f, 0.8f, 0.4f, 1f), "(bypass)");
-                    }
-                }
+                // Locked-emote bypass is auto-detected at play time.
             }
 
         }
@@ -1738,7 +1751,339 @@ public class PresetEditorWindow : Window
         }
         EndCard();
 
+        var depsSummary = editDependencies.Count == 0 ? "" : $"{editDependencies.Count} mod{(editDependencies.Count == 1 ? "" : "s")}";
+        var depsSummaryCol = editDependencies.Count == 0 ? Chr_TextFaint : Sec_Depends;
+        if (BeginCard("08", "MOD DEPENDENCIES", Sec_Depends, depsSummary, depsSummaryCol, ref dependenciesOpen))
+        {
+            DrawDependenciesSection();
+        }
+        EndCard();
+
         // Save/Cancel live in the window footer (pinned, not scrolled)
+    }
+
+    private void DrawDependenciesSection()
+    {
+        ImGui.PushTextWrapPos(ImGui.GetCursorPosX() + CardInnerWidth());
+        ImGui.TextUnformatted("Extra mods enabled together with this preset (skeleton mods, prop textures). Each uses its own priority boost on top of that mod's current priority.");
+        ImGui.PopTextWrapPos();
+        ImGui.Spacing();
+
+        var scale = UIStyles.Scale;
+        var dl = ImGui.GetWindowDrawList();
+        float frameH = ImGui.GetFrameHeight();
+        float rowAvail = CardInnerWidth();
+        float refreshBtnW = 72f * scale;
+        float searchW = rowAvail - refreshBtnW - 6f * scale;
+        float glyphW = 22f * scale;
+
+        uint glyphCol = ImGui.ColorConvertFloat4ToU32(Chr_TextFaint);
+        ImGui.PushFont(UiBuilder.IconFont);
+        var mag = FontAwesomeIcon.Search.ToIconString();
+        var magSz = ImGui.CalcTextSize(mag);
+        ImGui.PopFont();
+
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(glyphW, 4f * scale));
+        ImGui.SetNextItemWidth(searchW);
+        ImGui.InputTextWithHint("##depSearch", "Search all mods...", ref dependencySearchFilter, 100);
+        var inputMin = ImGui.GetItemRectMin();
+        ImGui.PopStyleVar();
+        FocusRing();
+
+        ImGui.PushFont(UiBuilder.IconFont);
+        dl.AddText(
+            new Vector2(inputMin.X + (glyphW - magSz.X) * 0.5f,
+                        inputMin.Y + (frameH - magSz.Y) * 0.5f),
+            glyphCol, mag);
+        ImGui.PopFont();
+
+        ImGui.SameLine(0, 6f * scale);
+        if (ImGui.Button("Refresh##depRefresh"))
+            dependencyModList = null;
+        if (ImGui.IsItemHovered())
+            UIStyles.EncoreTooltip("Reload the Penumbra mod list");
+
+        ImGui.Spacing();
+
+        if (dependencyModList == null)
+        {
+            var raw = Plugin.Instance?.PenumbraService?.GetModList() ?? new Dictionary<string, string>();
+            dependencyModList = raw.Select(kv => (Dir: kv.Key, Name: kv.Value))
+                .OrderBy(m => m.Name, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            dependencyFilterKey = null;
+        }
+
+        var filter = dependencySearchFilter.Trim();
+        var filterKey = filter + "|" + editModDirectory;
+        if (dependencyFilterKey != filterKey)
+        {
+            dependencyFilterKey = filterKey;
+            dependencyFiltered = dependencyModList
+                .Where(m => !string.Equals(m.Dir, editModDirectory, StringComparison.OrdinalIgnoreCase)
+                    && (filter.Length == 0
+                        || m.Name.Contains(filter, StringComparison.OrdinalIgnoreCase)
+                        || m.Dir.Contains(filter, StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+        }
+
+        var listHeight = 170f * scale;
+        float rowH = 32f * scale;
+        ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0.06f, 0.07f, 0.10f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.Border,  new Vector4(0.20f, 0.22f, 0.27f, 1f));
+        ImGui.PushStyleVar(ImGuiStyleVar.FrameBorderSize, 1f);
+        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new Vector2(0, 0));
+        if (ImGui.BeginChild("DepModList", new Vector2(rowAvail, listHeight), true))
+        {
+            if (dependencyFiltered.Count == 0)
+            {
+                ImGui.TextDisabled(dependencyModList.Count == 0 ? "No Penumbra mods found." : "No mods match the search.");
+            }
+            else
+            {
+                int count = dependencyFiltered.Count;
+                float scrollY = ImGui.GetScrollY();
+                int firstRow = Math.Max(0, (int)(scrollY / rowH) - 1);
+                int lastRow = Math.Min(count, firstRow + (int)(listHeight / rowH) + 3);
+
+                if (firstRow > 0)
+                    ImGui.Dummy(new Vector2(0, firstRow * rowH));
+
+                for (int i = firstRow; i < lastRow; i++)
+                {
+                    var (dir, name) = dependencyFiltered[i];
+                    var added = editDependencies.Any(d => string.Equals(d.ModDirectory, dir, StringComparison.OrdinalIgnoreCase));
+                    if (DrawDependencyListRow(dir, name, added, rowH))
+                    {
+                        if (added)
+                            editDependencies.RemoveAll(d => string.Equals(d.ModDirectory, dir, StringComparison.OrdinalIgnoreCase));
+                        else
+                            editDependencies.Add(new PresetDependency { ModDirectory = dir, ModName = name });
+                    }
+                }
+
+                if (lastRow < count)
+                    ImGui.Dummy(new Vector2(0, (count - lastRow) * rowH));
+            }
+        }
+        ImGui.EndChild();
+        ImGui.PopStyleVar(2);
+        ImGui.PopStyleColor(2);
+
+        if (editDependencies.Count == 0)
+            return;
+
+        ImGui.Spacing();
+        ImGui.Spacing();
+
+        int removeAt = -1;
+        for (int i = 0; i < editDependencies.Count; i++)
+        {
+            var dep = editDependencies[i];
+            ImGui.PushID(i);
+
+            var label = string.IsNullOrEmpty(dep.ModName) ? dep.ModDirectory : dep.ModName;
+            var drawLabel = label;
+            var maxW = rowAvail - 4f * scale;
+            if (ImGui.CalcTextSize(drawLabel).X > maxW)
+            {
+                while (drawLabel.Length > 0 && ImGui.CalcTextSize(drawLabel + "...").X > maxW)
+                    drawLabel = drawLabel[..^1];
+                drawLabel += "...";
+            }
+
+            ImGui.TextColored(Sec_Depends, drawLabel);
+            if (drawLabel.Length != label.Length && ImGui.IsItemHovered())
+                UIStyles.EncoreTooltip(label);
+
+            ImGui.SetNextItemWidth(90f * scale);
+            int boost = dep.PriorityBoost;
+            if (ImGui.InputInt("Boost##depBoost", ref boost))
+                dep.PriorityBoost = boost;
+            if (ImGui.IsItemHovered())
+                UIStyles.EncoreTooltip("Priority boost on top of this mod's current priority.\nSkeletons only need to beat your current skeleton mod;\ntexture overrides usually need a high value.");
+            ImGui.SameLine(0, 14f * scale);
+            bool redraw = dep.RedrawOnEnable;
+            if (ImGui.Checkbox("Redraw", ref redraw))
+                dep.RedrawOnEnable = redraw;
+            if (ImGui.IsItemHovered())
+                UIStyles.EncoreTooltip("Redraw the character after enabling this mod, before the emote runs.\nRequired for skeleton mods; leave off for textures.");
+            ImGui.SameLine(0, 14f * scale);
+            var optionsExpanded = depOptionsExpanded.Contains(dep.ModDirectory);
+            var optionsLabel = dep.ModOptions.Count > 0 ? $"Options ({dep.ModOptions.Count})" : "Options";
+            if (ImGui.SmallButton(optionsLabel))
+            {
+                if (optionsExpanded)
+                    depOptionsExpanded.Remove(dep.ModDirectory);
+                else
+                    depOptionsExpanded.Add(dep.ModDirectory);
+            }
+            if (ImGui.IsItemHovered())
+                UIStyles.EncoreTooltip("Choose this mod's option groups while the preset is active.\nGroups left on (current) keep whatever is set in Penumbra.");
+            ImGui.SameLine(0, 14f * scale);
+            if (ImGui.SmallButton("Remove"))
+                removeAt = i;
+
+            if (optionsExpanded)
+                DrawDependencyOptions(dep);
+
+            if (i < editDependencies.Count - 1)
+                ImGui.Spacing();
+
+            ImGui.PopID();
+        }
+
+        if (removeAt >= 0)
+            editDependencies.RemoveAt(removeAt);
+    }
+
+    private void DrawDependencyOptions(PresetDependency dep)
+    {
+        var scale = UIStyles.Scale;
+        var dl = ImGui.GetWindowDrawList();
+        float labelColW = CardInnerWidth() * 0.34f;
+        float gridGap = 16f * scale;
+        float labelTrack = 1.0f * scale;
+        float labelMaxW = labelColW - 14f * scale;
+
+        if (!depAvailableSettings.TryGetValue(dep.ModDirectory, out var avail))
+        {
+            avail = Plugin.Instance?.PenumbraService?.GetAvailableModSettings(dep.ModDirectory, dep.ModName);
+            depAvailableSettings[dep.ModDirectory] = avail;
+        }
+
+        ImGui.Spacing();
+
+        if (avail == null || avail.Count == 0)
+        {
+            ImGui.TextDisabled("No adjustable option groups - the mod's current settings are used.");
+            return;
+        }
+
+        foreach (var (groupName, (options, groupType)) in avail)
+        {
+            if (options.Length == 0)
+                continue;
+
+            ImGui.AlignTextToFramePadding();
+            string fullLabel = groupName.ToUpperInvariant();
+            string shownLabel = TruncateTrackedToFit(fullLabel, labelMaxW, labelTrack);
+            bool labelTruncated = shownLabel != fullLabel;
+            var labelPos = ImGui.GetCursorScreenPos();
+            UIStyles.DrawTrackedText(dl, labelPos, shownLabel,
+                ImGui.ColorConvertFloat4ToU32(Chr_TextGhost), labelTrack);
+            ImGui.Dummy(new Vector2(labelColW, ImGui.GetTextLineHeight()));
+            if (labelTruncated && ImGui.IsItemHovered())
+                UIStyles.EncoreTooltip(groupName);
+            ImGui.SameLine(labelColW + gridGap, 0);
+
+            dep.ModOptions.TryGetValue(groupName, out var currentSelection);
+
+            if (groupType == 0)
+            {
+                var selectedOption = currentSelection?.Count > 0 ? currentSelection[0] : "";
+                var previewLabel = string.IsNullOrEmpty(selectedOption) ? "(current)" : selectedOption;
+
+                ImGui.SetNextItemWidth(CardInnerWidth());
+                UIStyles.PushEncoreComboStyle();
+                if (ImGui.BeginCombo($"##depopt_{groupName}", previewLabel))
+                {
+                    if (ImGui.Selectable("(current)", string.IsNullOrEmpty(selectedOption)))
+                        dep.ModOptions.Remove(groupName);
+
+                    for (int i = 0; i < options.Length; i++)
+                    {
+                        if (ImGui.Selectable(options[i], options[i] == selectedOption))
+                            dep.ModOptions[groupName] = new List<string> { options[i] };
+                    }
+                    ImGui.EndCombo();
+                }
+                UIStyles.PopEncoreComboStyle();
+                FocusRing();
+            }
+            else
+            {
+                var selectedSet = currentSelection != null
+                    ? new HashSet<string>(currentSelection, StringComparer.OrdinalIgnoreCase)
+                    : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                bool changed = false;
+                for (int i = 0; i < options.Length; i++)
+                {
+                    if (i > 0)
+                    {
+                        ImGui.Dummy(Vector2.Zero);
+                        ImGui.SameLine(labelColW + gridGap, 0);
+                    }
+
+                    var isChecked = selectedSet.Contains(options[i]);
+                    if (ImGui.Checkbox($"{options[i]}##depopt_{groupName}_{i}", ref isChecked))
+                    {
+                        if (isChecked)
+                            selectedSet.Add(options[i]);
+                        else
+                            selectedSet.Remove(options[i]);
+                        changed = true;
+                    }
+                }
+
+                if (changed)
+                {
+                    if (selectedSet.Count > 0)
+                        dep.ModOptions[groupName] = selectedSet.ToList();
+                    else
+                        dep.ModOptions.Remove(groupName);
+                }
+            }
+        }
+    }
+
+    // Row in the dependency mod list. Returns true when clicked.
+    private bool DrawDependencyListRow(string dir, string name, bool added, float rowH)
+    {
+        var scale = UIStyles.Scale;
+        var dl = ImGui.GetWindowDrawList();
+        var rowMin = ImGui.GetCursorScreenPos();
+        float rowW = ImGui.GetContentRegionAvail().X;
+        var rowMax = new Vector2(rowMin.X + rowW, rowMin.Y + rowH);
+
+        ImGui.InvisibleButton($"##deprow_{dir}", new Vector2(rowW, rowH));
+        bool hovered = ImGui.IsItemHovered();
+        bool clicked = ImGui.IsItemClicked();
+
+        if (hovered)
+            UIStyles.EncoreTooltip(added ? "Click to remove this dependency" : "Click to add as a dependency");
+
+        var bgMax = new Vector2(rowMax.X, rowMax.Y - 1f * scale);
+        if (added)
+        {
+            uint bgL = ImGui.ColorConvertFloat4ToU32(new Vector4(Sec_Depends.X, Sec_Depends.Y, Sec_Depends.Z, 0.14f));
+            uint bgR = ImGui.ColorConvertFloat4ToU32(new Vector4(Sec_Depends.X, Sec_Depends.Y, Sec_Depends.Z, 0f));
+            dl.AddRectFilledMultiColor(rowMin, bgMax, bgL, bgR, bgR, bgL);
+        }
+        else if (hovered)
+        {
+            dl.AddRectFilled(rowMin, bgMax,
+                ImGui.ColorConvertFloat4ToU32(new Vector4(Sec_Depends.X, Sec_Depends.Y, Sec_Depends.Z, 0.10f)));
+        }
+
+        float textY = rowMin.Y + (rowH - ImGui.GetTextLineHeight()) * 0.5f;
+        float textX = rowMin.X + 8f * scale;
+
+        if (added)
+        {
+            ImGui.PushFont(UiBuilder.IconFont);
+            var check = FontAwesomeIcon.Check.ToIconString();
+            dl.AddText(new Vector2(textX, textY), ImGui.ColorConvertFloat4ToU32(Sec_Depends), check);
+            var checkW = ImGui.CalcTextSize(check).X;
+            ImGui.PopFont();
+            textX += checkW + 6f * scale;
+        }
+
+        var nameCol = added ? Chr_Text : new Vector4(0.80f, 0.82f, 0.85f, 1f);
+        dl.AddText(new Vector2(textX, textY), ImGui.ColorConvertFloat4ToU32(nameCol), name);
+
+        return clicked;
     }
 
     private static readonly Vector4 HeelsAccentColor = new Vector4(0.95f, 0.75f, 0.45f, 1f);
@@ -1775,7 +2120,7 @@ public class PresetEditorWindow : Window
         }
         else
         {
-            ImGui.TextWrapped("Overrides Simple Heels while this preset is active. Drag the world-space arrows/rotation ring in game, or use the numeric fields below. Clears when a different preset or /encorereset runs.");
+            ImGui.TextWrapped("Adds to your current Simple Heels offset while this preset is active. Drag the world-space arrows/rotation ring in game, or use the numeric fields below. Clears when a different preset or /encorereset runs.");
         }
 
         ImGui.Spacing();
@@ -2142,7 +2487,7 @@ public class PresetEditorWindow : Window
                         modifierLastActiveKey = tabKey;
                     }
                     float alpha = 1f;
-                    if (modifierTabSwitchStart >= 0)
+                    if (UIStyles.MotionAmbient && modifierTabSwitchStart >= 0)
                     {
                         float tE = (float)(ImGui.GetTime() - modifierTabSwitchStart);
                         const float tDur = 0.15f;
@@ -2221,7 +2566,7 @@ public class PresetEditorWindow : Window
                         modifierLastActiveKey = "draft";
                     }
                     float draftAlpha = 1f;
-                    if (modifierTabSwitchStart >= 0)
+                    if (UIStyles.MotionAmbient && modifierTabSwitchStart >= 0)
                     {
                         float tE = (float)(ImGui.GetTime() - modifierTabSwitchStart);
                         const float tDur = 0.15f;
@@ -2664,7 +3009,6 @@ public class PresetEditorWindow : Window
         }
 
         CurrentPreset.IsVanilla = isVanillaPreset;
-        CurrentPreset.EmoteLocked = editEmoteLocked;
 
         // Save mod options (deep copy)
         CurrentPreset.ModOptions = new Dictionary<string, List<string>>();
@@ -2681,6 +3025,11 @@ public class PresetEditorWindow : Window
         // Save conflict exclusions (only those still present in detected command list)
         CurrentPreset.ConflictExclusions = editConflictExclusions
             .Where(e => detectedEmoteCommands.Any(c => string.Equals(c, e, StringComparison.OrdinalIgnoreCase)))
+            .ToList();
+
+        CurrentPreset.Dependencies = editDependencies
+            .Where(d => !string.IsNullOrEmpty(d.ModDirectory))
+            .Select(d => d.Clone())
             .ToList();
 
         // Save heels offset. Disabled or all-zero -> null (so no unnecessary IPC traffic on activation).
@@ -2908,6 +3257,7 @@ public class PresetEditorWindow : Window
     private static readonly Vector4 Sec_Modifiers  = new(1.00f, 0.82f, 0.30f, 1f); // amber
     private static readonly Vector4 Sec_Heels      = new(1.00f, 0.42f, 0.70f, 1f); // rose
     private static readonly Vector4 Sec_Conflict   = new(0.28f, 0.88f, 0.92f, 1f); // cyan
+    private static readonly Vector4 Sec_Depends    = new(1.00f, 0.58f, 0.36f, 1f); // coral
 
     // BeginCard always pushes (balanced with EndCard); `active` tells EndCard if body rendered
     private readonly Stack<(float leftX, float rightX, float bodyTopY, bool active)> cardBodyStarts = new();
@@ -2963,7 +3313,7 @@ public class PresetEditorWindow : Window
         // 3px accent bar; ~500ms brightness pulse on click
         float accentW = 3f * scale;
         Vector4 accentBarCol = accent;
-        if (cardRippleStart.TryGetValue(num, out var flashStart))
+        if (UIStyles.MotionButtonBounce && cardRippleStart.TryGetValue(num, out var flashStart))
         {
             float fE = (float)(ImGui.GetTime() - flashStart);
             const float fDur = 0.50f;
@@ -3016,11 +3366,15 @@ public class PresetEditorWindow : Window
             float targetAngle = isOpen ? MathF.PI * 0.5f : 0f;
             if (!cardChevronAngle.TryGetValue(num, out var curAngle))
                 curAngle = targetAngle;  // no animation on first frame
-            // Ease toward target (8 rad/sec ~= ~200ms for 90deg).
-            float delta = targetAngle - curAngle;
-            float step = ImGui.GetIO().DeltaTime * 8f;
-            if (MathF.Abs(delta) <= step) curAngle = targetAngle;
-            else curAngle += MathF.Sign(delta) * step;
+            if (UIStyles.MotionAmbient)
+            {
+                // Ease toward target (8 rad/sec ~= ~200ms for 90deg).
+                float delta = targetAngle - curAngle;
+                float step = ImGui.GetIO().DeltaTime * 8f;
+                if (MathF.Abs(delta) <= step) curAngle = targetAngle;
+                else curAngle += MathF.Sign(delta) * step;
+            }
+            else curAngle = targetAngle;  // snap to target when ambient off
             cardChevronAngle[num] = curAngle;
 
             // chevron points rotate around center: 0deg = >, 90deg = v
@@ -3209,8 +3563,8 @@ public class PresetEditorWindow : Window
         float pipCenterY = start.Y + ribbonH * 0.5f;
         float pipX = start.X + padX;
 
-        // Breathing glow behind the icon (matches HTML pip-mark
-        // ::after pulse).
+        // Breathing glow behind the icon
+        if (UIStyles.MotionAmbient)
         {
             float glowT = 0.5f + 0.5f * MathF.Sin((float)ImGui.GetTime() * MathF.Tau / 2.2f);
             float glowBase = 0.20f + 0.10f * glowT;
@@ -3323,7 +3677,8 @@ public class PresetEditorWindow : Window
         uint bgBot = ImGui.ColorConvertFloat4ToU32(new Vector4(0.039f, 0.051f, 0.078f, 1f));
         dl.AddRectFilledMultiColor(start, end, bgTop, bgTop, bgBot, bgBot);
 
-        // Slow spotlight drifting across the top - marquee vibe.
+        // Slow spotlight drifting across the top
+        if (UIStyles.MotionAmbient)
         {
             float st = 0.5f + 0.5f * MathF.Sin(t * MathF.Tau / 13f);
             float cx = start.X + availW * (0.30f + 0.40f * st);
@@ -3623,6 +3978,7 @@ public class PresetEditorWindow : Window
             (Sec_Modifiers,  "MDF", "Modifiers",    editModifiers.Count > 0),
             (Sec_Heels,      "HEL", "Heels offset", editHeelsEnabled),
             (Sec_Conflict,   "CON", "Conflict handling", editConflictExclusions.Count > 0),
+            (Sec_Depends,    "DEP", "Mod dependencies",  editDependencies.Count > 0),
         };
 
         float padX = 14f * scale;
@@ -3661,10 +4017,13 @@ public class PresetEditorWindow : Window
 
             if (armed)
             {
-                // Phase-offset breathing so the row reads as a
-                // running signal meter rather than synced blinking.
-                float breathT = (float)(ImGui.GetTime() * MathF.Tau / 2.4f) + i * 0.32f;
-                float breath = 0.82f + 0.18f * (0.5f + 0.5f * MathF.Sin(breathT));
+                float breath = 1f;
+                if (UIStyles.MotionAmbient)
+                {
+                    // Phase-offset breathing so the dots don't blink in sync
+                    float breathT = (float)(ImGui.GetTime() * MathF.Tau / 2.4f) + i * 0.32f;
+                    breath = 0.82f + 0.18f * (0.5f + 0.5f * MathF.Sin(breathT));
+                }
                 for (int h = 3; h >= 1; h--)
                 {
                     float pad = h * 2f * scale;
@@ -3687,10 +4046,9 @@ public class PresetEditorWindow : Window
                     0f, 0, 1f);
             }
 
-            // Arm-up ring pulse - expands outward + fades over
-            // 500ms, easeOutCubic. Drawn AFTER the dot so it radiates
-            // from the dot rather than being covered by it.
-            if (tickerPulseStart[i] >= 0)
+            // Arm-up ring pulse - expands + fades over 500ms, easeOutCubic.
+            // Drawn after the dot so it isn't covered by it.
+            if (UIStyles.MotionAmbient && tickerPulseStart[i] >= 0)
             {
                 float pElapsed = (float)(ImGui.GetTime() - tickerPulseStart[i]);
                 const float pDur = 0.5f;
@@ -3789,9 +4147,8 @@ public class PresetEditorWindow : Window
         ValidateUniqueness();
         bool isValid = IsFormValid();
 
-        // Delayed close after Save click - lets the kick-scale
-        // animation finish before the window actually disappears.
-        if (savePendingClose && ImGui.GetTime() >= savePendingCloseAt)
+        // Delayed close so the save kick animation finishes first; no wait when bounce off
+        if (savePendingClose && (!UIStyles.MotionButtonBounce || ImGui.GetTime() >= savePendingCloseAt))
         {
             SavePreset();
             Confirmed = true;
@@ -3828,13 +4185,22 @@ public class PresetEditorWindow : Window
         else if (!isValid) { statusText = "Select a mod (or mark as vanilla)"; statusCol = new Vector4(1f, 0.72f, 0.30f, 1f); }
         else { statusText = "Ready to save"; statusCol = Chr_Accent; }
 
-        // Soft-pulsing status dot - breathes on the valid/"ready"
-        // state so the footer feels alive; static otherwise.
+        // Buttons on the right: Cancel (ghost) then Save (accent halo).
+        float btnH = 28f * scale;
+        float saveBtnW = 96f * scale;
+        float cancelBtnW = 72f * scale;
+        float btnGap = 10f * scale;
+
+        float saveX = end.X - padX - saveBtnW;
+        float saveY = contentY - btnH * 0.5f;
+        float cancelX = saveX - btnGap - cancelBtnW;
+
+        // Status dot pulses on the valid state, static otherwise
         float dotR = 3.5f * scale;
         float dotX = start.X + padX + dotR;
         float dotY = contentY;
         float dotAlpha = 1f;
-        if (isValid && nameError == null && commandError == null)
+        if (UIStyles.MotionAmbient && isValid && nameError == null && commandError == null)
         {
             float t = (float)(ImGui.GetTime() * MathF.Tau / 2.2f);
             dotAlpha = 0.75f + 0.25f * (0.5f + 0.5f * MathF.Sin(t));
@@ -3849,22 +4215,23 @@ public class PresetEditorWindow : Window
         }
         dl.AddCircleFilled(new Vector2(dotX, dotY), dotR,
             ImGui.ColorConvertFloat4ToU32(new Vector4(statusCol.X, statusCol.Y, statusCol.Z, dotAlpha)));
-        dl.AddText(new Vector2(dotX + dotR + 8f * scale, textY),
-            ImGui.ColorConvertFloat4ToU32(statusCol), statusText);
+        // Truncate the status text so it never runs under the buttons; full text on hover.
+        float statusX = dotX + dotR + 8f * scale;
+        float statusMaxW = cancelX - 12f * scale - statusX;
+        var statusDraw = statusText;
+        if (ImGui.CalcTextSize(statusDraw).X > statusMaxW)
+        {
+            while (statusDraw.Length > 0 && ImGui.CalcTextSize(statusDraw + "...").X > statusMaxW)
+                statusDraw = statusDraw[..^1];
+            statusDraw += "...";
+            if (ImGui.IsMouseHoveringRect(new Vector2(statusX, start.Y), new Vector2(cancelX, end.Y)))
+                UIStyles.EncoreTooltip(statusText);
+        }
 
-        // Buttons on the right: Cancel (ghost) then Save (accent halo).
-        float btnH = 28f * scale;
-        float saveBtnW = 96f * scale;
-        float cancelBtnW = 72f * scale;
-        float btnGap = 10f * scale;
+        dl.AddText(new Vector2(statusX, textY),
+            ImGui.ColorConvertFloat4ToU32(statusCol), statusDraw);
 
-        float saveX = end.X - padX - saveBtnW;
-        float saveY = contentY - btnH * 0.5f;
-        float cancelX = saveX - btnGap - cancelBtnW;
-
-        // Cancel - ghost outline. Hover glows the border toward
-        // accent + softens the bg. Click has a brief press-down
-        // alpha dip via ImGui's native ButtonActive state.
+        // Cancel - ghost outline
         var cancelMin = new Vector2(cancelX, saveY);
         var cancelMax = new Vector2(cancelX + cancelBtnW, saveY + btnH);
         bool cancelHovered = ImGui.IsMouseHoveringRect(cancelMin, cancelMax);

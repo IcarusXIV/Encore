@@ -17,7 +17,8 @@ public class PatchNotesWindow : Window
     private bool wasOpen = false;
 
     // Section collapse state (latest open, older collapsed).
-    private bool v1006Open = true;
+    private bool v1010Open = true;
+    private bool v1006Open = false;
     private bool v1005Open = false;
     private bool v100Open = false;
 
@@ -143,6 +144,7 @@ public class PatchNotesWindow : Window
             if (ImGui.BeginChild("##patchContent",
                     new Vector2(ImGui.GetContentRegionAvail().X, contentH), false))
             {
+                DrawVersion1010Notes();
                 DrawVersion1006Notes();
                 DrawVersion1005Notes();
                 DrawVersion100Notes();
@@ -851,13 +853,36 @@ public class PatchNotesWindow : Window
         ImGui.Dummy(new Vector2(1, 4f * scale));
     }
 
-    // ================================================================
-    // VERSION SECTIONS
-    // ================================================================
+    // Version sections
+    private void DrawVersion1010Notes()
+    {
+        if (DrawPatchSection("v1010", $"V{Plugin.PatchNotesVersion}",
+                "Mod Dependencies & Targets", isLatest: true, ref v1010Open))
+        {
+            DrawFeatureItem(FontAwesomeIcon.Cubes, "Mod Dependencies",
+                "Presets can enable other mods alongside the animation mod, each with its own priority boost. Useful for skeleton mods an animation needs, or textures for props it uses. They revert when the preset ends.",
+                tag: "HEADLINER");
+
+            DrawFeatureItem(FontAwesomeIcon.Crosshairs, "Apply to Target",
+                "/do <preset> plays a preset on your target: works on any target with a Penumbra collection assigned, including actors in GPose. /do stop ends it.");
+
+            DrawFeatureItem(FontAwesomeIcon.Unlock, "Locked Emotes",
+                "Removed the 'I don't have this emote' checkbox, Encore works out if you own the emote or not. Typing a locked emote's command plays your mod instead of the vanilla animation.");
+
+            DrawFeatureItem(FontAwesomeIcon.SlidersH, "Reduce Motion",
+                "New Motion section in Settings. Turn the UI's animations off one by one, or all at once.");
+
+            DrawFeatureItem(FontAwesomeIcon.Cube, "Penumbra 1.7 Ready",
+                "Encore has been made to work with the Penumbra update.");
+
+            EndSectionBody();
+        }
+    }
+
     private void DrawVersion1006Notes()
     {
-        if (DrawPatchSection("v1006", $"V{Plugin.PatchNotesVersion}",
-                "Routines & Choreography", isLatest: true, ref v1006Open))
+        if (DrawPatchSection("v1006", "V1.0.0.6",
+                "Routines & Choreography", isLatest: false, ref v1006Open))
         {
             DrawFeatureItem(FontAwesomeIcon.Palette, "UI Redesign",
                 "Encore's had a full visual refresh. Hover over things, open some menus, switch between tabs, and you'll notice little touches tucked in all over the place. Everything's a bit easier on the eyes, too.",

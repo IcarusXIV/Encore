@@ -30,6 +30,7 @@ public class SettingsWindow : Window
     private static readonly Vector4 SecEmotes        = new(0.45f, 0.92f, 0.55f, 1f);  // spring green
     private static readonly Vector4 SecNotifications = new(0.49f, 0.65f, 0.85f, 1f);  // signal blue (accent)
     private static readonly Vector4 SecDisplay       = new(0.72f, 0.52f, 1.00f, 1f);  // violet
+    private static readonly Vector4 SecMotion        = new(0.28f, 0.88f, 0.92f, 1f);  // cyan
     private static readonly Vector4 Warning          = new(1.00f, 0.72f, 0.30f, 1f);  // amber
 
     // 8-step rainbow palette - same one used by the patch-notes and
@@ -645,12 +646,14 @@ public class SettingsWindow : Window
         var config = Plugin.Instance?.Configuration;
         if (config == null) return;
 
-        //  CH 01 - EMOTES 
+        //  CH 01 - EMOTES
         DrawEmotesChannel(config);
-        //  CH 02 - NOTIFICATIONS 
+        //  CH 02 - NOTIFICATIONS
         DrawNotificationsChannel(config);
-        //  CH 03 - DISPLAY 
+        //  CH 03 - DISPLAY
         DrawDisplayChannel(config);
+        //  CH 04 - MOTION
+        DrawReduceMotionChannel(config);
     }
 
     private void DrawEmotesChannel(Configuration config)
@@ -737,6 +740,125 @@ public class SettingsWindow : Window
         }
 
         EndChannel();
+    }
+
+    private void DrawReduceMotionChannel(Configuration config)
+    {
+        int armed = 0;
+        if (config.MotionEqualizers)   armed++;
+        if (config.MotionScreenDim)    armed++;
+        if (config.MotionCursorGlow)   armed++;
+        if (config.MotionButtonBounce) armed++;
+        if (config.MotionAmbient)      armed++;
+
+        BeginChannel("04", "MOTION", SecMotion, armed, 5);
+
+        DrawQuickSetRow(config);
+        DrawRowSeparator();
+
+        bool eq = config.MotionEqualizers;
+        if (DrawSwitchRow("motEq", SecMotion, ref eq,
+                "Equalizer bars",
+                "The audio meter bars that pump along the window edges and beside playing tracks. The equalizer behind the ENCORE title always stays."))
+        {
+            config.MotionEqualizers = eq;
+            config.Save();
+        }
+
+        DrawRowSeparator();
+
+        bool dim = config.MotionScreenDim;
+        if (DrawSwitchRow("motDim", SecMotion, ref dim,
+                "Card dimming on hover",
+                "Fades the other cards darker when you hover one, so the hovered card stands out. Turn off to keep every card at full brightness."))
+        {
+            config.MotionScreenDim = dim;
+            config.Save();
+        }
+
+        DrawRowSeparator();
+
+        bool cursor = config.MotionCursorGlow;
+        if (DrawSwitchRow("motCursor", SecMotion, ref cursor,
+                "Cursor glow",
+                "The soft glow that follows your mouse across a card, and its slow drift on the currently playing card."))
+        {
+            config.MotionCursorGlow = cursor;
+            config.Save();
+        }
+
+        DrawRowSeparator();
+
+        bool bounce = config.MotionButtonBounce;
+        if (DrawSwitchRow("motBounce", SecMotion, ref bounce,
+                "Button bounce and ripples",
+                "All motion on the play, save, and stop buttons: the squash-and-bounce, the glow, the pulsing dot, and the ripple halo. Also the ripple when you click a card and the spark burst when a preset starts."))
+        {
+            config.MotionButtonBounce = bounce;
+            config.Save();
+        }
+
+        DrawRowSeparator();
+
+        bool ambient = config.MotionAmbient;
+        if (DrawSwitchRow("motAmbient", SecMotion, ref ambient,
+                "Ambient shimmer",
+                "General idle motion: breathing status dots, drifting header spotlights, the ENCORE title shimmer, the sliding tab underline, and the beat pulse and rings on a playing card."))
+        {
+            config.MotionAmbient = ambient;
+            config.Save();
+        }
+
+        EndChannel();
+    }
+
+    private void DrawQuickSetRow(Configuration config)
+    {
+        var scale = UIStyles.Scale;
+        var dl = ImGui.GetWindowDrawList();
+        var rowStart = ImGui.GetCursorScreenPos();
+
+        float btnW = 60f * scale;
+        float btnH = 22f * scale;
+        float gap = 8f * scale;
+
+        var lbl = "QUICK SET";
+        var lblSz = ImGui.CalcTextSize(lbl);
+        dl.AddText(new Vector2(rowStart.X, rowStart.Y + (btnH - lblSz.Y) * 0.5f),
+            ImGui.ColorConvertFloat4ToU32(TextDim), lbl);
+
+        float rightEdge = CurrentChannelRight() - 14f * scale;
+        float noneX = rightEdge - btnW;
+        float allX = noneX - gap - btnW;
+
+        ImGui.SetCursorScreenPos(new Vector2(allX, rowStart.Y));
+        if (UIStyles.DrawPlayButton("##motAll", new Vector2(btnW, btnH), 1f, scale,
+                label: "ALL", restCol: Accent, hoverCol: AccentBright,
+                heldCol: AccentDeep, borderCol: AccentDeep, textColor: AccentDark))
+        {
+            config.MotionEqualizers = true;
+            config.MotionScreenDim = true;
+            config.MotionCursorGlow = true;
+            config.MotionButtonBounce = true;
+            config.MotionAmbient = true;
+            config.Save();
+        }
+
+        ImGui.SetCursorScreenPos(new Vector2(noneX, rowStart.Y));
+        if (UIStyles.DrawPlayButton("##motNone", new Vector2(btnW, btnH), 1f, scale,
+                label: "NONE", restCol: Accent, hoverCol: AccentBright,
+                heldCol: AccentDeep, borderCol: AccentDeep, textColor: AccentDark))
+        {
+            config.MotionEqualizers = false;
+            config.MotionScreenDim = false;
+            config.MotionCursorGlow = false;
+            config.MotionButtonBounce = false;
+            config.MotionAmbient = false;
+            config.Save();
+        }
+
+        ImGui.SetCursorScreenPos(new Vector2(rowStart.X, rowStart.Y + btnH + 4f * scale));
+        ImGui.Dummy(new Vector2(1, 2f * scale));
     }
 
     // ================================================================

@@ -92,9 +92,49 @@ public class EmoteDetectionService
         return added;
     }
 
-    // FFXIV's actual emote commands - comprehensive mapping from file names to slash commands
-    // Based on FFXIV game data: ActionTimeline sheet, emote file paths, and game data mining
-    // Format: file name (without extension) -> slash command
+    // Derive loop_emot##/act_emot## -> command map from Lumina ActionTimeline keys.
+    private static readonly System.Text.RegularExpressions.Regex InternalEmoteAnimPattern =
+        new(@"^(loop_emote?|act_emote?)\d+", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    public static int PopulateInternalEmoteAnims(Dictionary<ushort, List<(int slot, string key, bool isLoop, byte loadType)>> emoteIdToTimelines,
+        Dictionary<string, ushort> commandToId)
+    {
+        var idToCommand = new Dictionary<ushort, string>();
+        foreach (var (cmd, id) in commandToId)
+        {
+            if (!idToCommand.ContainsKey(id))
+                idToCommand[id] = cmd;
+        }
+
+        int added = 0;
+        foreach (var (emoteId, entries) in emoteIdToTimelines)
+        {
+            if (!idToCommand.TryGetValue(emoteId, out var cmd) || string.IsNullOrEmpty(cmd))
+                continue;
+
+            foreach (var (slot, key, isLoop, loadType) in entries)
+            {
+                if (string.IsNullOrEmpty(key)) continue;
+
+                var lastSlash = key.LastIndexOf('/');
+                var name = lastSlash >= 0 ? key.Substring(lastSlash + 1) : key;
+
+                var m = InternalEmoteAnimPattern.Match(name);
+                if (!m.Success) continue;
+
+                var prefix = m.Value.ToLowerInvariant();
+                if (!EmoteToCommand.TryGetValue(prefix, out var existing) || !string.Equals(existing, cmd, StringComparison.OrdinalIgnoreCase))
+                {
+                    EmoteToCommand[prefix] = cmd;
+                    added++;
+                }
+            }
+        }
+
+        return added;
+    }
+
+    // File name (without extension) -> slash command
     internal static readonly Dictionary<string, string> EmoteToCommand = new(StringComparer.OrdinalIgnoreCase)
     {
         // DANCE EMOTES
@@ -1155,73 +1195,9 @@ public class EmoteDetectionService
         { "victory pose", "/victorypose" },
         { "hildibrand", "/hildibrand" },
 
-        // INTERNAL FFXIV ANIMATION NAMES
-        // These are the loop_emot## and act_emot## patterns used internally
-        // Loop emote patterns (loop_emot## -> specific emotes)
-        { "loop_emot01", "/joy" },
-        { "loop_emot02", "/angry" },
-        { "loop_emot03", "/sad" },
-        { "loop_emot04", "/cry" },
-        { "loop_emot05", "/think" },
-        { "loop_emot06", "/doubt" },
-        { "loop_emot07", "/blush" },
-        { "loop_emot08", "/panic" },
-        { "loop_emot09", "/fume" },
-        { "loop_emot10", "/sulk" },
-        { "loop_emot11", "/laugh" },
-        { "loop_emot12", "/cheer" },
-        { "loop_emot13", "/rally" },
-        { "loop_emot14", "/dance" },
-        { "loop_emot15", "/stretch" },
-        { "loop_emot16", "/doze" },
-        { "loop_emot17", "/flex" },
-        { "loop_emot18", "/pray" },
-        { "loop_emot19", "/hum" },
-        { "loop_emot20", "/stepdance" },
-        { "loop_emot21", "/harvestdance" },
-        { "loop_emot22", "/golddance" },
-        { "loop_emot23", "/lean" },
-        { "loop_emot24", "/mandervilledance" },
-        { "loop_emot25", "/bombdance" },
-        { "loop_emot26", "/mogdance" },
-        { "loop_emot27", "/songbird" },
-        { "loop_emot28", "/thavdance" },
-        { "loop_emot29", "/beesknees" },
-        { "loop_emot30", "/sidestep" },
-        { "loop_emot31", "/easterndance" },
-        { "loop_emot32", "/sundance" },
-        { "loop_emot33", "/moonlift" },
-        { "loop_emot34", "/popotostep" },
-        { "loop_emot35", "/flamedance" },
-        { "loop_emot36", "/yoldance" },
-        { "loop_emot37", "/littleladiesdance" },
-        { "loop_emot38", "/heeltoe" },
-        { "loop_emot39", "/mandervillemambo" },
-        { "loop_emot40", "/lalihop" },
-        { "loop_emot41", "/lophop" },
+        // loop_emot##/act_emot## entries populated dynamically. See PopulateInternalEmoteAnims.
 
-        // Action emote patterns (act_emot## -> specific emotes)
-        { "act_emot01", "/bow" },
-        { "act_emot02", "/wave" },
-        { "act_emot03", "/clap" },
-        { "act_emot04", "/salute" },
-        { "act_emot05", "/kneel" },
-        { "act_emot06", "/point" },
-        { "act_emot07", "/slap" },
-        { "act_emot08", "/hug" },
-        { "act_emot09", "/comfort" },
-        { "act_emot10", "/flex" },
-        { "act_emot11", "/psych" },
-        { "act_emot12", "/vpose" },
-        { "act_emot13", "/yes" },
-        { "act_emot14", "/no" },
-        { "act_emot15", "/beckon" },
-        { "act_emot16", "/pet" },
-        { "act_emot17", "/blowkiss" },
-
-        // ADDITIONAL FOLDER NAME VARIANTS
-        // FFXIV uses various folder naming conventions
-        // Show emotes (folder names)
+        // Folder name variants.
         { "show_left", "/showleft" },
         { "show_right", "/showright" },
         { "showl", "/showleft" },
@@ -2279,6 +2255,13 @@ public class EmoteDetectionService
             var fullModPath = Path.Combine(penumbraModPath, modDirectory);
             if (!Directory.Exists(fullModPath))
                 return filePaths;
+
+            // FileVersion decides the format, same as Penumbra itself
+            if (PenumbraModFormat.TryReadV4Meta(fullModPath) is { } v4Meta)
+            {
+                PenumbraModFormat.CollectFileGamePaths(v4Meta, filePaths);
+                return filePaths;
+            }
 
             foreach (var file in Directory.EnumerateFiles(fullModPath, "*.json"))
             {

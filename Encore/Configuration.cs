@@ -61,6 +61,13 @@ public class Configuration : IPluginConfiguration
     // window chrome ignores GlobalScale; fonts still scale
     public bool IgnoreGlobalScale { get; set; } = false;
 
+    // Reduce Motion toggles (true = motion on)
+    public bool MotionEqualizers { get; set; } = true;
+    public bool MotionScreenDim { get; set; } = true;
+    public bool MotionCursorGlow { get; set; } = true;
+    public bool MotionButtonBounce { get; set; } = true;
+    public bool MotionAmbient { get; set; } = true;
+
     public void Save()
     {
         Plugin.PluginInterface.SavePluginConfig(this);
@@ -145,6 +152,9 @@ public class DancePreset
     // Entries are matched against the mod's AffectedEmotes / EmoteCommands (without leading slash).
     public List<string> ConflictExclusions { get; set; } = new();
 
+    // Extra mods enabled alongside this preset (skeletons, prop textures), each with its own boost
+    public List<PresetDependency> Dependencies { get; set; } = new();
+
     // Simple Heels override applied while this preset is active (requires SimpleHeels plugin)
     public HeelsOffset? HeelsOffset { get; set; }
 
@@ -180,6 +190,36 @@ public class DancePreset
         };
         foreach (var m in Modifiers)
             clone.Modifiers.Add(m.Clone());
+        foreach (var d in Dependencies)
+            clone.Dependencies.Add(d.Clone());
+        return clone;
+    }
+}
+
+// A mod enabled together with a preset. Boost is added to the mod's current priority.
+public class PresetDependency
+{
+    public string ModDirectory { get; set; } = "";
+    public string ModName { get; set; } = "";
+    public int PriorityBoost { get; set; } = 10;
+
+    // Redraw the character after enabling, before the emote runs. Required for skeleton mods.
+    public bool RedrawOnEnable { get; set; } = false;
+
+    // Group name -> selected options. Groups not listed keep the mod's current settings.
+    public Dictionary<string, List<string>> ModOptions { get; set; } = new();
+
+    public PresetDependency Clone()
+    {
+        var clone = new PresetDependency
+        {
+            ModDirectory = ModDirectory,
+            ModName = ModName,
+            PriorityBoost = PriorityBoost,
+            RedrawOnEnable = RedrawOnEnable,
+        };
+        foreach (var (g, o) in ModOptions)
+            clone.ModOptions[g] = new List<string>(o);
         return clone;
     }
 }

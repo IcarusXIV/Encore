@@ -390,7 +390,9 @@ public class MainWindow : Window, IDisposable
         // ON-AIR pip: breathing core + two expanding rings
         float pipX = start.X + padX + 9f * scale;
         float coreR = 2f * scale;
-        float coreBreath = 0.5f + 0.5f * MathF.Sin(t * MathF.Tau / 1.8f);
+        float coreBreath = UIStyles.MotionAmbient
+            ? 0.5f + 0.5f * MathF.Sin(t * MathF.Tau / 1.8f)
+            : 0f;
         float corePulse = 1.0f + 0.2f * coreBreath;
         float pr = coreR * corePulse;
         for (int g = 2; g >= 1; g--)
@@ -401,14 +403,17 @@ public class MainWindow : Window, IDisposable
         }
         dl.AddCircleFilled(new Vector2(pipX, pipCenterY), pr,
             MW_ColA(MW_AccentBright, 1f));
-        for (int ring = 0; ring < 2; ring++)
+        if (UIStyles.MotionAmbient)
         {
-            float phase = ((float)t + ring * 0.9f) % 1.8f / 1.8f;
-            float rRadius = 2f * scale + (9f * scale - 2f * scale) * phase;
-            float rAlpha = 0.85f * (1f - phase);
-            if (rAlpha < 0.02f) continue;
-            dl.AddCircle(new Vector2(pipX, pipCenterY), rRadius,
-                MW_ColA(MW_Accent, rAlpha), 16, 1f);
+            for (int ring = 0; ring < 2; ring++)
+            {
+                float phase = ((float)t + ring * 0.9f) % 1.8f / 1.8f;
+                float rRadius = 2f * scale + (9f * scale - 2f * scale) * phase;
+                float rAlpha = 0.85f * (1f - phase);
+                if (rAlpha < 0.02f) continue;
+                dl.AddCircle(new Vector2(pipX, pipCenterY), rRadius,
+                    MW_ColA(MW_Accent, rAlpha), 16, 1f);
+            }
         }
 
         //  Meta run: "MAINSTAGE - N PRESETS - N ROUTINES"
@@ -478,13 +483,16 @@ public class MainWindow : Window, IDisposable
             float pDotCx = pLeft + pDotR;
             float pDotCy = textY + textH * 0.5f;
 
-            float pBreath = 0.5f + 0.5f * MathF.Sin(t * MathF.Tau / 2.4f);
-            for (int g = 3; g >= 1; g--)
+            if (UIStyles.MotionAmbient)
             {
-                float pad = g * 1.2f * scale;
-                float a = 0.20f / g * (0.6f + 0.4f * pBreath);
-                dl.AddCircleFilled(new Vector2(pDotCx, pDotCy), pDotR + pad,
-                    MW_ColA(pStatusCol, a));
+                float pBreath = 0.5f + 0.5f * MathF.Sin(t * MathF.Tau / 2.4f);
+                for (int g = 3; g >= 1; g--)
+                {
+                    float pad = g * 1.2f * scale;
+                    float a = 0.20f / g * (0.6f + 0.4f * pBreath);
+                    dl.AddCircleFilled(new Vector2(pDotCx, pDotCy), pDotR + pad,
+                        MW_ColA(pStatusCol, a));
+                }
             }
             dl.AddCircleFilled(new Vector2(pDotCx, pDotCy), pDotR,
                 MW_Col(pStatusCol));
@@ -520,6 +528,7 @@ public class MainWindow : Window, IDisposable
             new Vector2(start.X, start.Y + heroH * 0.6f), end,
             bgMid, bgMid, bgBot, bgBot);
 
+        if (UIStyles.MotionAmbient)
         {
             float heroT = (float)ImGui.GetTime();
             void Spot(float period, float phase, float xFracBase, float xFracRange,
@@ -606,8 +615,11 @@ public class MainWindow : Window, IDisposable
         else if (headerFontFallback is { Available: true }) bannerFontH = headerFontFallback;
         if (bannerFontH != null)
         {
-            encoreFadeAlpha = MathF.Min(1f,
-                encoreFadeAlpha + ImGui.GetIO().DeltaTime / 0.40f);
+            if (UIStyles.MotionAmbient)
+                encoreFadeAlpha = MathF.Min(1f,
+                    encoreFadeAlpha + ImGui.GetIO().DeltaTime / 0.40f);
+            else
+                encoreFadeAlpha = 1f;
             float fade = encoreFadeAlpha;
             float tBreath = (float)ImGui.GetTime();
 
@@ -642,7 +654,7 @@ public class MainWindow : Window, IDisposable
                 for (int i = 0; i < banner.Length; i++)
                 {
                     float phaseL = tBreath * MathF.Tau / 4f - i * 0.28f;
-                    float bulb = 0.5f + 0.5f * MathF.Sin(phaseL);
+                    float bulb = UIStyles.MotionAmbient ? 0.5f + 0.5f * MathF.Sin(phaseL) : 1f;
                     float letterA = 0.94f + 0.06f * bulb;
                     var s = banner[i].ToString();
                     var letterPos = new Vector2(bannerX, bannerTopY);
@@ -1763,7 +1775,9 @@ public class MainWindow : Window, IDisposable
         // Focus ring - accent border + soft halo when active, eased alpha.
         {
             float targetFocus = ImGui.IsItemActive() ? 1f : 0f;
-            searchFocusAlpha = ApproachAlpha(searchFocusAlpha, targetFocus, 8f);
+            searchFocusAlpha = UIStyles.MotionAmbient
+                ? ApproachAlpha(searchFocusAlpha, targetFocus, 8f)
+                : targetFocus;
             if (searchFocusAlpha > 0.02f)
             {
                 uint ringCol = MW_ColA(MW_Accent, 0.95f * searchFocusAlpha);
@@ -1959,7 +1973,9 @@ public class MainWindow : Window, IDisposable
         }
 
         // Advance progress toward 1 over ~360ms.
-        tabSlideProgress = MathF.Min(1f, tabSlideProgress + ImGui.GetIO().DeltaTime / 0.36f);
+        tabSlideProgress = UIStyles.MotionAmbient
+            ? MathF.Min(1f, tabSlideProgress + ImGui.GetIO().DeltaTime / 0.36f)
+            : 1f;
 
         float p = tabSlideProgress;
 
@@ -2084,7 +2100,7 @@ public class MainWindow : Window, IDisposable
         }
 
         // 200ms in / 600ms out spotlight wash beneath the newly-active tab
-        if (tabClickedAt >= 0)
+        if (UIStyles.MotionAmbient && tabClickedAt >= 0)
         {
             float age = (float)(ImGui.GetTime() - tabClickedAt);
             const float washDur = 0.8f;
@@ -2371,7 +2387,9 @@ public class MainWindow : Window, IDisposable
                             && hoveredCardIdLastFrame != routine.Id
                             && !isActive;
             cardDimAlpha.TryGetValue(routine.Id, out var dimAlpha);
-            dimAlpha = ApproachAlpha(dimAlpha, shouldDim ? 0.45f : 0f, 5f);
+            dimAlpha = UIStyles.MotionScreenDim
+                ? ApproachAlpha(dimAlpha, shouldDim ? 0.45f : 0f, 5f)
+                : 0f;
             cardDimAlpha[routine.Id] = dimAlpha;
 
             var cardContentWidth = ImGui.GetContentRegionAvail().X;
@@ -2501,7 +2519,7 @@ public class MainWindow : Window, IDisposable
             // when active. Draw via drawlist whenever any scaling is active;
             // Dummy reserves layout space so surrounding widgets don't shift.
             float rtHoverScale = 1f + 0.06f * hoverAlpha;
-            float rtBeatKick = isActive ? UIStyles.BeatKickScale(0.08f) : 1f;
+            float rtBeatKick = isActive && UIStyles.MotionAmbient ? UIStyles.BeatKickScale(0.08f) : 1f;
             float rtScaleFactor = rtHoverScale * rtBeatKick;
             bool drawRtIconScaled = rtTex != null && (hoverAlpha > 0.02f || isActive);
             if (drawRtIconScaled)
@@ -3015,7 +3033,9 @@ public class MainWindow : Window, IDisposable
                             && hoveredCardIdLastFrame != preset.Id
                             && !isPlaying;
             cardDimAlpha.TryGetValue(preset.Id, out var dimAlpha);
-            dimAlpha = ApproachAlpha(dimAlpha, shouldDim ? 0.45f : 0f, 5f);
+            dimAlpha = UIStyles.MotionScreenDim
+                ? ApproachAlpha(dimAlpha, shouldDim ? 0.45f : 0f, 5f)
+                : 0f;
             cardDimAlpha[preset.Id] = dimAlpha;
 
             // Content width for right-aligning buttons (must capture before drawing changes cursor)
@@ -3135,7 +3155,7 @@ public class MainWindow : Window, IDisposable
             // beat-kick (playing). Draw via drawlist whenever any scaling is
             // active; Dummy reserves layout space so widgets don't shift.
             float iconHoverScale = 1f + 0.06f * hoverAlpha;
-            float iconBeatKick = isPlaying ? UIStyles.BeatKickScale(0.08f) : 1f;
+            float iconBeatKick = isPlaying && UIStyles.MotionAmbient ? UIStyles.BeatKickScale(0.08f) : 1f;
             float iconScaleFactor = iconHoverScale * iconBeatKick;
             bool drawIconScaled = resolvedTex != null && (hoverAlpha > 0.02f || isPlaying);
             if (drawIconScaled)
@@ -3190,7 +3210,7 @@ public class MainWindow : Window, IDisposable
                     };
                     chipCol = poseChipCol;
                 }
-                if (preset.EmoteLocked)
+                if (Plugin.Instance?.IsPresetEmoteBypassed(preset) == true)
                 {
                     chipText = chipText + " [bypass]";
                     chipCol = lockedChipCol;
@@ -3844,7 +3864,7 @@ public class MainWindow : Window, IDisposable
         Vector4 alignIconCol = MW_TextDim;
         if (isWalking)
         {
-            var pulse = (float)(Math.Sin(ImGui.GetTime() * 4.0) * 0.3 + 0.7);
+            var pulse = UIStyles.MotionAmbient ? (float)(Math.Sin(ImGui.GetTime() * 4.0) * 0.3 + 0.7) : 0.7f;
             alignIconCol = new Vector4(MW_Cyan.X * pulse + 0.1f, MW_Cyan.Y * pulse + 0.1f, MW_Cyan.Z * pulse + 0.1f, 1f);
         }
         else if (alignBlocked) alignIconCol = MW_Gold;

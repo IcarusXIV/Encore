@@ -24,26 +24,24 @@ internal static class ModMusicFinder
 
         var activeRelPaths = new List<string>();
 
-        TryAddFiles(Path.Combine(modRoot, "default_mod.json"), activeRelPaths,
-            optionPicker: null);
+        var v4Meta = PenumbraModFormat.TryReadV4Meta(modRoot);
 
-        var groupFiles = Directory.EnumerateFiles(modRoot, "group_*.json",
-            SearchOption.TopDirectoryOnly);
-        foreach (var groupFilePath in groupFiles)
+        if (v4Meta is { } metaDefaults && metaDefaults.TryGetProperty("DefaultData", out var defaultData) && defaultData.ValueKind == JsonValueKind.Object)
+            AddFilesValues(defaultData, activeRelPaths);
+        else
+            TryAddFiles(Path.Combine(modRoot, "default_mod.json"), activeRelPaths,
+                optionPicker: null);
+
+        void ProcessGroup(JsonElement root)
         {
-            try
             {
-                var json = File.ReadAllText(groupFilePath);
-                using var doc = JsonDocument.Parse(json);
-                var root = doc.RootElement;
-
-                if (!root.TryGetProperty("Name", out var nameProp)) continue;
+                if (!root.TryGetProperty("Name", out var nameProp)) return;
                 string groupName = nameProp.GetString() ?? "";
                 string groupType = root.TryGetProperty("Type", out var t)
                     ? (t.GetString() ?? "Single") : "Single";
 
-                if (!root.TryGetProperty("Options", out var optsProp)) continue;
-                if (optsProp.ValueKind != JsonValueKind.Array) continue;
+                if (!root.TryGetProperty("Options", out var optsProp)) return;
+                if (optsProp.ValueKind != JsonValueKind.Array) return;
 
                 List<int>? activeOptionIndices = null;
                 string? matchedSource = null;
@@ -67,8 +65,10 @@ internal static class ModMusicFinder
 
                 if (activeOptionIndices == null)
                 {
-                    uint defaults = root.TryGetProperty("DefaultSettings", out var d)
-                        ? d.GetUInt32() : 0u;
+                    uint defaults = 0u;
+                    if (root.TryGetProperty("DefaultSettings", out var d)
+                        && !d.TryGetUInt32(out defaults) && d.TryGetInt64(out long signedDefaults))
+                        defaults = unchecked((uint)signedDefaults);
                     activeOptionIndices = new List<int>();
                     if (groupType == "Single")
                     {
@@ -105,8 +105,36 @@ internal static class ModMusicFinder
                 }
                 log?.Debug($"[ModMusic]   group '{groupName}' ({groupType}, via {matchedSource}): [{string.Join(", ", pickedOptionNames)}]");
             }
-            catch
+        }
+
+        if (v4Meta is { } metaGroups)
+        {
+            foreach (var group in PenumbraModFormat.EnumerateGroups(metaGroups))
             {
+                try
+                {
+                    ProcessGroup(group);
+                }
+                catch
+                {
+                }
+            }
+        }
+        else
+        {
+            var groupFiles = Directory.EnumerateFiles(modRoot, "group_*.json",
+                SearchOption.TopDirectoryOnly);
+            foreach (var groupFilePath in groupFiles)
+            {
+                try
+                {
+                    var json = File.ReadAllText(groupFilePath);
+                    using var doc = JsonDocument.Parse(json);
+                    ProcessGroup(doc.RootElement);
+                }
+                catch
+                {
+                }
             }
         }
 
@@ -115,8 +143,19 @@ internal static class ModMusicFinder
         if (scdRel == null) return null;
 
         // Penumbra JSON paths use backslashes
-        var fullPath = Path.Combine(modRoot, scdRel.Replace('\\', Path.DirectorySeparatorChar));
+        var fullPath = Path.Combine(modRoot, scdRel.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar));
         return File.Exists(fullPath) ? fullPath : null;
+    }
+
+    private static void AddFilesValues(JsonElement container, List<string> sink)
+    {
+        if (!container.TryGetProperty("Files", out var filesProp)) return;
+        if (filesProp.ValueKind != JsonValueKind.Object) return;
+        foreach (var f in filesProp.EnumerateObject())
+        {
+            var rel = f.Value.GetString();
+            if (!string.IsNullOrEmpty(rel)) sink.Add(rel);
+        }
     }
 
     private static void TryAddFiles(string jsonPath, List<string> sink,
