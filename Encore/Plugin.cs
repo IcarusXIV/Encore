@@ -144,6 +144,8 @@ public sealed class Plugin : IDalamudPlugin
     private Dictionary<string, ushort>? emoteCommandToId;
     // emote ID -> all ActionTimeline entries (slot index, key string, isLoop flag, loadType: 0=Facial, 1=PerJob, 2=Normal)
     private Dictionary<ushort, List<(int slot, string key, bool isLoop, byte loadType)>>? emoteIdToTimelineKeys;
+    private readonly HashSet<ushort> ineligibleCarrierIds = new();
+    private string? emoteSwapProbePath;
     // Per-emote set of ActionTimeline row IDs - used to tell "internal intro->loop transition" from "emote ended"
     private Dictionary<ushort, HashSet<ushort>>? emoteIdToTimelineRowIds;
 
@@ -158,7 +160,6 @@ public sealed class Plugin : IDalamudPlugin
     private const string EncoreSwapModName = "_EncoreEmoteSwap";
     private bool encoreSwapModRegistered = false;
     // Counter for unique swap file names (avoids Penumbra file-content caching)
-    private int emoteSwapFileCounter = 0;
     // Cache carrier PAP names to avoid re-reading from game data each call
     private readonly Dictionary<ushort, string> carrierPapNameCache = new();
     // carrier sticking: reuse same carrier for same emote (sync plugin compat)
@@ -167,7 +168,6 @@ public sealed class Plugin : IDalamudPlugin
     private ushort lastBypassCarrierId = 0;
     private string? lastBypassRaceCode = null;
     // session-wide carrier tracking; game caches PAP per-animation-key (Penumbra ChangeCounter only busts TMBs)
-    private readonly HashSet<ushort> usedCarrierIds = new();
     // Soft-disabled state: swap files + sticking state preserved, but Penumbra temp settings removed.
     // Re-enabled on next bypass for same emote via sticking check in TrySetupEmoteBypass.
     private bool emoteSwapSoftDisabled = false;
@@ -414,10 +414,11 @@ public sealed class Plugin : IDalamudPlugin
                     if (emoteModeRef != null)
                         emoteIdToConditionMode[emoteId] = emoteModeRef.Value.ConditionMode;
 
-                    // Store ActionTimeline entries with loop detection and load type
                     // LoadType: 0=Facial expression, 1=PerJob, 2=Normal body animation
                     var entries = new List<(int slot, string key, bool isLoop, byte loadType)>();
                     var rowIds = new HashSet<ushort>();
+                    // per-job or weapon-folder animations can't be served as a carrier
+                    bool carrierUnsafe = row.DrawsWeapon;
                     for (int i = 0; i < 7; i++)
                     {
                         var tlRef = row.ActionTimeline[i];
@@ -426,15 +427,19 @@ public sealed class Plugin : IDalamudPlugin
                         var key = tl.Key.ToString();
                         if (!string.IsNullOrEmpty(key))
                         {
-                            bool isLoop = key.Contains("loop", StringComparison.OrdinalIgnoreCase);
-                            entries.Add((i, key, isLoop, tl.LoadType));
+                            // Pause is the loop flag, not IsLoop
+                            entries.Add((i, key, tl.Pause, tl.LoadType));
                             rowIds.Add((ushort)tlRef.RowId);
+                            if (tl.LoadType == 1 || tl.ActionTimelineIDMode == 2)
+                                carrierUnsafe = true;
                         }
                     }
                     if (entries.Count > 0)
                     {
                         emoteIdToTimelineKeys.TryAdd(emoteId, entries);
                         emoteIdToTimelineRowIds.TryAdd(emoteId, rowIds);
+                        if (carrierUnsafe)
+                            ineligibleCarrierIds.Add(emoteId);
                     }
 
                     // Map all command variants to emote ID
@@ -794,13 +799,6 @@ public sealed class Plugin : IDalamudPlugin
         Condition.ConditionChange += OnConditionChanged;
         conditionLoopCancelRegistered = true;
 
-        // Hydrate used-carrier tracking from persisted config so plugin reloads don't rotate back
-        // to carriers the game still has cached from the previous session.
-        foreach (var id in Configuration.UsedBypassCarrierIds)
-            usedCarrierIds.Add(id);
-        if (usedCarrierIds.Count > 0)
-            Log.Information($"[UnlockBypass] Restored {usedCarrierIds.Count} previously-used carrier(s) from config");
-
         // Check for plugin updates in the background
         CheckForUpdates();
 
@@ -1119,10 +1117,9 @@ public sealed class Plugin : IDalamudPlugin
                 loopWaitingForStart = true;
                 loopPreviousWeaponDrawn = ReadIsWeaponDrawn();
 
-                // Wait for Penumbra to process the temp mod before executing
                 Task.Run(async () =>
                 {
-                    await Task.Delay(150);
+                    await WaitForSwapReady();
                     await Framework.RunOnFrameworkThread(() => ExecuteEmoteDirect(carrierCmd));
                 });
 
@@ -1240,9 +1237,8 @@ public sealed class Plugin : IDalamudPlugin
                     bypassTargetIsLoop = tIsLoop;
                 });
 
-                // Wait for Penumbra to process the temp mod / real mod before executing.
                 if (bypassCommand != null)
-                    await Task.Delay(150);
+                    await WaitForSwapReady();
 
                 // Execute the carrier (bypassed) or original emote
                 await Framework.RunOnFrameworkThread(() =>
@@ -1845,8 +1841,7 @@ public sealed class Plugin : IDalamudPlugin
 
                         if (bypassCommand != null)
                         {
-                            // wait for Penumbra to process the mod
-                            await Task.Delay(150);
+                            await WaitForSwapReady();
 
                             await Framework.RunOnFrameworkThread(() =>
                             {
@@ -3325,6 +3320,26 @@ public sealed class Plugin : IDalamudPlugin
     }
 
     // isExecutingBypassCarrier stops the command hook clearing the swap
+    // poll until Penumbra serves the swap
+    private async Task WaitForSwapReady(int maxMs = 600)
+    {
+        var probe = emoteSwapProbePath;
+        if (PenumbraService == null || probe == null) { await Task.Delay(150); return; }
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < maxMs)
+        {
+            var resolved = await Framework.RunOnFrameworkThread(() => PenumbraService.ResolvePlayerPath(probe));
+            if (resolved != null && !string.Equals(resolved, probe, StringComparison.OrdinalIgnoreCase))
+            {
+                Log.Debug($"[EmoteSwap] Swap ready after {sw.ElapsedMilliseconds}ms");
+                return;
+            }
+            await Task.Delay(16);
+        }
+        Log.Warning($"[EmoteSwap] Swap not confirmed after {maxMs}ms, executing anyway");
+    }
+
     private unsafe void ExecuteEmoteDirect(string command)
     {
         if (string.IsNullOrWhiteSpace(command)) return;
@@ -3512,7 +3527,7 @@ public sealed class Plugin : IDalamudPlugin
     private static readonly string[] PreferredOneShotCarriers = { "/no", "/me", "/bow", "/clap", "/yes", "/wave", "/cheer", "/dance", "/laugh" };
 
     // matches loop type; prefers slot 1 carriers when target has intro animation
-    private (ushort id, string command, string key, string papName, bool isLoop, string? slot1Key, string? slot1PapName)? FindCarrier(bool needsLoop, bool preferSlot1 = false, int maxNameLen = 0, int maxSlot1NameLen = 0, byte? requiredConditionMode = null, HashSet<ushort>? excludeCarrierIds = null, bool rejectTmbOnlyIntro = false)
+    private (ushort id, string command, string key, string papName, bool isLoop, string? slot1Key, string? slot1PapName)? FindCarrier(bool needsLoop, bool preferSlot1 = false, int maxNameLen = 0, int maxSlot1NameLen = 0, byte? requiredConditionMode = null, bool rejectTmbOnlyIntro = false)
     {
         if (emoteCommandToId == null || emoteIdToTimelineKeys == null) return null;
 
@@ -3522,8 +3537,6 @@ public sealed class Plugin : IDalamudPlugin
             if (NoCarrierCommands.Contains(cmd))
                 excludedIds.Add(id);
         }
-        if (excludeCarrierIds != null)
-            excludedIds.UnionWith(excludeCarrierIds);
 
         bool FitsNameConstraint((ushort id, string command, string key, string papName, bool isLoop, string? slot1Key, string? slot1PapName)? result)
         {
@@ -3551,7 +3564,7 @@ public sealed class Plugin : IDalamudPlugin
             if (withSlot1 != null) return withSlot1;
             Log.Debug($"[UnlockBypass] No carrier with a usable intro fits, falling back to one without");
         }
-        var matchingCarrier = ScanForCarrier(excludedIds, needsLoop, requireSlot1: false, maxNameLen, requiredConditionMode: requiredConditionMode, rejectTmbOnlyIntro: rejectTmbOnlyIntro);
+        var matchingCarrier = ScanForCarrier(excludedIds, needsLoop, requireSlot1: false, maxNameLen, requiredConditionMode: requiredConditionMode);
         if (matchingCarrier != null) return matchingCarrier;
 
         // Fallback: any carrier regardless of loop type
@@ -3561,19 +3574,20 @@ public sealed class Plugin : IDalamudPlugin
             // looping target, no looping carrier: try preferred one-shot
             foreach (var cmd in PreferredOneShotCarriers)
             {
-                var result = TryGetCarrierInfo(cmd, excludedIds, requireLoop: null, requiredConditionMode: requiredConditionMode, rejectTmbOnlyIntro: rejectTmbOnlyIntro);
+                var result = TryGetCarrierInfo(cmd, excludedIds, requireLoop: null, requiredConditionMode: requiredConditionMode);
                 if (FitsNameConstraint(result)) return result;
             }
         }
-        return ScanForCarrier(excludedIds, loopType: null, requireSlot1: false, maxNameLen, requiredConditionMode: requiredConditionMode, rejectTmbOnlyIntro: rejectTmbOnlyIntro);
+        return ScanForCarrier(excludedIds, loopType: null, requireSlot1: false, maxNameLen, requiredConditionMode: requiredConditionMode);
     }
 
-    // null loopType / 0 maxNameLen = no constraint
+    // null loopType = accept any
     private (ushort id, string command, string key, string papName, bool isLoop, string? slot1Key, string? slot1PapName)? ScanForCarrier(HashSet<ushort> excludedIds, bool? loopType, bool requireSlot1, int maxNameLen = 0, int maxSlot1NameLen = 0, byte? requiredConditionMode = null, bool rejectTmbOnlyIntro = false)
     {
         foreach (var (id, keys) in emoteIdToTimelineKeys!)
         {
             if (excludedIds.Contains(id)) continue;
+            if (ineligibleCarrierIds.Contains(id)) continue;
             if (!IsEmoteUnlocked(id)) continue;
             // Filter by ConditionMode (e.g., only ConditionMode 0 carriers when player is sitting)
             if (requiredConditionMode.HasValue && emoteIdToConditionMode != null &&
@@ -3588,8 +3602,6 @@ public sealed class Plugin : IDalamudPlugin
 
             var papName = GetCarrierPapName(id, slot0.key);
             if (papName == null) continue;
-
-            // Check name length constraint
             if (maxNameLen > 0 && papName.Length > maxNameLen) continue;
             if (requireSlot1 && maxSlot1NameLen > 0 && slot1PapName != null && slot1PapName.Length > maxSlot1NameLen) continue;
 
@@ -3614,6 +3626,7 @@ public sealed class Plugin : IDalamudPlugin
         var cmdLookup = command.TrimStart('/').ToLowerInvariant();
         if (!emoteCommandToId!.TryGetValue(cmdLookup, out var id)) return null;
         if (excludedIds.Contains(id)) return null;
+        if (ineligibleCarrierIds.Contains(id)) return null;
         if (!IsEmoteUnlocked(id)) return null;
         // Filter by ConditionMode (e.g., only ConditionMode 0 carriers when player is sitting)
         if (requiredConditionMode.HasValue && emoteIdToConditionMode != null &&
@@ -3761,9 +3774,7 @@ public sealed class Plugin : IDalamudPlugin
         if (targetHasSlot1)
             Log.Debug($"[UnlockBypass] Target has intro animation: [{targetSlot1.slot}]={targetSlot1.key}");
 
-        // Read target PAP names to determine max carrier name length.
-        // The C009.Path in TMB has limited padded space - carrier name must fit.
-        // Use the player's race+job-specific PAP when available for correct skeleton/expression data.
+        // carrier name must fit the target's padding
         int maxSlot0NameLen = 0;
         int maxSlot1NameLen = 0;
         var playerJobSub = GetPlayerJobSubfolder();
@@ -3774,12 +3785,8 @@ public sealed class Plugin : IDalamudPlugin
             if (targetPaths.Count > 0)
             {
                 var targetFile = DataManager.GetFile(PickBestPath(targetPaths, playerRaceCode, playerJobSub));
-                if (targetFile != null)
-                {
-                    var targetName = ReadPapAnimationName(targetFile.Data);
-                    if (targetName != null)
-                        maxSlot0NameLen = targetName.Length;
-                }
+                var targetName = targetFile != null ? ReadPapAnimationName(targetFile.Data) : null;
+                if (targetName != null) maxSlot0NameLen = targetName.Length;
             }
         }
 
@@ -3789,20 +3796,16 @@ public sealed class Plugin : IDalamudPlugin
             if (targetSlot1Paths.Count > 0)
             {
                 var targetSlot1File = DataManager.GetFile(PickBestPath(targetSlot1Paths, playerRaceCode, playerJobSub));
-                if (targetSlot1File != null)
-                {
-                    var targetSlot1Name = ReadPapAnimationName(targetSlot1File.Data);
-                    if (targetSlot1Name != null)
-                        maxSlot1NameLen = targetSlot1Name.Length;
-                }
+                var targetSlot1Name = targetSlot1File != null ? ReadPapAnimationName(targetSlot1File.Data) : null;
+                if (targetSlot1Name != null) maxSlot1NameLen = targetSlot1Name.Length;
             }
         }
 
-        Log.Debug($"[UnlockBypass] Target PAP name constraints: slot0 max={maxSlot0NameLen}, slot1 max={maxSlot1NameLen}");
+        // intro row with no pap = nothing to redirect
+        var targetSlot1PapExists = maxSlot1NameLen > 0;
 
         // Check player state for sitting-aware carrier selection.
-        // Only InPositionLoop (sit/doze) actually rejects standing-only emote commands -
-        // EmoteLoop (mid-dance) accepts any emote (new one cancels the current), so no filter needed there.
+        // sit/doze rejects standing-only emotes; mid-dance accepts any
         byte? requiredConditionMode = null;
         var localPlayer = ObjectTable.LocalPlayer;
         if (localPlayer != null && localPlayer.Address != nint.Zero)
@@ -3818,71 +3821,25 @@ public sealed class Plugin : IDalamudPlugin
             }
         }
 
-        // game caches PAP per-animation-key; rotate carriers (Penumbra ChangeCounter only busts TMBs)
-        var targetSlot1PapExists = maxSlot1NameLen > 0;
-        var rejectTmbOnly = targetHasSlot1 && targetSlot1PapExists;
-        // forPreset keeps the same carrier across invocations (sync plugins see consistent carrier)
-        HashSet<ushort>? excludeCarrierIds = (!forPreset && usedCarrierIds.Count > 0) ? usedCarrierIds : null;
-        if (excludeCarrierIds != null)
-            Log.Debug($"[UnlockBypass] Excluding {excludeCarrierIds.Count} previously used carrier(s) for PAP cache busting");
-        var carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, maxNameLen: maxSlot0NameLen, maxSlot1NameLen: maxSlot1NameLen, requiredConditionMode: requiredConditionMode, excludeCarrierIds: excludeCarrierIds, rejectTmbOnlyIntro: rejectTmbOnly);
+        var rejectTmbOnly = targetSlot1PapExists;
+        var carrier = FindCarrier(targetIsLoop, preferSlot1: targetSlot1PapExists, maxNameLen: maxSlot0NameLen, maxSlot1NameLen: maxSlot1NameLen, requiredConditionMode: requiredConditionMode, rejectTmbOnlyIntro: rejectTmbOnly);
 
-        // If no carrier fits with slot 1 preference, try without slot 1 requirement
-        if (carrier == null && targetHasSlot1 && targetSlot1PapExists)
-        {
-            Log.Debug($"[UnlockBypass] No carrier with slot 1 fits, trying without slot 1");
-            carrier = FindCarrier(targetIsLoop, preferSlot1: false, maxNameLen: maxSlot0NameLen, requiredConditionMode: requiredConditionMode, excludeCarrierIds: excludeCarrierIds, rejectTmbOnlyIntro: rejectTmbOnly);
-        }
-
-        // If still no carrier fits the name constraint, try without name constraint (partial rewrite - may not animate but better than nothing)
         if (carrier == null && maxSlot0NameLen > 0)
         {
             Log.Warning($"[UnlockBypass] No carrier with name length <= {maxSlot0NameLen} found, trying without length constraint");
-            carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, requiredConditionMode: requiredConditionMode, excludeCarrierIds: excludeCarrierIds, rejectTmbOnlyIntro: rejectTmbOnly);
+            carrier = FindCarrier(targetIsLoop, preferSlot1: targetSlot1PapExists, requiredConditionMode: requiredConditionMode, rejectTmbOnlyIntro: rejectTmbOnly);
         }
 
-        // If ConditionMode constraint prevented finding a carrier, fall back to any carrier (better to try than fail silently)
         if (carrier == null && requiredConditionMode.HasValue)
         {
             Log.Warning($"[UnlockBypass] No ConditionMode {requiredConditionMode.Value} carriers found, trying without ConditionMode constraint");
-            carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, maxNameLen: maxSlot0NameLen, maxSlot1NameLen: maxSlot1NameLen, excludeCarrierIds: excludeCarrierIds, rejectTmbOnlyIntro: rejectTmbOnly);
-            if (carrier == null && targetHasSlot1 && targetSlot1PapExists)
-                carrier = FindCarrier(targetIsLoop, preferSlot1: false, maxNameLen: maxSlot0NameLen, excludeCarrierIds: excludeCarrierIds, rejectTmbOnlyIntro: rejectTmbOnly);
-            if (carrier == null && maxSlot0NameLen > 0)
-                carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, excludeCarrierIds: excludeCarrierIds, rejectTmbOnlyIntro: rejectTmbOnly);
-        }
-
-        // Pool exhaustion: all carriers used this session. Clear and retry - game's LRU cache
-        // may have evicted old entries. Better to try a reused carrier than fail entirely.
-        if (carrier == null && usedCarrierIds.Count > 0)
-        {
-            Log.Information($"[UnlockBypass] All carriers exhausted ({usedCarrierIds.Count} used), clearing pool and retrying");
-            usedCarrierIds.Clear();
-            Configuration.UsedBypassCarrierIds.Clear();
-            Configuration.Save();
-            excludeCarrierIds = null;
-            carrier = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, maxNameLen: maxSlot0NameLen, maxSlot1NameLen: maxSlot1NameLen, requiredConditionMode: requiredConditionMode, rejectTmbOnlyIntro: rejectTmbOnly);
-        }
-
-        // Loop-target mismatch rescue: if target wants a loop but FindCarrier fell back to a
-        // non-loop carrier AND we had any exclusions, clear the used pool and retry for a loop.
-        // A non-loop carrier for a looping target will stop after one play - unacceptable for loops.
-        if (targetIsLoop && carrier != null && !carrier.Value.isLoop && usedCarrierIds.Count > 0)
-        {
-            Log.Information($"[UnlockBypass] Got non-loop carrier for loop target while {usedCarrierIds.Count} carriers were excluded - resetting pool to find a real loop carrier");
-            usedCarrierIds.Clear();
-            Configuration.UsedBypassCarrierIds.Clear();
-            Configuration.Save();
-            excludeCarrierIds = null;
-            var retry = FindCarrier(targetIsLoop, preferSlot1: targetHasSlot1 && targetSlot1PapExists, maxNameLen: maxSlot0NameLen, maxSlot1NameLen: maxSlot1NameLen, requiredConditionMode: requiredConditionMode, rejectTmbOnlyIntro: rejectTmbOnly);
-            if (retry != null && retry.Value.isLoop)
-                carrier = retry;
+            carrier = FindCarrier(targetIsLoop, preferSlot1: targetSlot1PapExists, maxNameLen: maxSlot0NameLen, maxSlot1NameLen: maxSlot1NameLen, rejectTmbOnlyIntro: rejectTmbOnly);
         }
 
         if (carrier == null && rejectTmbOnly)
         {
             Log.Warning($"[UnlockBypass] No carriers with a clean intro for '{cmdLower}', accepting one that may show its own windup");
-            carrier = FindCarrier(targetIsLoop, preferSlot1: false, maxNameLen: maxSlot0NameLen, excludeCarrierIds: excludeCarrierIds);
+            carrier = FindCarrier(targetIsLoop, preferSlot1: false, maxNameLen: maxSlot0NameLen);
         }
 
         if (carrier == null)
@@ -3967,16 +3924,7 @@ public sealed class Plugin : IDalamudPlugin
             lastBypassCarrierCommand = carrierCommand;
             lastBypassCarrierId = carrierId;
             lastBypassRaceCode = playerRaceCode;
-            // For preset-driven bypass, don't pollute the used-carrier pool - we WANT to
-            // pick the same carrier on subsequent invocations (same preset / routine loop).
-            // Skipping the add keeps /pray (or whatever preferred) available forever.
-            if (!forPreset)
-            {
-                usedCarrierIds.Add(carrierId); // Track for PAP cache busting
-                Configuration.UsedBypassCarrierIds.Add(carrierId);
-                Configuration.Save();
-            }
-            Log.Information($"[UnlockBypass] Swap active for '{cmdLower}', executing {carrierCommand} ({keyPairs.Count} slot(s), fromMod={forPreset}, usedCarriers={usedCarrierIds.Count})");
+            Log.Information($"[UnlockBypass] Swap active for '{cmdLower}', executing {carrierCommand} ({keyPairs.Count} slot(s), fromMod={forPreset})");
             return (carrierCommand, carrierId, targetIsLoop);
         }
 
@@ -4486,7 +4434,14 @@ public sealed class Plugin : IDalamudPlugin
         return Encoding.ASCII.GetString(papData, nameStart, nameEnd - nameStart);
     }
 
-    // C009.Path string table is fixed-size; carrier name must fit (use FindCarrier maxNameLen)
+    // 8 hex chars of sha1
+    private static string ContentTag(byte[] data)
+    {
+        var hash = System.Security.Cryptography.SHA1.HashData(data);
+        return Convert.ToHexString(hash, 0, 4).ToLowerInvariant();
+    }
+
+    // in-place patch, name must fit existing padding
     private (byte[]? data, int replaced, int found) RewritePapAnimationNames(byte[] data, string targetName, string carrierName)
     {
         var result = (byte[])data.Clone();
@@ -4627,9 +4582,6 @@ public sealed class Plugin : IDalamudPlugin
         {
             ClearEmoteSwap();
 
-            // Unique suffix for file names (avoids Penumbra file-content caching by path)
-            var swapId = (++emoteSwapFileCounter).ToString();
-
             // Determine directories for both approaches
             var configSwapDir = EmoteSwapDir;
             Directory.CreateDirectory(configSwapDir);
@@ -4668,15 +4620,12 @@ public sealed class Plugin : IDalamudPlugin
                 var targetData = readTargetFromMod ? ReadTargetFile(selectedTargetPath, true) : DataManager.GetFile(selectedTargetPath)?.Data;
                 if (targetData == null) { Log.Warning($"[EmoteSwap] Pair {i}: Can't read target PAP from {selectedTargetPath}"); continue; }
 
-                // Load carrier PAP to read its actual internal animation name - prefer the player's race+job-specific file
+                // target takes the carrier's animation name
                 var carrierExistingPaths = ResolveEmotePaths(carrierKey);
                 if (carrierExistingPaths.Count == 0) { Log.Warning($"[EmoteSwap] Pair {i}: No carrier paths for name lookup"); continue; }
-                var selectedCarrierPath = PickBestPath(carrierExistingPaths, playerRaceCode, playerJobSub);
-                Log.Verbose($"[EmoteSwap] Pair {i}: carrier path={selectedCarrierPath} (from {carrierExistingPaths.Count} resolved)");
-                var carrierFile = DataManager.GetFile(selectedCarrierPath);
+                var carrierFile = DataManager.GetFile(PickBestPath(carrierExistingPaths, playerRaceCode, playerJobSub));
                 if (carrierFile == null) { Log.Warning($"[EmoteSwap] Pair {i}: Can't read carrier PAP"); continue; }
 
-                // Read the internal animation names from both PAPs
                 var targetName = ReadPapAnimationName(targetData);
                 var carrierName = ReadPapAnimationName(carrierFile.Data);
                 if (targetName == null || carrierName == null)
@@ -4685,11 +4634,11 @@ public sealed class Plugin : IDalamudPlugin
                     continue;
                 }
 
+                var targetTmbPath = $"chara/action/{targetKey}.tmb";
+                var targetTmbData = readTargetFromMod ? ReadTargetFile(targetTmbPath, true) : DataManager.GetFile(targetTmbPath)?.Data;
+
                 Log.Debug($"[EmoteSwap] Pair {i}: rewriting '{targetName}' -> '{carrierName}' ({targetData.Length} bytes)");
 
-                // Rewrite target PAP: replace animation name to match carrier's expected name.
-                // The surgical TMB-aware rewriter extends the string table when needed,
-                // so partial rewrites due to C009 size constraints no longer occur.
                 var (modifiedData, replaced, found) = RewritePapAnimationNames(targetData, targetName, carrierName);
                 if (modifiedData == null)
                 {
@@ -4704,12 +4653,13 @@ public sealed class Plugin : IDalamudPlugin
                     else { continue; } // Skip non-critical slots
                 }
 
-                // Save modified PAP with unique file name (to both directories)
-                var fileName = $"swap_{i}_{swapId}.pap";
+                // content-addressed filename
+                var fileName = $"swap_{ContentTag(modifiedData)}.pap";
                 var configPath = Path.Combine(configSwapDir, fileName);
-                File.WriteAllBytes(configPath, modifiedData);
+                if (!File.Exists(configPath))
+                    File.WriteAllBytes(configPath, modifiedData);
 
-                // Generate ALL possible carrier paths (every race x layer x subfolder).
+                // every race x layer x subfolder
                 var carrierAllPaths = GenerateAllPossiblePaths(carrierKey);
                 foreach (var cp in carrierAllPaths)
                 {
@@ -4718,24 +4668,19 @@ public sealed class Plugin : IDalamudPlugin
 
                 // redirect carrier TMB -> target TMB (timing/events/facial expression triggers)
                 var carrierTmbPath = $"chara/action/{carrierKey}.tmb";
-                var targetTmbPath = $"chara/action/{targetKey}.tmb";
-                var targetTmbData = readTargetFromMod ? ReadTargetFile(targetTmbPath, true) : DataManager.GetFile(targetTmbPath)?.Data;
                 if (targetTmbData != null)
                 {
-                    // Rewrite any target animation name references in the TMB to carrier name
                     var tmbData = targetTmbData;
-                    if (targetName != null && carrierName != null)
+                    var (rewrittenTmb, tmbReplaced, tmbFound) = RewritePapAnimationNames(tmbData, targetName, carrierName);
+                    if (rewrittenTmb != null && tmbReplaced > 0)
                     {
-                        var (rewrittenTmb, tmbReplaced, tmbFound) = RewritePapAnimationNames(tmbData, targetName, carrierName);
-                        if (rewrittenTmb != null && tmbReplaced > 0)
-                        {
-                            tmbData = rewrittenTmb;
-                            Log.Debug($"[EmoteSwap] Pair {i}: TMB name rewrite {tmbReplaced}/{tmbFound} '{targetName}' -> '{carrierName}'");
-                        }
+                        tmbData = rewrittenTmb;
+                        Log.Debug($"[EmoteSwap] Pair {i}: TMB name rewrite {tmbReplaced}/{tmbFound} '{targetName}' -> '{carrierName}'");
                     }
-                    var tmbFileName = $"swap_tmb_{i}_{swapId}.tmb";
+                    var tmbFileName = $"swap_tmb_{ContentTag(tmbData)}.tmb";
                     var tmbConfigPath = Path.Combine(configSwapDir, tmbFileName);
-                    File.WriteAllBytes(tmbConfigPath, tmbData);
+                    if (!File.Exists(tmbConfigPath))
+                        File.WriteAllBytes(tmbConfigPath, tmbData);
                     allMappings[carrierTmbPath] = tmbConfigPath;
                     Log.Debug($"[EmoteSwap] Pair {i}: TMB redirect {carrierTmbPath} -> {tmbFileName} ({tmbData.Length} bytes)");
                 }
@@ -4753,6 +4698,7 @@ public sealed class Plugin : IDalamudPlugin
                 Log.Warning($"[EmoteSwap] No valid mappings from {keyPairs.Count} pair(s)");
                 return false;
             }
+            emoteSwapProbePath = allMappings.Keys.First();
 
             var (success, collectionId, _) = PenumbraService.GetCurrentCollection();
             if (!success) { Log.Warning("[EmoteSwap] Can't get collection"); return false; }
@@ -4957,6 +4903,7 @@ public sealed class Plugin : IDalamudPlugin
 
         emoteSwapCollectionId = Guid.Empty;
         emoteSwapPriority = 0;
+        emoteSwapProbePath = null;
         lastBypassEmoteCommand = null;
         lastBypassCarrierCommand = null;
         lastBypassCarrierId = 0;
