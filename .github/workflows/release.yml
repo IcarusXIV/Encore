@@ -54,7 +54,9 @@ jobs:
           $OutputZip = "Encore.zip"
           $Files = @(
             "$PluginPath/Encore.dll",
-            "$PluginPath/Encore.json"
+            "$PluginPath/Encore.json",
+            "$PluginPath/NVorbis.dll",
+            "$PluginPath/SixLabors.ImageSharp.dll"
           )
           Compress-Archive -Path $Files -DestinationPath $OutputZip -Force
           if (Test-Path "$PluginPath/Assets") {
